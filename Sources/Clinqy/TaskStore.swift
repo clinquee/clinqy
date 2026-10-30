@@ -57,40 +57,62 @@ final class TaskStore: ObservableObject {
     @Published private(set) var records: [Record] = []
     @Published private(set) var storageError: String?
     var onReady: ((UUID) -> Void)?
-    private let file: URL
     private let redact: (String) -> String
+    private var database: SQLiteDatabase?
+    private var positions: [UUID: Int] = [:]
     private var corrupt = false
 
-    init(file: URL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Clinqy/tasks.json"),
-         redact: @escaping (String) -> String = Secrets.mask) {
-        self.file = file
+    init(file: URL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Clinqy/tasks.sqlite"),
+         legacyFile: URL? = nil, redact: @escaping (String) -> String = Secrets.mask) {
         self.redact = redact
-        guard FileManager.default.fileExists(atPath: file.path) else { return }
         do {
-            records = try JSONDecoder().decode([Record].self, from: Data(contentsOf: file))
-            // A waiting question and any approval belong to the old process. Never reconstruct an active continuation.
-            for index in records.indices {
-                switch records[index].state {
-                case .running, .waiting, .needsAttention:
-                    records[index].state = .interrupted
-                    records[index].stage = "Clinqy stopped before this task finished. Check the real outcome before sending new instructions."
-                    records[index].updatedAt = Date()
-                case .queued:
-                    records[index].requiresReview = true
-                    records[index].reviewReason = "Restored after restart. Review the request and files, then start it explicitly."
-                default: break
+            let db = try SQLiteDatabase(file: file)
+            database = db
+            try db.execute("CREATE TABLE IF NOT EXISTS tasks(id TEXT PRIMARY KEY COLLATE NOCASE, state TEXT NOT NULL, updated REAL NOT NULL, payload TEXT NOT NULL); CREATE INDEX IF NOT EXISTS tasks_updated ON tasks(updated DESC); CREATE INDEX IF NOT EXISTS tasks_state ON tasks(state); CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL);")
+            let legacy = legacyFile ?? (file.lastPathComponent == "tasks.sqlite" ? file.deletingLastPathComponent().appendingPathComponent("tasks.json") : nil)
+            if try db.rows("SELECT value FROM metadata WHERE key='legacy_imported'").isEmpty {
+                try db.transaction {
+                    if let legacy, FileManager.default.fileExists(atPath: legacy.path) {
+                        let old = try JSONDecoder().decode([Record].self, from: Data(contentsOf: legacy))
+                        for item in old { try persist(item, replace: false) }
+                    }
+                    try db.execute("INSERT INTO metadata VALUES('legacy_imported','1')")
                 }
             }
-            try save()
+            // Keep unfinished work and a recent UI window in memory. All older records remain addressable in SQL.
+            let rows = try db.rows("SELECT payload FROM tasks WHERE state IN ('queued','running','waiting','needsAttention','interrupted') OR id IN (SELECT id FROM tasks ORDER BY updated DESC LIMIT 500) ORDER BY updated")
+            records = try rows.map { try JSONDecoder().decode(Record.self, from: Data($0[0].utf8)) }
+            try db.transaction {
+                for index in records.indices {
+                    switch records[index].state {
+                    case .running, .waiting, .needsAttention:
+                        records[index].state = .interrupted
+                        records[index].stage = "Clinqy stopped before this task finished. Check the real outcome before sending new instructions."
+                        records[index].updatedAt = Date()
+                        try persist(records[index])
+                    case .queued:
+                        records[index].requiresReview = true
+                        records[index].reviewReason = "Restored after restart. Review the request and files, then start it explicitly."
+                        try persist(records[index])
+                    default: break
+                    }
+                }
+            }
+            rebuildPositions()
         } catch {
             corrupt = true
-            storageError = "Task history couldn't be read safely. The existing file was preserved; automatic task starts are disabled."
+            storageError = "Task history couldn't be read safely. Existing files were preserved; automatic task starts are disabled."
         }
     }
 
-    func record(_ id: UUID?) -> Record? { id.flatMap { id in records.first { $0.id == id } } }
+    func record(_ id: UUID?) -> Record? {
+        guard let id else { return nil }
+        if let index = positions[id] { return records[index] }
+        return stored("SELECT payload FROM tasks WHERE id=?", [id.uuidString]).first
+    }
     func find(_ shortID: String) -> Record? {
-        let matches = records.filter { $0.id.uuidString.lowercased().hasPrefix(shortID.lowercased()) }
+        guard shortID.count >= 4, shortID.count <= 36, shortID.allSatisfy({ $0.isHexDigit || $0 == "-" }) else { return nil }
+        let matches = stored("SELECT payload FROM tasks WHERE id LIKE ? LIMIT 2", [shortID + "%"])
         return matches.count == 1 ? matches[0] : nil
     }
     var backgroundLimit = 3
@@ -104,7 +126,10 @@ final class TaskStore: ObservableObject {
 
     @discardableResult
     func enqueue(_ request: String, files: [URL] = [], source: Source, background: Bool = true, conversationID: Int64? = nil, idempotencyKey: String? = nil, parentID: UUID? = nil) -> UUID? {
-        if let idempotencyKey, let existing = records.first(where: { $0.dispatchKey == idempotencyKey }) { return existing.id }
+        if let idempotencyKey {
+            if let existing = records.first(where: { $0.dispatchKey == idempotencyKey }) { return existing.id }
+            if let existing = stored("SELECT payload FROM tasks WHERE json_extract(payload, '$.dispatchKey')=? LIMIT 1", [idempotencyKey]).first { return existing.id }
+        }
         let clean = redact(request)
         let item = Record(request: clean, files: files.map(\.path), source: source, background: background,
                           requiresReview: clean != request, conversationID: conversationID,
@@ -112,7 +137,9 @@ final class TaskStore: ObservableObject {
         var scheduled = item
         scheduled.dispatchKey = idempotencyKey
         scheduled.parentID = parentID
-        guard mutate({ $0.append(scheduled) }) else { return nil }
+        guard !corrupt else { return nil }
+        do { try persist(scheduled); records.append(scheduled); positions[scheduled.id] = records.count - 1; trimPublishedRecords(); storageError = nil }
+        catch { storageError = "Couldn't save task state. Work is stopped to preserve safe recovery."; return nil }
         return item.id
     }
 
@@ -198,23 +225,38 @@ final class TaskStore: ObservableObject {
     func requestStart(_ id: UUID) { guard record(id)?.state == .queued else { return }; onReady?(id) }
 
     private func change(_ id: UUID, _ action: (inout Record) -> Void) -> Bool {
-        mutate { items in
-            guard let i = items.firstIndex(where: { $0.id == id }) else { return }
-            action(&items[i]); items[i].updatedAt = Date()
+        guard !corrupt, var item = record(id) else { return false }
+        action(&item); item.updatedAt = Date()
+        do {
+            try persist(item) // Durable acknowledgement comes before publishing or executing a side effect.
+            if let index = positions[id] { records[index] = item }
+            else { records.append(item); positions[id] = records.count - 1 }
+            trimPublishedRecords()
+            storageError = nil
+            return true
+        } catch {
+            storageError = "Couldn't save task state. Work is stopped to preserve safe recovery."
+            return false
         }
     }
-    private func mutate(_ action: (inout [Record]) -> Void) -> Bool {
-        guard !corrupt else { return false }
-        let previous = records
-        action(&records)
-        do { try save(); storageError = nil; return true }
-        catch { records = previous; storageError = "Couldn't save task state. Work is stopped to preserve safe recovery."; return false }
+
+    private func persist(_ item: Record, replace: Bool = true) throws {
+        guard let database else { throw NSError(domain: "Clinqy.Tasks", code: 1) }
+        let payload = String(decoding: try JSONEncoder().encode(item), as: UTF8.self)
+        let sql = replace
+            ? "INSERT INTO tasks VALUES(?,?,?,?) ON CONFLICT(id) DO UPDATE SET state=excluded.state,updated=excluded.updated,payload=excluded.payload"
+            : "INSERT OR IGNORE INTO tasks VALUES(?,?,?,?)"
+        try database.execute(sql, [item.id.uuidString, item.state.rawValue, String(item.updatedAt.timeIntervalSince1970), payload])
     }
-    private func save() throws {
-        let fm = FileManager.default
-        try fm.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-        let data = try JSONEncoder().encode(records)
-        try data.write(to: file, options: .atomic)
-        try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+    private func stored(_ sql: String, _ values: [String]) -> [Record] {
+        guard let rows = try? database?.rows(sql, values) else { return [] }
+        return rows.compactMap { try? JSONDecoder().decode(Record.self, from: Data($0[0].utf8)) }
     }
+    private func trimPublishedRecords() {
+        guard records.count > 600 else { return }
+        let recent = Set(records.suffix(500).map(\.id))
+        records.removeAll { $0.state.terminal && $0.state != .interrupted && !recent.contains($0.id) }
+        rebuildPositions()
+    }
+    private func rebuildPositions() { positions = Dictionary(uniqueKeysWithValues: records.enumerated().map { ($0.element.id, $0.offset) }) }
 }
