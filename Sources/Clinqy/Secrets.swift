@@ -22,4 +22,16 @@ enum Secrets {
         }
         return out
     }
+
+    /// Redact every string value, including nested trace arguments and result cards, without damaging JSON syntax.
+    static func maskJSON(_ data: Data) -> Data? {
+        guard let object = try? JSONSerialization.jsonObject(with: data) else { return nil }
+        func scrub(_ value: Any) -> Any {
+            if let text = value as? String { return mask(text) }
+            if let array = value as? [Any] { return array.map(scrub) }
+            if let dict = value as? [String: Any] { return dict.mapValues(scrub) }
+            return value
+        }
+        return try? JSONSerialization.data(withJSONObject: scrub(object), options: [.sortedKeys])
+    }
 }
