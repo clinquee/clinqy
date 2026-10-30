@@ -83,9 +83,15 @@ enum Router {
     /// "continue", "go on", "also make an answer list", "now send it to Rahul", "aur", "phir": builds on the last task.
     static func isFollowUp(_ request: String) -> Bool {
         let t = normalize(request)
-        return t.range(of: #"^(continue|carry on|go on|keep going|resume|finish( it| that)?|complete( it| that)?|try again|retry|"#
+        return isCorrection(request) || t.range(of: #"^(continue|carry on|go on|keep going|resume|finish( it| that)?|complete( it| that)?|try again|retry|"#
                        + #"also|and|now|then|next|after that|same|aur|phir|ab|aage|jari rakho|continue karo)\b"#,
                        options: .regularExpression) != nil
+    }
+
+    /// Explicit corrections should continue the prior task and stop its old route being replayed as proven.
+    static func isCorrection(_ request: String) -> Bool {
+        normalize(request).range(of: #"^(actually\b|instead\b|no[, :]|nope[, :]|not like that\b|that's wrong\b|that is wrong\b|correction for\b|i meant\b)|\b(use|save|export|send)\b.+\binstead\b"#,
+                                 options: .regularExpression) != nil
     }
 
     /// "no thanks", "that's all", "kuch nahi": nothing more to do (an answer to the follow-up mic).
