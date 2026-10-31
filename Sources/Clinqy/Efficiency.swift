@@ -2,6 +2,8 @@ import AppKit
 
 /// Shared budgets for decorative work. Agent observations and exported screenshots keep their own fidelity.
 @MainActor enum Efficiency {
+    /// Demonstration pacing is opt-in; decoration never holds up normal automation.
+    static var humanMotion: Bool { ["on", "1", "true", "yes"].contains((Config.value("HUMAN_MOTION") ?? "off").lowercased()) }
     static let previewInterval: TimeInterval = 1
     static let waitingPreviewInterval: TimeInterval = 3
     private(set) static var constrained = limited()

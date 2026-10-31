@@ -149,27 +149,6 @@ enum Launcher {
 /// Runs a command off the main thread with a time limit.
 enum Shell {
     static func run(_ path: String, _ args: [String], timeout: TimeInterval = 20) async -> (status: Int32, output: String) {
-        await Task.detached {
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: path)
-            process.arguments = args
-            var env = ProcessInfo.processInfo.environment
-            let home = FileManager.default.homeDirectoryForCurrentUser.path
-            env["PATH"] = "\(home)/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-            process.environment = env
-            process.currentDirectoryURL = FileManager.default.homeDirectoryForCurrentUser
-            let pipe = Pipe()
-            process.standardOutput = pipe
-            process.standardError = pipe
-            process.standardInput = FileHandle.nullDevice
-            do { try process.run() } catch { return (-1, error.localizedDescription) }
-            let killer = DispatchWorkItem { if process.isRunning { process.terminate() } }
-            DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: killer)
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            process.waitUntilExit()
-            killer.cancel()
-            let text = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
-            return (process.terminationStatus, process.terminationReason == .uncaughtSignal ? text + "\n(timed out)" : text)
-        }.value
+        await ProcessRunner.run(path, args, timeout: timeout)
     }
 }

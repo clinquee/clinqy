@@ -68,7 +68,7 @@ enum AXEngine {
 
     /// Collects visible actionable elements from `app`, breadth-first, up to `limit`. A sheet or modal dialog on
     /// the focused window is walked first; the menu bar only when asked (`pressMenu` reaches it by path).
-    static func elements(of app: NSRunningApplication, window snapshot: NativeWindowObservation? = nil, limit: Int = 200, menuBar: Bool = false) -> [UIElementInfo] {
+    static func elements(of app: NSRunningApplication, window snapshot: NativeWindowObservation? = nil, limit: Int = 200, menuBar: Bool = false, excludingWebContent: Bool = false) -> [UIElementInfo] {
         if let snapshot, snapshot.pid != app.processIdentifier || snapshot.staleness() != nil { return [] }
         let root = AXUIElementCreateApplication(app.processIdentifier)
         AXUIElementSetMessagingTimeout(root, 0.5)
@@ -131,7 +131,7 @@ enum AXEngine {
 
             // Don't descend into closed menus from the menu bar.
             if role == "AXMenuBarItem" { continue }
-            if depth < 30 {
+            if depth < 30, !(excludingWebContent && role == "AXWebArea") {
                 queue.append(contentsOf: children(of: element, role: role).map { ($0, depth + 1, inDialog) })
             }
         }
@@ -607,6 +607,7 @@ enum AXEngine {
     /// Shift/Option when needed) plus the character itself, so apps that read key codes and apps that read text
     /// both get it right. Characters no key makes (emoji, other scripts) go as text alone.
     static func type(_ text: String) {
+        guard !Task.isCancelled else { return }
         let source = CGEventSource(stateID: .combinedSessionState)
         for ch in text {
             let k = stroke(for: ch) ?? KeyStroke(code: 0, flags: [])
@@ -624,6 +625,7 @@ enum AXEngine {
 
     /// Pastes text through the clipboard, restoring what was there.
     static func paste(_ text: String) {
+        guard !Task.isCancelled else { return }
         let board = NSPasteboard.general
         let saved = board.string(forType: .string)
         board.clearContents()
@@ -888,6 +890,7 @@ enum AXEngine {
     }
 
     static func press(_ key: CGKeyCode, flags: CGEventFlags = []) {
+        guard !Task.isCancelled else { return }
         keystroke(key, flags: flags, source: CGEventSource(stateID: .hidSystemState))
     }
 }
