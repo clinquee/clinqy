@@ -115,6 +115,7 @@ final class FastLane {
     private func blocker(turnText: String, failures: Int) -> String? {
         guard model != nil, plan != nil else { return "no routine plan" }
         if turnText.hasPrefix("The user added") { return "the user added something" }
+        if turnText.contains("Delegated worker results") { return "the lead must reconcile delegated results" }
         if stintTurns == 0, failures > 0 { return "the lead's last step failed" }
         if stintFailures >= 2 { return "steps failed twice" }
         let most = auto ? Self.maxAutoStint : Self.maxStint
