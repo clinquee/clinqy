@@ -15,33 +15,73 @@ enum Tables {
         }.joined(separator: "\n\n")
     }
 
-    /// Rows of a CSV/TSV file on disk.
-    static func readDelimited(_ url: URL) -> [[String]]? {
-        guard let text = (try? String(contentsOf: url, encoding: .utf8)) ?? (try? String(contentsOf: url, encoding: .isoLatin1)) else { return nil }
-        let sep: Character = url.pathExtension.lowercased() == "tsv" || (!text.contains(",") && text.contains("\t")) ? "\t" : ","
-        return parse(text, separator: sep)
+    /// Stream files through a small buffer; extraction callers use the bounded sample API.
+    static func readDelimited(_ url: URL) -> [[String]]? { readSample(url, maxRows: .max, maxBytes: .max)?.rows }
+
+    static func readSample(_ url: URL, maxRows: Int = 500, maxBytes: Int = 1_000_000) -> (rows: [[String]], truncated: Bool)? {
+        guard let stream = InputStream(url: url) else { return nil }
+        stream.open(); defer { stream.close() }
+        var buffer = [UInt8](repeating: 0, count: 16_384), offset = 0, length = 0, consumed = 0
+        var budgetReached = false
+        func next() -> UInt8? {
+            guard !Task.isCancelled else { return nil }
+            if consumed >= maxBytes { budgetReached = true; return nil }
+            if offset == length {
+                length = stream.read(&buffer, maxLength: buffer.count); offset = 0
+                if length <= 0 { return nil }
+            }
+            consumed += 1
+            defer { offset += 1 }
+            return buffer[offset]
+        }
+        // Detect tabs from a bounded first buffer rather than scanning the entire file.
+        length = stream.read(&buffer, maxLength: buffer.count)
+        guard length >= 0 else { return nil }
+        let head = buffer.prefix(length)
+        let sep: UInt8 = url.pathExtension.lowercased() == "tsv" || (!head.contains(44) && head.contains(9)) ? 9 : 44
+        let limit = maxRows == .max ? Int.max : maxRows + 1
+        var rows = parseBytes(separator: sep, maxRows: limit, next: next)
+        guard stream.streamError == nil, !Task.isCancelled else { return nil }
+        let truncated = budgetReached || rows.count > maxRows
+        if budgetReached, !rows.isEmpty { rows.removeLast() } // A partial record must never look complete.
+        return (Array(rows.prefix(maxRows)), truncated)
     }
 
-    /// A small RFC 4180 parser: quoted fields, doubled quotes, newlines inside quotes.
+    /// RFC 4180 without a second Character array: quoted fields, doubled quotes, CRLF and quoted newlines.
     static func parse(_ text: String, separator: Character = ",") -> [[String]] {
-        var rows: [[String]] = [], row: [String] = [], field = "", quoted = false
-        var chars = Array(text.replacingOccurrences(of: "\r\n", with: "\n"))[...]
-        while let c = chars.popFirst() {
+        var bytes = text.utf8.makeIterator()
+        return parseBytes(separator: String(separator).utf8.first ?? 44, maxRows: .max) { bytes.next() }
+    }
+
+    private static func parseBytes(separator: UInt8, maxRows: Int, next: () -> UInt8?) -> [[String]] {
+        var rows: [[String]] = [], row: [String] = [], field = Data()
+        var quoted = false, quotePending = false, skipLF = false
+        func finishField() {
+            row.append(String(data: field, encoding: .utf8) ?? String(data: field, encoding: .isoLatin1) ?? "")
+            field.removeAll(keepingCapacity: true)
+        }
+        while let c = next() {
+            if skipLF { skipLF = false; if c == 10 { continue } }
             if quoted {
-                if c == "\"" {
-                    if chars.first == "\"" { field.append("\""); chars.removeFirst() } else { quoted = false }
-                } else { field.append(c) }
-            } else if c == "\"" && field.isEmpty {
-                quoted = true
-            } else if c == separator {
-                row.append(field); field = ""
-            } else if c == "\n" {
-                row.append(field); field = ""
+                if quotePending {
+                    if c == 34 { field.append(34); quotePending = false; continue }
+                    quoted = false; quotePending = false
+                } else {
+                    if c == 34 { quotePending = true } else { field.append(c) }
+                    continue
+                }
+            }
+            if c == 34 && field.isEmpty { quoted = true }
+            else if c == separator { finishField() }
+            else if c == 10 || c == 13 {
+                finishField()
                 if row.contains(where: { !$0.isEmpty }) { rows.append(row) }
-                row = []
+                row.removeAll(keepingCapacity: true)
+                skipLF = c == 13
+                if rows.count >= maxRows { return rows }
             } else { field.append(c) }
         }
-        row.append(field)
+        finishField()
         if row.contains(where: { !$0.isEmpty }) { rows.append(row) }
         return rows
     }
@@ -76,16 +116,22 @@ enum Tables {
             let exists = FileManager.default.fileExists(atPath: url.path)
             if exists, append {
                 // Add to the end; skip the header row if the file already starts with the same one.
-                let old = readDelimited(url) ?? []
-                let add = old.first.map { $0 == rows.first ?? [] } == true ? Array(rows.dropFirst()) : rows
+                guard let old = readSample(url, maxRows: 1) else { throw Pdf.Failure("couldn't read the existing CSV header") }
+                let add = old.rows.first.map { $0 == rows.first ?? [] } == true ? Array(rows.dropFirst()) : rows
                 let handle = try FileHandle(forWritingTo: url)
                 defer { try? handle.close() }
-                handle.seekToEndOfFile()
-                handle.write(Data(csv(add).utf8))
+                let end = handle.seekToEndOfFile()
+                if end > 0, let reader = try? FileHandle(forReadingFrom: url) {
+                    defer { try? reader.close() }
+                    try reader.seek(toOffset: end - 1)
+                    let last = try reader.read(upToCount: 1)?.first
+                    if last != 10 && last != 13 { try handle.write(contentsOf: Data([10])) }
+                }
+                if !add.isEmpty { try handle.write(contentsOf: Data(csv(add).utf8)) }
                 if destination == "numbers", let app = numbersURL() {
                     _ = try? await NSWorkspace.shared.open([url], withApplicationAt: app, configuration: .init())
                 }
-                return "appended \(add.count) rows to \(url.path) (now \(old.count + add.count) rows)"
+                return "appended \(add.count) rows to \(url.path)"
             }
             if exists { url = Pdf.unique(url) }   // never overwrite
             try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)

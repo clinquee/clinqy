@@ -15,16 +15,36 @@ enum Reader {
 
     /// Text of a local or downloadable file: PDFs through PDFKit, Word/RTF/HTML/text through AppKit.
     static func fileText(_ url: URL) async -> String? {
+        guard !Task.isCancelled else { return nil }
         var local = url
+        defer { if local != url { try? FileManager.default.removeItem(at: local) } }
         if !url.isFileURL {
             guard let (tmp, _) = try? await URLSession.shared.download(from: url) else { return nil }
             local = tmp
         }
         if url.pathExtension.lowercased() == "pdf" || isPDF(local) {
             guard let doc = PDFDocument(url: local) else { return nil }
-            let text = (0..<doc.pageCount).compactMap { doc.page(at: $0)?.string }.joined(separator: "\n\n")
-            return clean(text)
+            var text = ""
+            var page = 0
+            // Bound scanned/empty PDFs as well as text-rich documents.
+            while page < min(doc.pageCount, 100), text.count < 12_000 {
+                guard !Task.isCancelled else { return nil }
+                text += (doc.page(at: page)?.string ?? "") + "\n\n"
+                page += 1
+            }
+            return clean(text).map { $0 + (page < doc.pageCount ? "\n[excerpt truncated]" : "") }
         }
+        let plain = ["txt", "md", "csv", "tsv", "json", "log", "swift", "py", "js", "ts", "rs", "xml", "yaml", "yml"]
+        if plain.contains(url.pathExtension.lowercased()), let handle = try? FileHandle(forReadingFrom: local) {
+            defer { try? handle.close() }
+            let bytes = handle.readData(ofLength: 64_001)
+            return clean(String(decoding: bytes.prefix(64_000), as: UTF8.self)).map {
+                $0 + (bytes.count > 64_000 ? "\n[excerpt truncated]" : "")
+            }
+        }
+        // Rich document importers allocate the entire document; refuse unbounded input.
+        guard let size = try? local.resourceValues(forKeys: [.fileSizeKey]).fileSize, size <= 20_000_000,
+              !Task.isCancelled else { return nil }
         if let attributed = try? NSAttributedString(url: local, options: [:], documentAttributes: nil) {
             return clean(attributed.string)
         }

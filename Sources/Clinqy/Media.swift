@@ -1,4 +1,4 @@
-import AVFoundation
+@preconcurrency import AVFoundation
 
 /// Video/audio jobs with AVFoundation, in the background with no time limit: join, trim, shrink, convert,
 /// pull out the audio. Joining and trimming copy the streams without re-encoding when they can (seconds, not minutes).

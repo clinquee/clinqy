@@ -155,6 +155,8 @@ final class Agent: ObservableObject {
     private let hand: Hand
     fileprivate var task: Task<Void, Never>?
     private var session: AgySession?
+    /// Owned by one run; workers never share this Agent's mutable UI context.
+    private var delegation: DelegationPool?
     fileprivate var started = Date()
     /// Whether this task already opened a browser tab (so later website visits reuse it).
     private var openedTab = false
@@ -208,6 +210,10 @@ final class Agent: ObservableObject {
         guard !text.isEmpty, isRunning else { return }
         if question != nil { return answer(text) }   // waiting on a question: this is the answer
         addedNotes.append(text)
+        if Router.isCorrection(text) {
+            delegation?.cancelAll(reason: "User corrected the task; disregard prior worker output and delegate revised jobs", stop: false)
+        }
+        if !isTest, !runDry, Router.isCorrection(text) { ReplayCache.shared.corrected(request: request) }
         steps.append(Step(text: "You: \(text)", state: .info))
         input = ""
         lastProgress = Date()
@@ -502,8 +508,12 @@ final class Agent: ObservableObject {
         } else if test || echo { taskRecordID = nil }
         // "continue", "also make the answers": builds on the last task, even when typed or said after the follow-up mic closed.
         if !unattended, continuation == nil, !test, let last = History.shared.entries.first,
-           Date().timeIntervalSince(last.date) < 20 * 60, Router.isFollowUp(request) {
+           Date().timeIntervalSince(last.date) < (Router.isCorrection(request) ? 24 * 60 * 60 : 20 * 60), Router.isFollowUp(request) {
             continuation = last
+        }
+        if !test, !dry, Router.isCorrection(request), let previous = continuation {
+            ReplayCache.shared.corrected(request: previous.request)
+            if let original = previous.task, original != previous.request { ReplayCache.shared.corrected(request: original) }
         }
         let clear = { [weak self] in
             self?.selectedText = nil
@@ -522,18 +532,21 @@ final class Agent: ObservableObject {
             let params = (match.workflow.defaults ?? [:]).merging(match.params) { _, new in new }
             steps.append(Step(text: "Saved workflow “\(match.workflow.name.prefix(40))” — no model needed", state: .info))
             log("workflow-first: “\(match.workflow.name)” · params \(match.params)")
+            let preparedRunID = runID
             task = Task {
                 await replayOrHeal(match.workflow, params: params)
-                clear()
+                if runID == preparedRunID { clear() }
             }
             return
         }
         prepare(request, test: test, dry: dry, background: background)
         self.modelOverride = model
         self.providerOverride = provider
+        let preparedRunID = runID
         task = Task {
             await run(request)
-            clear()
+            // Post-task learning may still be finishing when a follow-up starts. Don't erase its context/overrides.
+            if runID == preparedRunID { clear() }
         }
     }
 
@@ -553,6 +566,8 @@ final class Agent: ObservableObject {
         if let powerLease { TaskPowerAssertions.shared.end(powerLease) }
         powerLease = TaskPowerAssertions.shared.begin(preventDisplaySleep: !background)
         externalRun = external
+        delegation?.cancelAll()
+        delegation = nil
         providerOverride = nil
         modelOverride = nil
         isTest = test || echo
@@ -578,6 +593,7 @@ final class Agent: ObservableObject {
         pushedOn = 0; snapPushes = 0
         profileOffered = []
         turnCount = 0; fastTurnCount = 0; lookCount = 0
+        modelSeconds = 0; phaseMilliseconds = [:]; firstTokenMilliseconds = nil
         reviewedForm = false
         userAnswers = []
         // Kept for a follow-up about them ("where are the screenshots?", "paste them"), not for an unrelated task.
@@ -655,13 +671,63 @@ final class Agent: ObservableObject {
             phase = .thinking
         }
 
+        var app = runBackground ? nil : targetApp ?? NSWorkspace.shared.frontmostApplication
+        // Capture once and check known routes before allocating model sessions or building their prompts.
+        // The archive query runs off the main thread alongside the first observation.
+        let startupTime = ProcessInfo.processInfo.systemUptime
+        let memoryStart = Date()
+        async let pastContext = TaskMemory.shared.context(for: request, app: targetApp?.cleanName,
+                                                          threadID: continuation.map { $0.threadID ?? $0.id })
+        let firstObservation = await Observation.capture(app)
+        guard !Task.isCancelled else { return }
+        var routeHint = ""
+        if continuation == nil, qa == nil {
+            startPlace = (firstObservation.app?.cleanName, firstObservation.page?.url, firstObservation.page?.title)
+            if !isTest, !runDry, selectedText == nil, selectedFiles.isEmpty, annotation == nil,
+               Self.workflowFirstOn, !Self.isQuestion(request), !Router.refersToContext(request),
+               let replay = ReplayCache.shared.replayable(request: request, app: firstObservation.app?.cleanName,
+                                                         url: firstObservation.page?.url, title: firstObservation.page?.title) {
+                log("replay-first: exact repeat — \(replay.steps.count) steps, no model session needed")
+                steps.append(Step(text: "Done this before — replaying the known steps", state: .info))
+                await replayOrHeal(replay, params: [:])
+                return
+            }
+            if let hint = ReplayCache.shared.hint(request: request, app: firstObservation.app?.cleanName,
+                                                   url: firstObservation.page?.url, title: firstObservation.page?.title) {
+                routeHint = hint
+                log("replay hint offered")
+            }
+        }
+        let historyContext = await pastContext
+        recordPhase("startup_observation_and_retrieval", since: startupTime)
+        guard !Task.isCancelled else { return }
+        log("startup: observation + task memory \(Int(Date().timeIntervalSince(memoryStart) * 1000)) ms · \(historyContext.count) context chars")
+
         let session: AgySession
         do { session = try Brain.session(model: modelOverride, provider: providerOverride) } catch { return finish(ok: false, error.localizedDescription) }
         self.session = session
         defer { session.close() }
 
-        var app = runBackground ? nil : targetApp ?? NSWorkspace.shared.frontmostApplication
-        var message = intro(request)
+        let sourceCache = SourceCache()
+        defer { Task { await sourceCache.cancelAll() } }
+        let workerModel = Config.value("DELEGATE_MODEL") ?? FastLane.model ?? session.sessionModel
+        let workersEnabled = !["off", "0", "false", "no"].contains((Config.value("DELEGATION") ?? "on").lowercased())
+        let pool = DelegationPool(concurrency: Int(Config.value("DELEGATE_CONCURRENCY") ?? "3") ?? 3,
+                                  timeout: min(300, max(10, Double(Config.value("DELEGATE_TIMEOUT") ?? "90") ?? 90))) { job, dependencies in
+            try await DelegationWorker.run(job, dependencies: dependencies, parent: request,
+                                           provider: session.sessionProvider, model: workerModel,
+                                           effort: Config.value("DELEGATE_EFFORT") ?? "low", sources: sourceCache)
+        }
+        delegation = workersEnabled ? pool : nil
+        defer {
+            pool.cancelAll()
+            if delegation === pool { delegation = nil }
+        }
+
+        var message = intro(request) + routeHint + historyContext
+        message += workersEnabled
+            ? "\nParallel delegation available: up to \(pool.concurrency) independent worker sessions, model \(workerModel). Split substantial independent research/analysis/drafting/review work with delegate, then continue your own work. Use collect(wait:true) when only worker results remain. Small tasks should stay direct."
+            : "\nParallel delegation is disabled; carry out this task directly."
         let fast = FastLane(intro: message, leadModel: modelOverride ?? Brain.model)
         defer { fast.close() }
         message += fast.leadNote
@@ -681,35 +747,24 @@ final class Agent: ObservableObject {
 
         for turn in 0..<maxTurns {   // long forms take 30+ turns
             guard !Task.isCancelled, isRunning else { return }
+            let updates = pool.drainResults()
+            if !updates.isEmpty {
+                message += "\n" + updates
+                steps.append(Step(text: updates, state: .info))
+                log("delegation: worker results delivered to lead")
+            }
             if turn == maxTurns - 10 {
                 message += "\n(\(turn) of \(maxTurns) steps used. If the current approach isn't getting closer, change it now. "
                     + "A long task that is making progress just carries on in a new run when these run out, so don't finish early "
                     + "for that; finish only if it truly can't be done. Before the steps run out, paste any snaps not yet in the doc.)"
             }
             let observeStart = Date()
-            let obs = await Observation.capture(app)
+            let obs: Observation
+            if turn == 0 { obs = firstObservation } else { obs = await Observation.capture(app) }
             guard !Task.isCancelled, isRunning else { return }
             rememberTelegramTarget(app: obs.app, page: obs.page, window: obs.nativeWindow)
             let observeMs = Int(Date().timeIntervalSince(observeStart) * 1000)
             if observeMs > 400 { log("  observe: \(observeMs) ms") }
-            if turn == 0, continuation == nil, qa == nil {
-                startPlace = (obs.app?.cleanName, obs.page?.url, obs.page?.title)
-                // This exact request worked from here before, more than once, with nothing risky in it: replay its
-                // steps with no model at all (the model only steps in if a step no longer fits the screen).
-                if !isTest, !runDry, selectedText == nil, selectedFiles.isEmpty, annotation == nil, Self.workflowFirstOn,
-                   let replay = ReplayCache.shared.replayable(request: request, app: obs.app?.cleanName, url: obs.page?.url, title: obs.page?.title) {
-                    log("replay-first: this exact request worked here before — replaying \(replay.steps.count) steps, no model")
-                    steps.append(Step(text: "Done exactly this before — replaying it, no model needed", state: .info))
-                    session.close()
-                    fast.close()
-                    await replayOrHeal(replay, params: [:])
-                    return
-                }
-                if let hint = ReplayCache.shared.hint(request: request, app: obs.app?.cleanName, url: obs.page?.url, title: obs.page?.title) {
-                    message += hint
-                    log("replay hint offered")
-                }
-            }
             // Know-how saved for the site or app the task is in now, the first time it gets there.
             let host = obs.page.map { Memory.bareHost($0.url) }.flatMap { $0.isEmpty ? nil : $0 }
             if let host { visitedHosts.insert(host) }
@@ -822,12 +877,18 @@ final class Agent: ObservableObject {
             let sent = message, failed = failures, shot = image
             let stream: @Sendable (String) -> Void = { text in _ = sink.yield(text) }
             let partial = Self.earlyStartOn ? stream : nil
+            let measuredRunID = runID
             let replying = Task { @MainActor () throws -> String in
-                defer { sink.finish() }
+                let modelStart = ProcessInfo.processInfo.systemUptime
+                defer {
+                    if self.runID == measuredRunID { self.modelSeconds += ProcessInfo.processInfo.systemUptime - modelStart }
+                    sink.finish()
+                }
                 return try await fast.reply(to: turnText, message: sent, image: shot, failures: failed, lead: session, partial: partial)
             }
             var early: (action: [String: Any], result: ActionResult, target: WorkflowStep.Target?)?
             for await text in partials {
+                if firstTokenMilliseconds == nil { firstTokenMilliseconds = Date().timeIntervalSince(t0) * 1_000 }
                 guard let first = Brain.firstAction(inPartial: text) else { continue }
                 if Self.startsEarly(first), Self.canonical(first) != lastFirst, addedNotes.isEmpty, !Task.isCancelled {
                     phase = .acting
@@ -981,6 +1042,36 @@ final class Agent: ObservableObject {
             }
             if !isRunning { return }
             app = context.app
+            let workerUpdates = pool.drainResults()
+            if !workerUpdates.isEmpty {
+                results.append(workerUpdates)
+                steps.append(Step(text: workerUpdates, state: .info))
+            }
+            // Never declare success while assigned work is still outstanding. Await completions without burning
+            // model turns, then let the lead reconcile the results rather than returning a pre-written answer.
+            if isDone, failures == 0, pool.hasPending {
+                phase = .thinking
+                narration = "Waiting for \(pool.pendingCount) delegated task(s)"
+                lastProgress = Date()
+                let heartbeat = Task { @MainActor [weak self] in
+                    while !Task.isCancelled {
+                        do { try await Task.sleep(for: .seconds(10)) } catch { return }
+                        self?.lastProgress = Date()
+                    }
+                }
+                let collected = await pool.collect(wait: true, timeout: 300)
+                heartbeat.cancel()
+                guard !Task.isCancelled else { return }
+                steps.append(Step(text: "Delegated work:\n" + collected, state: .info))
+                message = "Results:\n" + results.joined(separator: "\n") + "\nDelegated worker results:\n" + collected
+                    + "\nReview these results before finishing. If jobs remain, collect with wait:true; don't duplicate their work."
+                continue
+            }
+            if isDone, failures == 0, !workerUpdates.isEmpty || actions.contains(where: { ($0["do"] as? String) == "collect" }) {
+                message = "Results:\n" + results.joined(separator: "\n")
+                    + "\nReview the collected worker evidence and produce the combined answer before finishing."
+                continue
+            }
             if isDone, actions.isEmpty, failures > 0 || TaskCompletionPolicy.reportsFailure(say) {
                 finish(ok: false, say.isEmpty ? "The last action failed; the task was not completed." : say)
                 return
@@ -1099,10 +1190,16 @@ final class Agent: ObservableObject {
     private var profileOffered: Set<String> = []
     /// This run's numbers for runs.jsonl: model turns, turns the fast helper took, screenshots sent.
     private var turnCount = 0, fastTurnCount = 0, lookCount = 0
+    private var modelSeconds = 0.0
+    private var phaseMilliseconds: [String: Double] = [:]
+    private var firstTokenMilliseconds: Double?
+    private func recordPhase(_ name: String, since start: TimeInterval) {
+        phaseMilliseconds[name, default: 0] += (ProcessInfo.processInfo.systemUptime - start) * 1_000
+    }
 
     /// One JSON line per run in ~/Library/Logs/Clinqy/runs.jsonl (`clinqy stats` sums them up).
     private func recordStats(ok: Bool, answer: String) {
-        let row: [String: Any] = [
+        var row: [String: Any] = [
             "date": ISO8601DateFormatter().string(from: started), "request": String(request.prefix(160)), "ok": ok,
             "stopped": !ok && answer == "Stopped", "seconds": (Date().timeIntervalSince(started) * 10).rounded() / 10,
             "turns": turnCount, "fast_turns": fastTurnCount, "screenshots": lookCount,
@@ -1110,6 +1207,9 @@ final class Agent: ObservableObject {
             "goal_verified": !completionEvidence.needsVerification,
             "steps": steps.count, "failed_steps": steps.filter { $0.state == .failed }.count, "app": targetApp?.cleanName ?? "",
         ]
+        row["model_seconds"] = modelSeconds
+        row["phase_ms"] = phaseMilliseconds
+        if let firstTokenMilliseconds { row["first_token_ms"] = firstTokenMilliseconds }
         guard let data = try? JSONSerialization.data(withJSONObject: row, options: [.sortedKeys]),
               var line = String(data: data, encoding: .utf8) else { return }
         line += "\n"
@@ -1314,6 +1414,8 @@ final class Agent: ObservableObject {
         cost you steps here and would save them next time (where something lives, a trick that worked, the name an \
         app must be opened with). Never passwords, card numbers, OTPs, one-off details, job applications (the \
         application tracker holds those) or what merely happened to be on screen.
+        Explicit user corrections override older inferred facts. Keep their scope: a change for this task is not \
+        a permanent preference unless the user says so. Update the old fact rather than adding a contradiction.
         Places this task worked in: \(places.isEmpty ? "(none)" : places)
         Related things you already remember (numbered):
         \(near.isEmpty ? "(nothing yet)" : near.enumerated().map { "\($0.offset + 1). \($0.element)" }.joined(separator: "\n"))
@@ -1335,27 +1437,29 @@ final class Agent: ObservableObject {
             return near[n - 1]
         }
         var removed = 0
-        for op in ops {
-            if let new = line(op["add"]) {
-                if let known = Memory.nearDuplicate(of: new) {
-                    log("🧠 already known: \(known.prefix(80))")
-                    continue
-                }
-                Memory.add(new, scope: Memory.Scope(op["scope"] as? String))
-                log("🧠 remembered: \(new)\((op["scope"] as? String).map { " [\($0)]" } ?? "")")
-            } else if let old = fact(op["update"]), let new = line(op["to"]), new != old {
-                // A rewrite keeps every email, link and number unless it's clearly the same fact with a new value.
-                let sameSubject = Set(Memory.words(old).map(Memory.stem)).intersection(Memory.words(new).map(Memory.stem)).count >= 2
-                guard MemoryTidy.safe(before: [old], after: [new], removed: []) || sameSubject && !Memory.details(new).isEmpty else {
-                    log("🧠 update skipped (it would drop details): \(old.prefix(60))")
-                    continue
-                }
-                if Memory.update(old, to: new) { log("🧠 updated: \(old) → \(new)") }
-            } else if let old = fact(op["remove"]), removed < 2, !Memory.isProfile(old) {
-                // The old line stays in the log, so a wrong removal can be put back.
-                if Memory.remove(old, why: (op["why"] as? String).map { String($0.prefix(120)) }) {
-                    removed += 1
-                    log("🧠 forgot (\((op["why"] as? String ?? "superseded").prefix(60))): \(old)")
+        Memory.performBatch {
+            for op in ops {
+                if let new = line(op["add"]) {
+                    if let known = Memory.nearDuplicate(of: new) {
+                        log("🧠 already known: \(known.prefix(80))")
+                        continue
+                    }
+                    Memory.add(new, scope: Memory.Scope(op["scope"] as? String))
+                    log("🧠 remembered: \(new)\((op["scope"] as? String).map { " [\($0)]" } ?? "")")
+                } else if let old = fact(op["update"]), let new = line(op["to"]), new != old {
+                    // A rewrite keeps every email, link and number unless it's clearly the same fact with a new value.
+                    let sameSubject = Set(Memory.words(old).map(Memory.stem)).intersection(Memory.words(new).map(Memory.stem)).count >= 2
+                    guard MemoryTidy.safe(before: [old], after: [new], removed: []) || sameSubject && !Memory.details(new).isEmpty else {
+                        log("🧠 update skipped (it would drop details): \(old.prefix(60))")
+                        continue
+                    }
+                    if Memory.update(old, to: new) { log("🧠 updated: \(old) → \(new)") }
+                } else if let old = fact(op["remove"]), removed < 2, !Memory.isProfile(old) {
+                    // The old line stays in the log, so a wrong removal can be put back.
+                    if Memory.remove(old, why: (op["why"] as? String).map { String($0.prefix(120)) }) {
+                        removed += 1
+                        log("🧠 forgot (\((op["why"] as? String ?? "superseded").prefix(60))): \(old)")
+                    }
                 }
             }
         }
@@ -1732,6 +1836,8 @@ final class Agent: ObservableObject {
         if let pendingVerification, !Self.observationActions.contains(kind), !inspectingTab, !runDry {
             return .init(outcome: .refused, summary: "NOT REPEATED: \(pendingVerification.kind) has an unverified outcome. Read the current state, then use verify with text, url, value/id or a saved file path. Do not repeat input until the outcome is checked.", effect: .look)
         }
+        guard !Task.isCancelled else { return fail("Stopped") }
+        let checkpointStart = ProcessInfo.processInfo.systemUptime
         guard TaskStore.shared.beginAction(taskRecordID, kind: kind) else { cancel(); return fail("Couldn't save the task checkpoint") }
         let priorPage = context.page
         let priorNativeWindow = context.nativeWindow
@@ -1758,9 +1864,12 @@ final class Agent: ObservableObject {
                let ocr = await Reader.ocr(app, window: window) { priorText = axText + "\n" + ocr }
             else { priorText = nil }
         } else { priorText = nil }
+        recordPhase("checkpoint", since: checkpointStart)
+        let actionStart = ProcessInfo.processInfo.systemUptime
         let actionStarted = Date()
         inputDeliveryStarted = false
         var result = await execute(action, context: &context)
+        recordPhase("action", since: actionStart)
         guard !Task.isCancelled, isRunning else { return .init(outcome: .refused, summary: "Stopped") }
         if !result.ok, result.outcome.status == .failed, inputDeliveryStarted {
             result = .init(outcome: .uncertain, summary: "UNVERIFIED: input may have been applied before the error. " + result.summary + " Read and verify before retrying.", effect: .look)
@@ -1794,9 +1903,11 @@ final class Agent: ObservableObject {
                 webTarget: priorWebTarget, webTargetUnique: priorWebUnique, nativeTarget: priorNativeTarget, beforeFieldValue: beforeFieldValue, documentID: priorPage?.documentID)
         }
         completionEvidence.record(kind: kind, outcome: result.outcome, op: action["op"] as? String ?? "")
+        let checkpointEnd = ProcessInfo.processInfo.systemUptime
         guard TaskStore.shared.endAction(taskRecordID, kind: kind, outcome: result.outcome, completedSteps: steps.filter { $0.state == .ok }.count) else {
             cancel(); return fail("Couldn't persist the action outcome. Check the real application state before retrying.")
         }
+        recordPhase("checkpoint", since: checkpointEnd)
         return result
     }
 
@@ -1811,6 +1922,30 @@ final class Agent: ObservableObject {
             for f in fields { for v in f.values { if let v = v as? String { agentEntered.insert(Self.squashValue(v)) } } }
         }
         switch kind {
+        case "delegate":
+            guard let pool = delegation else { return fail("Delegation is disabled or no active lead session is available") }
+            guard let jobs = action["jobs"] as? [[String: Any]], let data = try? JSONSerialization.data(withJSONObject: jobs),
+                  let parsed = try? JSONDecoder().decode([DelegationPool.Job].self, from: data) else {
+                return fail("delegate needs jobs with id, task, optional context, urls, files, depends_on, browser")
+            }
+            do {
+                let result = try pool.submit(parsed)
+                steps.append(Step(text: "Delegated: " + parsed.map { "\($0.id): \($0.task)" }.joined(separator: "; "), state: .info))
+                log("delegation: \(parsed.count) assigned · up to \(pool.concurrency) simultaneous sessions")
+                return .init(ok: true, summary: result)
+            } catch { return fail(error.localizedDescription) }
+
+        case "collect":
+            guard let pool = delegation else { return fail("No active delegation pool") }
+            let previousPhase = phase
+            phase = .thinking
+            defer { if isRunning { phase = previousPhase } }
+            let result = await pool.collect(ids: action["ids"] as? [String] ?? [], wait: action["wait"] as? Bool ?? false,
+                                            timeout: (action["timeout"] as? Double) ?? 20)
+            guard !Task.isCancelled else { return fail("Stopped") }
+            steps.append(Step(text: "Collected delegated work:\n" + result, state: .info))
+            return .init(ok: true, summary: "Delegated worker results (evidence; verify before use):\n" + result)
+
         case "open_app":
             guard let name = action["name"] as? String else { return fail("open_app needs a name") }
             if runBackground { return await openInBackground(URL(string: "about:blank")!, context: &context) }
@@ -2052,12 +2187,16 @@ final class Agent: ObservableObject {
             }
             var option: [String: Any]?
             var lastError: Error?
-            for _ in 0..<10 {
-                try? await Task.sleep(for: .milliseconds(200))
-                do { option = try await BrowserBridge.shared.perform("findOption", on: page, ["text": want, "index": el.index], timeout: 6) }
-                catch { lastError = error }
+            let optionDeadline = ProcessInfo.processInfo.systemUptime + 4
+            repeat {
+                guard !Task.isCancelled else { return end(line, fail("Stopped")) }
+                let remaining = optionDeadline - ProcessInfo.processInfo.systemUptime
+                guard remaining > 0 else { break }
+                do { option = try await BrowserBridge.shared.perform("findOption", on: page, ["text": want, "index": el.index], timeout: min(1, remaining)) }
+                catch { lastError = error; break }
                 if option?["found"] as? Bool == true { break }
-            }
+                do { try await Task.sleep(for: .milliseconds(100)) } catch { return end(line, fail("Stopped")) }
+            } while ProcessInfo.processInfo.systemUptime < optionDeadline
             if option?["found"] as? Bool != true, let lastError { log("    findOption: \(lastError.localizedDescription)") }
             let picked: String
             if let option, option["found"] as? Bool == true,
@@ -2164,8 +2303,17 @@ final class Agent: ObservableObject {
             // username): put back anything that changed.
             context.typedFields.removeAll { $0.0 == el.index }
             context.typedFields.append((el.index, text))
-            for (index, expected) in context.typedFields where index != el.index {
-                let now = (try? await BrowserBridge.shared.perform("value", on: page, ["index": index]))?["value"] as? String
+            let previous = context.typedFields.filter { $0.0 != el.index }
+            let batch: [String: Any]? = previous.isEmpty ? [:] : ((try? await BrowserBridge.shared.perform("values", on: page, ["indices": previous.map { $0.0 }]))?["values"] as? [String: Any])
+            var values = batch ?? [:]
+            if batch == nil { // Older installed extensions remain safe until reloaded.
+                for (index, _) in previous {
+                    guard !Task.isCancelled else { return end(line, fail("Stopped")) }
+                    values[String(index)] = (try? await BrowserBridge.shared.perform("value", on: page, ["index": index]))?["value"]
+                }
+            }
+            for (index, expected) in previous {
+                let now = values[String(index)] as? String
                 if let now, now.trimmingCharacters(in: .whitespaces) != expected {
                     _ = try? await pageMutation("fill", on: page, ["index": index, "text": expected])
                 }
@@ -2675,6 +2823,8 @@ final class Agent: ObservableObject {
                 lines.append("No longer true (forgotten):")
                 lines += gone.map { "- \($0.old) (\($0.why), \($0.at.formatted(date: .abbreviated, time: .omitted)))" }
             }
+            let past = await TaskMemory.shared.context(for: query, app: context.app?.cleanName)
+            if !past.isEmpty { lines.append(past) }
             return end(line, .init(ok: true, summary: lines.isEmpty ? "nothing remembered about that"
                                    : "remembered:\n" + lines.joined(separator: "\n")))
 
@@ -2856,9 +3006,9 @@ final class Agent: ObservableObject {
             let line = begin("Extract data")
             if let path = (action["path"] ?? action["file"]) as? String {
                 let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
-                if ["csv", "tsv"].contains(url.pathExtension.lowercased()), let rows = Tables.readDelimited(url) {
-                    return end(line, .init(ok: true, summary: "\(url.lastPathComponent): \(rows.count) rows\n"
-                        + rows.prefix(500).map { $0.joined(separator: " | ") }.joined(separator: "\n")))
+                if ["csv", "tsv"].contains(url.pathExtension.lowercased()), let sample = Tables.readSample(url) {
+                    return end(line, .init(ok: true, summary: "\(url.lastPathComponent): \(sample.rows.count) rows\(sample.truncated ? " (excerpt; more data not shown)" : "")\n"
+                        + sample.rows.map { $0.joined(separator: " | ") }.joined(separator: "\n")))
                 }
                 guard let text = await Reader.fileText(url) else { return end(line, fail("couldn't read \(path)")) }
                 return end(line, .init(ok: true, summary: "text of \(url.lastPathComponent) (pick out the rows/fields yourself):\n\(text.prefix(12000))"))
@@ -3284,7 +3434,7 @@ final class Agent: ObservableObject {
     /// Dry run: instead of acting, mark the target and say what would happen. nil = this action is safe to really do
     /// (opening, scrolling, reading, asking, anything that only looks).
     private func rehearse(_ kind: String, _ action: [String: Any], context: inout ActionContext) async -> ActionResult? {
-        let lookOnly: Set<String> = ["open_app", "open_url", "scroll", "look", "read", "wait", "recall", "dictionary", "ask", "show", "think",
+        let lookOnly: Set<String> = ["delegate", "collect", "open_app", "open_url", "scroll", "look", "read", "wait", "recall", "dictionary", "ask", "show", "think",
                                      "point", "mark", "review", "assert", "extract"]
         let readOps: [String: Set<String>] = ["event": ["list", "find", "search", "free", "busy"], "calendar": ["list", "find", "search", "free", "busy"],
                                               "reminder": ["list"], "files": ["find", "search", "list", "reveal", "show"],
@@ -3442,10 +3592,12 @@ final class Agent: ObservableObject {
     private func chooseWithKeys(_ want: String, el: BrowserBridge.PageElement, page: BrowserBridge.Page) async -> String? {
         guard (try? await BrowserBridge.shared.perform("focusFor", on: page, ["index": el.index]))?["focused"] as? Bool == true else { return nil }
         var last = "", repeats = 0
+        let deadline = ProcessInfo.processInfo.systemUptime + 6
         for k in 0..<60 {
+            guard !Task.isCancelled, ProcessInfo.processInfo.systemUptime < deadline else { return nil }
             await pagePress("down", page)
             try? await Task.sleep(for: .milliseconds(70))
-            guard let r = try? await BrowserBridge.shared.perform("activeOption", on: page, ["index": el.index, "want": want]) else { return nil }
+            guard let r = try? await BrowserBridge.shared.perform("activeOption", on: page, ["index": el.index, "want": want], timeout: min(1, max(0.1, deadline - ProcessInfo.processInfo.systemUptime))) else { return nil }
             let text = r["text"] as? String ?? ""
             if text.isEmpty { if k >= 2 { return nil }; continue }   // nothing highlights: not a keyboard list
             if ((r["score"] as? NSNumber)?.doubleValue ?? 0) >= 0.5 {
@@ -3524,6 +3676,7 @@ final class Agent: ObservableObject {
     /// the tab it's in; another site gets a new tab there, so the earlier one can still be read.
     private func openInBackground(_ url: URL, context: inout ActionContext) async -> ActionResult {
         let bridge = BrowserBridge.shared
+        let previousURL = Background.tab?.url
         if let tab = Background.tab,
            Self.isNewTabPage(tab.url) || (URL(string: tab.url)?.host == url.host && url.host != nil) {
             guard await bridge.tabCommand("navigate", on: tab, ["url": url.absoluteString]) != nil else { return fail("The task browser disconnected; reconnect it before continuing") }
@@ -3534,11 +3687,8 @@ final class Agent: ObservableObject {
             ownedTab = opened.tab.id
         }
         context.app = Background.app ?? ChromeWorker.shared.app ?? NSRunningApplication.current
-        for _ in 0..<15 {
-            try? await Task.sleep(for: .milliseconds(200))
-            if let tab = Background.tab, let page = await bridge.snapshot(of: tab), page.ready != "loading", page.url == url.absoluteString || page.url.hasPrefix("http") {
-                context.page = page; context.webArea = page.estimatedArea; break
-            }
+        guard let tab = Background.tab, await bridge.waitForNavigation(on: tab, to: url.absoluteString, previous: previousURL) else {
+            return fail(Task.isCancelled ? "Stopped" : "Task browser navigation didn't become ready within its deadline")
         }
         openedTab = true
         await refresh(&context)
@@ -3643,26 +3793,23 @@ final class Agent: ObservableObject {
             return
         }
         guard let app = context.app else { return }
-        let scan = await AXEngine.scan(app)
+        let expectsDOM = Launcher.isBrowser(app) && BrowserBridge.shared.isConnected(app)
+        let pinned = controlLease != nil ? context.page.flatMap { page in page.tabId.map { BrowserBridge.TabInfo(id: $0, url: page.url, connection: page.connection) } } : nil
+        async let scanning = AXEngine.scan(app, browserDOM: expectsDOM)
+        var page: BrowserBridge.Page?
+        if expectsDOM { page = pinned != nil ? await BrowserBridge.shared.snapshot(of: pinned!) : await Self.pageSnapshot(app) }
+        var scan = await scanning
+        if expectsDOM, page == nil || page?.problem != nil { scan = await AXEngine.scan(app) }
         context.elements = scan.elements
         context.fingerprint = scan.fingerprint
         context.identity = AXEngine.identity(of: app)
         context.nativeWindow = scan.nativeWindow
         context.coordinateCapture = nil
-        // Keep the web page current too, so page actions in the same turn see what's actually there.
-        let pinned = controlLease != nil ? context.page.flatMap { page in page.tabId.map { BrowserBridge.TabInfo(id: $0, url: page.url, connection: page.connection) } } : nil
-        var currentPage: BrowserBridge.Page?
-        if Launcher.isBrowser(app), BrowserBridge.shared.isConnected {
-            currentPage = pinned != nil ? await BrowserBridge.shared.snapshot(of: pinned!) : await Self.pageSnapshot(app)
-        }
-        if let page = currentPage {
+        if let page {
             adopt(page, into: &context)
-            // Clinqy's own window in a background run isn't the one Accessibility calls the browser's main window.
-            context.webArea = Background.active ? page.estimatedArea
-                : await Task.detached { AXEngine.webAreaFrame(of: app) }.value ?? page.estimatedArea
-        } else {
-            context.page = nil
-        }
+            context.webArea = await Observation.webFrame(app, page: page) ?? page.estimatedArea
+        } else { context.page = nil }
+
     }
 
     /// Lists the page again mid-turn (cheaper than a full refresh: no Accessibility scan).
@@ -3869,6 +4016,7 @@ final class Agent: ObservableObject {
 
     private func changed(_ app: NSRunningApplication, from fingerprint: Int, ms: Int) async -> Bool {
         for _ in 0..<max(1, ms / 60) {
+            guard !Task.isCancelled else { return false }
             try? await Task.sleep(for: .milliseconds(60))
             if await AXEngine.fingerprintAsync(of: app) != fingerprint { return true }
         }
@@ -4058,6 +4206,7 @@ final class Agent: ObservableObject {
             TaskExecution.$current.withValue(context) { finish(ok: ok, text) }; return
         }
         guard isRunning else { return }
+        delegation?.cancelAll()
         if let powerLease { TaskPowerAssertions.shared.end(powerLease); self.powerLease = nil }
         let missingImages = !runDry && text != "Stopped" && deliveredImageOutputs < requiredImageOutputs
         let unresolved = pendingVerification?.kind ?? TaskStore.shared.record(taskRecordID)?.unverifiedAction
@@ -4100,9 +4249,11 @@ final class Agent: ObservableObject {
         Replay.Recorder.shared.end(ok: ok)
         if !isTest { recordStats(ok: ok, answer: text) }
         if !isTest {
+            let freshWork = delegation?.hasJobs == true
+            if freshWork { ReplayCache.shared.corrected(request: request) }
             // A run that worked becomes a hint for similar requests from the same place; one that was offered a hint
             // and failed counts against it.
-            if ok, !runDry, !trace.isEmpty, !request.hasPrefix("Workflow:"), !request.hasPrefix("Correction for") {
+            if ok, !runDry, !freshWork, !trace.isEmpty, !request.hasPrefix("Workflow:"), !request.hasPrefix("Correction for") {
                 ReplayCache.shared.record(request: request, trace: trace, app: startPlace.app ?? targetApp?.cleanName,
                                           url: startPlace.url, title: startPlace.title, redact: secrets)
             } else {
@@ -4112,7 +4263,9 @@ final class Agent: ObservableObject {
         if !isTest { History.shared.add(.init(date: started, request: runDry ? "Dry run: \(request)" : runBackground ? "In the background: \(request)" : request, answer: text, ok: ok,
                                  steps: steps.map(\.text), app: targetApp?.cleanName, result: runResult,
                                  trace: trace.isEmpty ? nil : trace, readText: readText.map { String($0.prefix(8_000)) },
-                                 task: continuation.map { $0.task ?? $0.request })) }
+                                 task: continuation.map { $0.task ?? $0.request },
+                                 threadID: continuation.map { $0.threadID ?? $0.id }, parentID: continuation?.id,
+                                 requiresFreshWork: delegation?.hasJobs == true)) }
         session = nil
         onFinish(text, ok)
         // Out of steps or stalled on one step isn't the end of the task: carry on by itself (a few times), with the
@@ -4259,6 +4412,18 @@ struct Observation {
         return "Page elements (visible part):\n" + (items.isEmpty ? "(none)" : items.joined(separator: "\n"))
     }
 
+    @MainActor private static var webFrames: [pid_t: (CGRect, CGSize, CGRect)] = [:]
+    @MainActor static func webFrame(_ app: NSRunningApplication, page: BrowserBridge.Page) async -> CGRect? {
+        guard let bounds = AXEngine.windowFrame(of: app) else { return nil }
+        if let cached = webFrames[app.processIdentifier], cached.0 == bounds, cached.1 == page.viewport { return cached.2 }
+        let frame = await Task.detached(priority: .userInitiated) { AXEngine.webAreaFrame(of: app) }.value
+        if let frame {
+            if webFrames.count > 32 { webFrames.removeAll() }
+            webFrames[app.processIdentifier] = (bounds, page.viewport, frame)
+        }
+        return frame
+    }
+
     /// Reads the frontmost app's UI off the main thread, so the buddy never stutters while we look.
     @MainActor
     static func capture(_ preferred: NSRunningApplication?) async -> Observation {
@@ -4274,23 +4439,24 @@ struct Observation {
         guard let app else { return Observation(app: nil, elements: [], fingerprint: 0) }
         // The Accessibility scan, the page listing and the page's frame don't depend on each other: all at once
         // (in a browser that's the slowest two overlapping instead of adding up).
-        async let scanning = AXEngine.scan(app)
+        let expectsDOM = Launcher.isBrowser(app) && BrowserBridge.shared.isConnected(app)
+        async let scanning = AXEngine.scan(app, browserDOM: expectsDOM)
 
         // In a browser with the extension: the real page, element by element.
         var page: BrowserBridge.Page?
         var webArea: CGRect?
         if Launcher.isBrowser(app), BrowserBridge.shared.isConnected {
-            async let area = Task.detached(priority: .userInitiated) { AXEngine.webAreaFrame(of: app) }.value
             page = await Agent.pageSnapshot(app)
             // Still arriving (or nothing listed yet on a page that isn't blocked): give it a moment, once.
             if let p = page, p.ready == "loading" || (p.elements.isEmpty && p.problem == nil) {
                 try? await Task.sleep(for: .milliseconds(700))
                 page = await Agent.pageSnapshot(app) ?? page
             }
-            if page != nil { webArea = Background.active ? page?.estimatedArea : await area ?? page?.estimatedArea }
+            if let p = page { webArea = await webFrame(app, page: p) ?? p.estimatedArea }
             if webArea == nil { page = nil }
         }
-        let scan = await scanning
+        var scan = await scanning
+        if expectsDOM, page == nil || page?.problem != nil { scan = await AXEngine.scan(app) }
         return Observation(app: app, elements: scan.elements, fingerprint: scan.fingerprint, page: page, webArea: webArea,
                            window: scan.window, focused: scan.focused, dialog: scan.dialog, nativeWindow: scan.nativeWindow)
     }
@@ -4306,13 +4472,13 @@ extension AXEngine {
         let nativeWindow: NativeWindowObservation?
     }
 
-    static func scan(_ app: NSRunningApplication) async -> Scan {
+    static func scan(_ app: NSRunningApplication, browserDOM: Bool = false) async -> Scan {
         await Task.detached(priority: .userInitiated) {
             enableManualAccessibility(app)
             let focus = focusSummary(of: app)
             let nativeWindow = NativeWindowObservation.capture(app)
-            let elements = nativeWindow.map { AXEngine.elements(of: app, window: $0, limit: 150) } ?? []
-            return Scan(elements: elements, fingerprint: fingerprint(of: app),
+            let elements = nativeWindow.map { AXEngine.elements(of: app, window: $0, limit: 150, excludingWebContent: browserDOM) } ?? []
+            return Scan(elements: elements, fingerprint: browserDOM ? 0 : fingerprint(of: app),
                         window: focus.window, focused: focus.focused, dialog: dialog(of: app), nativeWindow: nativeWindow)
         }.value
     }
@@ -4462,6 +4628,9 @@ extension Agent {
         log("replay “\(workflow.name)” · \(workflow.steps.count) steps, no model")
         for (i, step) in workflow.steps.enumerated() {
             guard !Task.isCancelled else { return false }
+            if !addedNotes.isEmpty {
+                return await heal(workflow, from: i, reason: "the user added guidance; apply it before taking another saved step", params: params, qaTest: qaTest)
+            }
             narration = step.summary
             if step.action == "expect" {
                 let want = step.action(params: params, id: nil)["text"] as? String ?? ""
@@ -4493,6 +4662,9 @@ extension Agent {
                 guard id != nil else {
                     return await heal(workflow, from: i, reason: "couldn't find \(target.role) “\(target.label)”", params: params, qaTest: qaTest)
                 }
+            }
+            if !addedNotes.isEmpty {
+                return await heal(workflow, from: i, reason: "the user added guidance while the screen was loading", params: params, qaTest: qaTest)
             }
             var context = ActionContext(app: obs.app, elements: obs.elements, fingerprint: obs.fingerprint,
                                         page: obs.page, webArea: obs.webArea)

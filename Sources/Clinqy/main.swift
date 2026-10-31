@@ -365,8 +365,8 @@ if command == "selftest" {
             }
         }
         print("     memory: \(all) facts · maths sends \(math.facts.count) · food sends \(food.facts.count)")
-        // Below Memory.sendAllBudget (16k characters) every fact goes along by design; filtering starts above it.
-        let small = Memory.facts.joined().count <= 16_000
+        // Only tiny memories go along whole; growing memory is retrieved.
+        let small = Memory.lines.joined().count <= Memory.sendAllBudget
         check(small ? math.omitted == 0 : all < 8 || math.facts.count < all / 2,
               small ? "small memory is sent whole" : "irrelevant facts are left out")
         check(!Memory.facts.contains { $0.contains("Swiggy") } || food.facts.contains { $0.contains("Swiggy") }, "food request brings in Swiggy facts")

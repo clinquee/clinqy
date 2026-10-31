@@ -1,4 +1,5 @@
 import Foundation
+import Combine
 
 /// One concrete, replayable step: what was done and how to find its target again — no model needed.
 struct WorkflowStep: Codable, Equatable {
@@ -77,6 +78,7 @@ struct Workflow: Codable, Identifiable, Equatable {
     /// Builds a workflow from a finished run: typed text becomes a named parameter (the field's label),
     /// defaulting to what was typed, so `clinqy workflow <name> "Your name=Priya"` works.
     static func from(_ entry: History.Entry) -> Workflow? {
+        guard entry.requiresFreshWork != true else { return nil }
         guard var steps = entry.trace, !steps.isEmpty else { return nil }
         var params: [String] = []
         var defaults: [String: String] = [:]
@@ -180,15 +182,24 @@ final class ReplayCache {
     /// The replay offered to the current run, so its outcome can be booked.
     private var offered: UUID?
 
-    private let url: URL = {
+    private static var defaultURL: URL {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Clinqy", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir.appendingPathComponent("replays.json")
-    }()
+    }
+    private let url: URL
+    private var procedures: ProcedureStore?
 
-    private init() {
+    init(file: URL? = nil) {
+        self.url = file ?? Self.defaultURL
         if let data = try? Data(contentsOf: url), let saved = try? JSONDecoder.iso8601.decode([CachedRoute].self, from: data) { all = saved }
+        do {
+            let store = try ProcedureStore(file: url.appendingPathExtension("sqlite"))
+            try store.save(all, importing: true)
+            all = try store.recent()
+            procedures = store
+        } catch { NSLog("Clinqy procedures: %@", error.localizedDescription) }
     }
 
     /// Keeps a successful run's steps. `url`/`title` are the page it started on (nil in an app); typed secrets are blanked.
@@ -225,6 +236,16 @@ final class ReplayCache {
         let want = Self.words(request)
         guard !want.isEmpty else { return nil }
         let place = Self.place(url: url, app: app), shape = Self.titleShape(title)
+        // Exact, same-place repeats need neither an embedding nor ranking every cached route.
+        if let exact = all.first(where: {
+            Router.normalize($0.request) == Router.normalize(request) && $0.place == place && $0.title == shape
+        }) { return exact }
+        if let cold = try? procedures?.exact(request, place: place, title: shape) {
+            all.removeAll { $0.id == cold.id }
+            all.insert(cold, at: 0)
+            if all.count > 150 { all.removeLast() }
+            return cold
+        }
         let wantVector = Embedder.shared.vector(request)
         let scored = all.compactMap { r -> (CachedRoute, Double)? in
             let have = Set(r.words)
@@ -282,9 +303,26 @@ final class ReplayCache {
         return Workflow(name: String(r.request.prefix(60)), summary: "Replayed from an earlier run", params: [], steps: r.steps, created: r.last)
     }
 
-    func remove(_ r: CachedRoute) { all.removeAll { $0.id == r.id }; save() }
+    func remove(_ r: CachedRoute) {
+        do { try procedures?.remove(r.id) } catch { NSLog("Clinqy procedures: %@", error.localizedDescription) }
+        all.removeAll { $0.id == r.id }; save()
+    }
 
-    private func save() { Persist.write(all, to: url, encoder: .iso8601) }
+    func corrected(request: String) {
+        let raw = request.replacingOccurrences(of: #"(?i)^(in the background|dry run):\s*"#, with: "", options: .regularExpression)
+        let normalized = Router.normalize(raw)
+        do { try procedures?.corrected(raw) } catch { NSLog("Clinqy procedures: %@", error.localizedDescription) }
+        for i in all.indices where Router.normalize(all[i].request) == normalized {
+            all[i].misses += 1
+        }
+        save()
+    }
+
+    private func save() {
+        do { try procedures?.save(all) }
+        catch { NSLog("Clinqy procedures: %@", error.localizedDescription) }
+        if procedures == nil { Persist.write(all, to: url, encoder: .iso8601) }
+    }
 
     // MARK: Keys
 
@@ -334,7 +372,10 @@ enum Persist {
     }
 
     /// Waits for pending writes (before the app quits).
-    static func flush() { queue.sync {} }
+    static func flush() {
+        queue.sync {}
+        TaskMemory.shared.flush()
+    }
 }
 
 extension JSONDecoder {

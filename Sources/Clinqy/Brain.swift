@@ -161,7 +161,7 @@ final class AgySession: @unchecked Sendable {
     var visionDelivery: VisionPolicy.Delivery { api == nil && isAgy ? .fileReference : .embedded }
 
     func send(_ text: String, image: String? = nil, partial: (@Sendable (String) -> Void)? = nil) async throws -> String {
-        if let api { return try await api.send(text, image: image) }
+        if let api { return try await api.send(text, image: image, partial: partial) }
 
         var line: Data
         if isAgy {
