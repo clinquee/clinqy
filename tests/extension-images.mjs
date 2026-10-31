@@ -17,7 +17,8 @@ const items=[img('https://site.test/icon.png','Icon',{rect:{width:16,height:16}}
   img('https://site.test/below.png','Below',{rect:{top:2000,bottom:2160}}),
   img('javascript:alert(1)','Bad')];
 const root={querySelectorAll(){return items;}};
-const context=vm.createContext({window:{},crypto:{randomUUID:()=> 'doc'},URL,Map,Set,WeakMap,
+class MutationObserver { disconnect() {} takeRecords() { return []; } observe() {} }
+const context=vm.createContext({window:{},MutationObserver,crypto:{randomUUID:()=> 'doc'},URL,Map,Set,WeakMap,
   document:{body:root,baseURI:'https://site.test/article',title:'Fixture',querySelector(){return root;}},
   location:{href:'https://site.test/article'},innerHeight:900,innerWidth:1440,
   getComputedStyle(el){return {display:el.hidden?'none':'block',visibility:'visible',opacity:'1'};}});

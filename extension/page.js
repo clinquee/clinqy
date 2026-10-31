@@ -1,7 +1,9 @@
 // Runs inside web pages (in the extension's isolated world). Installed by background.js before each command;
 // all page-side logic lives here so helpers are available to every command.
 (() => {
-  if (window.__clinqy && window.__clinqy.protocolVersion === 4) return;
+  const HELPER_VERSION = 2;
+  if (window.__clinqy?.protocolVersion === 4 && window.__clinqy?.version === HELPER_VERSION) return;
+  window.__clinqy?.dispose?.();
   const documentID = typeof crypto.randomUUID === "function" ? crypto.randomUUID()
     : Array.from(crypto.getRandomValues(new Uint8Array(16)), (v) => v.toString(16).padStart(2, "0")).join("");
   let snapshotID = null;
@@ -243,16 +245,29 @@ const SEL = [
   "[contenteditable=''], [contenteditable=true]", "[onclick]", "[tabindex]:not([tabindex='-1'])",
 ].join(",");
 
-// Every candidate element, including inside open shadow roots.
+// Cache only the candidate set. Geometry, labels, values and checked states are read fresh on every snapshot.
+let candidateCache = null, shadowHosts = [];
+const candidateObserver = new MutationObserver(() => { candidateCache = null; });
 function candidates() {
-  const nodes = [];
+  if (candidateObserver.takeRecords().length) candidateCache = null;
+  if (candidateCache && shadowHosts.every(([host, root]) => shadowOf(host) === root)) return candidateCache;
+  candidateObserver.disconnect();
+  const nodes = [], hosts = [];
   const walk = (root) => {
+    candidateObserver.observe(root, { subtree: true, childList: true, attributes: true,
+      attributeFilter: ["role", "type", "href", "for", "contenteditable", "onclick", "tabindex"] });
     root.querySelectorAll(SEL).forEach((el) => nodes.push(el));
     const tw = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
-    for (let n = tw.nextNode(); n; n = tw.nextNode()) { if (n.hasAttribute("data-clinqy-overlay")) continue; const s = shadowOf(n); if (s) walk(s); }
+    for (let n = tw.nextNode(); n; n = tw.nextNode()) {
+      if (n.hasAttribute("data-clinqy-overlay")) continue;
+      const shadow = shadowOf(n);
+      if (n.tagName && n.tagName.includes("-")) hosts.push([n, shadow]);
+      if (shadow) walk(shadow);
+    }
   };
   walk(document);
-  return nodes;
+  shadowHosts = hosts;
+  return candidateCache = nodes;
 }
 
 // What an element is, as listed to the model (null = not worth listing). Shared by snapshot and re-finding.
@@ -779,6 +794,11 @@ function readText() {
     return { value: f.tagName === "SELECT" ? (f.options[f.selectedIndex] ? f.options[f.selectedIndex].text.trim() : "")
                                            : String(f.isContentEditable ? f.innerText : f.value || "").slice(0, 400) };
   }
+  function values(indices) {
+    const result = {};
+    for (const index of indices.slice(0, 200)) result[String(index)] = value(index).value;
+    return { values: result };
+  }
   function activeValue() {
     const el = deepActive();
     // Editors like Google Docs keep the caret in an iframe: keys typed now land there, but its text can't be read.
@@ -945,7 +965,7 @@ function readText() {
     });
   }
 
-  window.__clinqy = { protocolVersion: 4, documentID, validate, invoke, check: () => ({ ok: true }),
+  window.__clinqy = { version: HELPER_VERSION, dispose: () => candidateObserver.disconnect(), protocolVersion: 4, documentID, validate, invoke, check: () => ({ ok: true }),
     focusStatus: () => ({ documentID, hasFocus: document.hasFocus(), frame: /^(IFRAME|FRAME)$/.test((deepActive() || {}).tagName || "") }),
-    frameBoxes, snapshot, locate, alive, activityPoint, focusFor, activeOption, markUpload, click, clickOption, focus, fill, findOption, chosen, upload, fileInputCount, review, readText, tables, images, isActive, value, activeValue, fillActive, prepare, state, scroll, selection, waitText };
+    frameBoxes, snapshot, locate, alive, activityPoint, focusFor, activeOption, markUpload, click, clickOption, focus, fill, findOption, chosen, upload, fileInputCount, review, readText, tables, images, isActive, value, values, activeValue, fillActive, prepare, state, scroll, selection, waitText };
 })();

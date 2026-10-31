@@ -164,14 +164,20 @@ final class BrowserBridge: ObservableObject {
         var msg = body
         msg["id"] = id
         guard let data = try? JSONSerialization.data(withJSONObject: msg) else { throw BridgeError.failed("bad request") }
-        return try await withCheckedThrowingContinuation { cont in
-            pending[id] = cont
-            let meta = NWProtocolWebSocket.Metadata(opcode: .text)
-            conn.send(content: data, contentContext: .init(identifier: "msg", metadata: [meta]), isComplete: true,
-                      completion: .contentProcessed { _ in })
-            DispatchQueue.main.asyncAfter(deadline: .now() + timeout) { [weak self] in
-                self?.pending.removeValue(forKey: id)?.resume(throwing: BridgeError.timeout)
+        let closing = ["closeTab", "closeAgentWindow"].contains(body["cmd"] as? String ?? "")
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { cont in
+                guard closing || !Task.isCancelled else { cont.resume(throwing: CancellationError()); return }
+                pending[id] = cont
+                let meta = NWProtocolWebSocket.Metadata(opcode: .text)
+                conn.send(content: data, contentContext: .init(identifier: "msg", metadata: [meta]), isComplete: true,
+                          completion: .contentProcessed { _ in })
+                DispatchQueue.main.asyncAfter(deadline: .now() + timeout) { [weak self] in
+                    self?.pending.removeValue(forKey: id)?.resume(throwing: BridgeError.timeout)
+                }
             }
+        } onCancel: {
+            if !closing { Task { @MainActor [weak self] in self?.pending.removeValue(forKey: id)?.resume(throwing: CancellationError()) } }
         }
     }
 
@@ -222,16 +228,16 @@ final class BrowserBridge: ObservableObject {
         let fm = FileManager.default
         let installed = fm.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Clinqy/extension")
         guard let bundled = Bundle.main.url(forResource: "extension", withExtension: nil), fm.fileExists(atPath: installed.path) else { return }
-        let version = { (dir: URL) in
-            (try? JSONSerialization.jsonObject(with: Data(contentsOf: dir.appendingPathComponent("manifest.json")))) .flatMap { ($0 as? [String: Any])?["version"] as? String }
+        let unchanged = ["manifest.json", "bridge.js", "page.js"].allSatisfy {
+            fm.contentsEqual(atPath: installed.appendingPathComponent($0).path, andPath: bundled.appendingPathComponent($0).path)
         }
-        guard version(installed) != version(bundled) else { return }
+        guard !unchanged else { return }
         for name in (try? fm.contentsOfDirectory(atPath: bundled.path)) ?? [] {
             let target = installed.appendingPathComponent(name)
             try? fm.removeItem(at: target)
             try? fm.copyItem(at: bundled.appendingPathComponent(name), to: target)
         }
-        Agent.writeLog("updated the browser extension's files to v\(version(bundled) ?? "?")")
+        Agent.writeLog("updated the browser extension's files to v\(Self.extensionVersion)")
     }
 
     /// Asks every connected browser to reload the extension (after it's been updated on disk).
@@ -264,7 +270,7 @@ final class BrowserBridge: ObservableObject {
         return nil
     }
 
-    struct TabInfo { let id: Int; let url: String; let connection: ObjectIdentifier }
+    struct TabInfo: Sendable { let id: Int; let url: String; let connection: ObjectIdentifier }
 
     /// The active tab of the focused browser window.
     func activeTab(in app: NSRunningApplication? = nil) async -> TabInfo? {
@@ -354,11 +360,11 @@ final class BrowserBridge: ObservableObject {
 
     /// Opens an inactive tab in the connected, signed-in profile. Once selected, the connection stays pinned;
     /// a disconnect must never cause a task to migrate to another browser/profile or the desktop.
-    func backgroundTab(_ url: String, in app: NSRunningApplication? = nil, at: CGRect? = nil) async -> (tab: TabInfo, browser: NSRunningApplication?, window: CGRect?)? {
+    func backgroundTab(_ url: String, in app: NSRunningApplication? = nil, at: CGRect? = nil, select: Bool = true) async -> (tab: TabInfo, browser: NSRunningApplication?, window: CGRect?)? {
         do {
             if !Background.usesExtension {
                 let worker = ChromeWorker.shared
-                let id = try await worker.newTab(url)
+                let id = try await worker.newTab(url, select: select)
                 return (TabInfo(id: id, url: url, connection: worker.identity), worker.app, CGRect(x: 0, y: 0, width: 1440, height: 900))
             }
             let generation = taskGeneration
@@ -478,6 +484,23 @@ final class BrowserBridge: ObservableObject {
         do { try requireTaskTab(tab) } catch { return }
         guard let conn = connections[tab.connection] else { return }
         _ = try? await request(conn, ["cmd": "switchTab", "tabId": tab.id], timeout: 3)
+    }
+
+    /// Cheap readiness checks avoid rescanning every element while navigation is still in progress.
+    func waitForNavigation(on tab: TabInfo, to requested: String, previous: String? = nil, timeout: Double = 8) async -> Bool {
+        let start = ProcessInfo.processInfo.systemUptime
+        let deadline = start + timeout
+        repeat {
+            guard !Task.isCancelled else { return false }
+            guard let info = await tabCommand("tabInfo", on: tab) else { return false }
+            let url = info["url"] as? String ?? ""
+            let ready = info["ready"] as? String ?? info["status"] as? String ?? "loading"
+            let changed = url == requested || (url != previous && url != "about:blank" && url.hasPrefix("http"))
+            if changed, ready == "complete" || ready == "interactive",
+               ProcessInfo.processInfo.systemUptime - start >= 0.08 { return true }
+            do { try await Task.sleep(for: .milliseconds(80)) } catch { return false }
+        } while ProcessInfo.processInfo.systemUptime < deadline
+        return false
     }
 
     // MARK: - Page API
