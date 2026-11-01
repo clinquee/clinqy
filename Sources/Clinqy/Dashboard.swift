@@ -171,7 +171,11 @@ final class DashboardModel: ObservableObject {
         case .ollama, .compatible: key = "LOCAL_MODEL"
         case .codexCLI: key = "CODEX_MODEL"
         case .agyCLI: key = "AGY_MODEL"
-        default: key = "CLAUDE_MODEL"
+        case .claudeCLI: key = "CLAUDE_MODEL"
+        case .anthropic: key = "ANTHROPIC_MODEL"
+        case .openai: key = "OPENAI_MODEL"
+        case .gemini: key = "GEMINI_MODEL"
+        case .openrouter: key = "OPENROUTER_MODEL"
         }
         do {
             try Config.write([key: value.isEmpty ? nil : value])

@@ -147,10 +147,18 @@ pub async fn list(p: Provider) -> Vec<Choice> {
 }
 
 /// The saved model's id for the picker ("" for a provider default).
+/// For tier-based providers (not Claude CLI), resolve the tier alias to the real model id
+/// so the picker can match it against the provider's choice list.
 pub fn saved(p: Provider) -> String {
     let m = p.default_model();
     if p == Provider::CodexCli && m == "sonnet" {
         return String::new();
+    }
+    // Claude CLI keeps tier aliases ("sonnet", "haiku", "opus") as-is — it resolves them
+    // itself at runtime. Every other provider needs the concrete id so the UI picker can
+    // highlight the saved entry in its list of choices.
+    if p != Provider::ClaudeCli && ["haiku", "sonnet", "opus"].contains(&m.to_lowercase().as_str()) {
+        return p.model(&m);
     }
     m
 }

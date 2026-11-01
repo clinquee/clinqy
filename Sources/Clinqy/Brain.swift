@@ -306,8 +306,16 @@ enum Brain {
             return Config.value("CODEX_MODEL") ?? ""
         case .claudeCLI:
             return Config.value("CLAUDE_MODEL") ?? Config.value("AGY_MODEL") ?? "sonnet"
-        default:
-            return Config.value("CLAUDE_MODEL") ?? Config.value("AGY_MODEL") ?? "sonnet"
+        case .anthropic:
+            return Config.value("ANTHROPIC_MODEL") ?? Config.value("CLAUDE_MODEL") ?? "sonnet"
+        case .openai:
+            return Config.value("OPENAI_MODEL") ?? "sonnet"
+        case .gemini:
+            return Config.value("GEMINI_MODEL") ?? "sonnet"
+        case .openrouter:
+            return Config.value("OPENROUTER_MODEL") ?? "sonnet"
+        case .ollama, .compatible:
+            return Config.value("LOCAL_MODEL") ?? "qwen3-vl"
         }
     }
     static var model: String { defaultModel(for: Provider.current) }

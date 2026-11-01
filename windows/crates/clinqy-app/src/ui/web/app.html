@@ -159,7 +159,7 @@ function providerDetail() {
   const list = models[p.id];
   const saved = list ? list.saved : "";
   let opts = list ? list.choices.slice() : [];
-  if (list && !opts.some((o) => o.id === saved)) opts = [{ id: saved, label: `${saved} (current)` }, ...opts];
+  if (list && saved && !opts.some((o) => o.id === saved)) opts = [{ id: saved, label: `${saved} (current)` }, ...opts];
   const isCustom = custom === p.id;
   const setup = [];
   if (p.kind === "cli") {
@@ -294,7 +294,7 @@ function act(what) {
     case "test": post("testModel", { provider: wanted }); break;
     case "apikey": { const v = $("apikey").value.trim(); if (v) { post("apiKey", { provider: wanted, key: v }); $("apikey").value = ""; models[wanted] = undefined; } break; }
     case "baseurl": post("baseUrl", { url: $("baseurl").value.trim() }); models[wanted] = undefined; break;
-    case "saveModel": { const sel = $("model").value; const id = sel === "__custom" ? ($("customModel")?.value || "").trim() : sel; if (sel === "__custom" && !id) return; post("saveModel", { provider: wanted, model: id }); if (models[wanted]) models[wanted].saved = id; if (sel === "__custom") { models[wanted].choices.push({ id, label: id }); custom = ""; } break; }
+    case "saveModel": { const sel = $("model") ? $("model").value : ""; const id = sel === "__custom" ? ($("customModel")?.value || "").trim() : sel; if (sel === "__custom" && !id) return; post("saveModel", { provider: wanted, model: id }); if (models[wanted]) { models[wanted].saved = id; if (sel === "__custom" && !models[wanted].choices.some((c) => c.id === id)) { models[wanted].choices.push({ id, label: id }); } } if (sel === "__custom") custom = ""; render(); break; }
     case "backgroundBrowser": post("backgroundBrowser", { on: !S.background.ownBrowser }); break;
     case "workerProfile": post("workerProfile", { folder: $("workerprofile").value.trim() }); break;
     case "limits": post("limits", { tokens: $("tokens").value.trim(), requests: $("requests").value.trim() }); break;
@@ -311,7 +311,7 @@ document.addEventListener("change", (e) => {
   if (t.id === "range") post("range", { range: t.value });
   else if (t.id === "voice") post("voice", { language: t.value });
   else if (t.id === "voiceEngine") post("voiceEngine", { engine: t.value });
-  else if (t.id === "model") { custom = t.value === "__custom" ? (picked || S.currentProvider) : ""; render(); }
+  else if (t.id === "model") { const wanted = picked || S.currentProvider; if (t.value === "__custom") { custom = wanted; render(); } else { custom = ""; if (models[wanted]) models[wanted].saved = t.value; post("saveModel", { provider: wanted, model: t.value }); render(); } }
 });
 window.addEventListener("keydown", (e) => {
   if (!capturing) return;
