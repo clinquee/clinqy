@@ -105,7 +105,13 @@ fn office_text(path: &Path, ext: &str) -> Option<String> {
 pub fn strip_tags(html: &str) -> String {
     let no_script = Regex::new(r"(?is)<(script|style)[^>]*>.*?</(script|style)>").unwrap().replace_all(html, " ");
     let text = Regex::new(r"(?s)<[^>]*>").unwrap().replace_all(&no_script, "");
-    let text = text.replace("&nbsp;", " ").replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&#39;", "'");
+    let text = text
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'");
     Regex::new(r"[ \t]+").unwrap().replace_all(&text, " ").lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join("\n")
 }
 
@@ -166,9 +172,9 @@ pub fn list(folder: &Path, sort: &str, limit: usize) -> Result<String, String> {
         })
         .collect();
     match sort {
-        "name" => rows.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase())),
-        "size" => rows.sort_by(|a, b| b.2.cmp(&a.2)),
-        _ => rows.sort_by(|a, b| b.3.cmp(&a.3)),
+        "name" => rows.sort_by_key(|a| a.0.to_lowercase()),
+        "size" => rows.sort_by_key(|a| std::cmp::Reverse(a.2)),
+        _ => rows.sort_by_key(|a| std::cmp::Reverse(a.3)),
     }
     let total = rows.len();
     let lines: Vec<String> = rows
@@ -183,7 +189,12 @@ pub fn list(folder: &Path, sort: &str, limit: usize) -> Result<String, String> {
             }
         })
         .collect();
-    Ok(format!("{}: {total} items\n{}{}", folder.display(), lines.join("\n"), if total > limit { format!("\n({} more)", total - limit) } else { String::new() }))
+    Ok(format!(
+        "{}: {total} items\n{}{}",
+        folder.display(),
+        lines.join("\n"),
+        if total > limit { format!("\n({} more)", total - limit) } else { String::new() }
+    ))
 }
 
 #[derive(Serialize, Deserialize)]
@@ -229,7 +240,12 @@ pub fn apply(pairs: &[(PathBuf, PathBuf)]) -> (Vec<(PathBuf, PathBuf)>, Vec<Stri
 
 /// Puts the most recent batch back.
 pub fn undo() -> Result<String, String> {
-    let mut logs: Vec<PathBuf> = std::fs::read_dir(moves_dir()).map_err(|e| e.to_string())?.flatten().map(|e| e.path()).filter(|p| p.extension().map(|e| e == "json").unwrap_or(false)).collect();
+    let mut logs: Vec<PathBuf> = std::fs::read_dir(moves_dir())
+        .map_err(|e| e.to_string())?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().map(|e| e == "json").unwrap_or(false))
+        .collect();
     logs.sort();
     let last = logs.pop().ok_or("nothing to undo")?;
     let moves: Vec<Move> = std::fs::read_to_string(&last).ok().and_then(|t| serde_json::from_str(&t).ok()).ok_or("nothing to undo")?;
@@ -329,7 +345,12 @@ pub fn read_delimited(path: &Path) -> Option<Vec<Vec<String>>> {
 
 pub fn to_csv(rows: &[Vec<String>]) -> String {
     rows.iter()
-        .map(|r| r.iter().map(|f| if f.contains([',', '"', '\n', '\r']) { format!("\"{}\"", f.replace('"', "\"\"")) } else { f.clone() }).collect::<Vec<_>>().join(","))
+        .map(|r| {
+            r.iter()
+                .map(|f| if f.contains([',', '"', '\n', '\r']) { format!("\"{}\"", f.replace('"', "\"\"")) } else { f.clone() })
+                .collect::<Vec<_>>()
+                .join(",")
+        })
         .collect::<Vec<_>>()
         .join("\r\n")
         + "\r\n"
@@ -345,10 +366,22 @@ pub fn describe_tables(tables: &[serde_json::Value]) -> String {
         .iter()
         .enumerate()
         .map(|(i, t)| {
-            let rows: Vec<Vec<String>> = t["rows"].as_array().map(|a| a.iter().map(|r| r.as_array().map(|c| c.iter().map(|x| x.as_str().unwrap_or("").to_string()).collect()).unwrap_or_default()).collect()).unwrap_or_default();
+            let rows: Vec<Vec<String>> = t["rows"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .map(|r| r.as_array().map(|c| c.iter().map(|x| x.as_str().unwrap_or("").to_string()).collect()).unwrap_or_default())
+                        .collect()
+                })
+                .unwrap_or_default();
             let name = t["name"].as_str().filter(|n| !n.is_empty()).map(|n| format!("“{n}”")).unwrap_or_default();
             let more = t["more"].as_i64().filter(|m| *m > 0).map(|m| format!(" (+{m} more rows not shown)")).unwrap_or_default();
-            format!("Table {} {name} — {} rows{more}:\n{}", i + 1, rows.len(), rows.iter().map(|r| r.join(" | ")).collect::<Vec<_>>().join("\n"))
+            format!(
+                "Table {} {name} — {} rows{more}:\n{}",
+                i + 1,
+                rows.len(),
+                rows.iter().map(|r| r.join(" | ")).collect::<Vec<_>>().join("\n")
+            )
         })
         .collect::<Vec<_>>()
         .join("\n\n")

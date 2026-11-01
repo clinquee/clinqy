@@ -91,7 +91,7 @@ pub struct Snapshot {
 
 #[derive(Clone, Debug)]
 pub enum Event {
-    Changed(Snapshot),
+    Changed(Box<Snapshot>),
     Started,
     /// Paused for the user's input.
     Question,
@@ -179,6 +179,8 @@ struct Snap {
     pasted: bool,
 }
 
+type ReviewAnswer = (bool, Option<String>);
+
 pub struct Agent {
     /// The agent's hands: the desktop, or the background browser in a background run.
     pub platform: Arc<dyn Platform>,
@@ -195,7 +197,7 @@ pub struct Agent {
     /// Things the user added mid-task, folded into the next step.
     added: Mutex<Vec<String>>,
     answer_waiter: Mutex<Option<oneshot::Sender<Option<String>>>>,
-    review_waiter: Mutex<Option<oneshot::Sender<(bool, Option<String>)>>>,
+    review_waiter: Mutex<Option<oneshot::Sender<ReviewAnswer>>>,
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     pub context: Mutex<Context>,
     /// The sticky Dry run toggle from the command bar.
@@ -233,6 +235,8 @@ struct RunInfo {
     start_place: (Option<String>, Option<String>, Option<String>),
     opened_last: bool,
     turns: u32,
+    model_seconds: f64,
+    requires_fresh_work: bool,
     looks: u32,
     linger: f64,
     run_result: Option<ResultCard>,
@@ -320,7 +324,7 @@ impl Agent {
     }
 
     fn changed(&self) {
-        (self.emit)(Event::Changed(self.snapshot()));
+        (self.emit)(Event::Changed(Box::new(self.snapshot())));
     }
 
     pub fn is_running(&self) -> bool {
@@ -566,7 +570,13 @@ impl Agent {
             if ctx.continuation.is_none() && !opts.test {
                 if let Some(last) = history::history().latest() {
                     let age = chrono::Local::now().signed_duration_since(last.when());
-                    if age.num_minutes() < 20 && crate::workflow::is_follow_up(&request) {
+                    let correction = crate::workflow::is_correction(&request);
+                    if age.num_seconds() >= 0
+                        && ((correction && age.num_hours() < 24) || (age.num_minutes() < 20 && crate::workflow::is_follow_up(&request)))
+                    {
+                        if correction {
+                            crate::workflow::replay_cache().corrected(&last.request);
+                        }
                         ctx.continuation = Some(last);
                     }
                 }
@@ -579,7 +589,10 @@ impl Agent {
             if let Some(m) = workflow {
                 let mut params = m.workflow.defaults.clone().unwrap_or_default();
                 params.extend(m.params.clone());
-                me.push_step(&format!("Saved workflow “{}” — no model needed", m.workflow.name.chars().take(40).collect::<String>()), StepState::Info);
+                me.push_step(
+                    &format!("Saved workflow “{}” — no model needed", m.workflow.name.chars().take(40).collect::<String>()),
+                    StepState::Info,
+                );
                 me.log(&format!("workflow-first: “{}” · params {:?}", m.workflow.name, m.params));
                 me.replay_or_heal(m.workflow, params, None, &opts).await;
             } else {
@@ -623,10 +636,28 @@ impl Agent {
     }
 
     /// Runs a UI test: replays its compiled script with no model, or learns it, then writes a report.
-    pub fn run_qa(self: &Arc<Self>, name: &str, test: &str, compiled: PathBuf, relearn: bool, model: Option<String>, provider: Option<Provider>, out: PathBuf) {
+    #[allow(clippy::too_many_arguments)] // Public QA command arguments map directly to the CLI contract.
+    pub fn run_qa(
+        self: &Arc<Self>,
+        name: &str,
+        test: &str,
+        compiled: PathBuf,
+        relearn: bool,
+        model: Option<String>,
+        provider: Option<Provider>,
+        out: PathBuf,
+    ) {
         if self.is_running() {
             write_report(
-                &QaReport { name: name.into(), passed: false, mode: "none".into(), duration_ms: 0, steps: vec![], checks: vec![], message: "Clinqy is busy with another task".into() },
+                &QaReport {
+                    name: name.into(),
+                    passed: false,
+                    mode: "none".into(),
+                    duration_ms: 0,
+                    steps: vec![],
+                    checks: vec![],
+                    message: "Clinqy is busy with another task".into(),
+                },
                 &out,
             );
             return;
@@ -638,10 +669,16 @@ impl Agent {
         let handle = tokio::spawn(async move {
             let started = Instant::now();
             let opts = RunOptions { test: true, model, provider, ..Default::default() };
-            let saved = (!relearn).then(|| std::fs::read_to_string(&compiled).ok().and_then(|t| serde_json::from_str::<crate::workflow::Workflow>(&t).ok())).flatten();
+            let saved = (!relearn)
+                .then(|| std::fs::read_to_string(&compiled).ok().and_then(|t| serde_json::from_str::<crate::workflow::Workflow>(&t).ok()))
+                .flatten();
             let mut mode = "learned".to_string();
             if let Some(w) = saved {
-                mode = if me.replay_or_heal(w, Default::default(), Some(test.clone()), &opts).await { "healed".into() } else { "replay".into() };
+                mode = if me.replay_or_heal(w, Default::default(), Some(test.clone()), &opts).await {
+                    "healed".into()
+                } else {
+                    "replay".into()
+                };
             } else {
                 me.run(run::qa_prompt(&name, &test), &opts).await;
             }
@@ -740,9 +777,21 @@ impl Agent {
         crate::replay::begin(request);
         let extra = [
             ctx.selected_text.as_ref().map(|t| format!(" [selection: {} chars]", t.chars().count())),
-            (!ctx.selected_files.is_empty())
-                .then(|| format!(" [files: {}]", ctx.selected_files.iter().filter_map(|f| f.file_name()).map(|f| f.to_string_lossy().into_owned()).collect::<Vec<_>>().join(", "))),
-            ctx.circled.as_deref().map(circle_bounds).map(|r| format!(" [circled: {}×{} at {},{}]", r.w as i64, r.h as i64, r.x as i64, r.y as i64)),
+            (!ctx.selected_files.is_empty()).then(|| {
+                format!(
+                    " [files: {}]",
+                    ctx.selected_files
+                        .iter()
+                        .filter_map(|f| f.file_name())
+                        .map(|f| f.to_string_lossy().into_owned())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            }),
+            ctx.circled
+                .as_deref()
+                .map(circle_bounds)
+                .map(|r| format!(" [circled: {}×{} at {},{}]", r.w as i64, r.h as i64, r.x as i64, r.y as i64)),
         ]
         .into_iter()
         .flatten()
@@ -868,13 +917,19 @@ impl Agent {
                     "request": request.chars().take(160).collect::<String>(),
                     "ok": ok, "stopped": !ok && text == "Stopped",
                     "seconds": (secs * 10.0).round() / 10.0,
-                    "turns": info.turns, "fast_turns": 0, "screenshots": info.looks,
+                    "turns": info.turns, "fast_turns": 0, "screenshots": info.looks, "model_seconds": info.model_seconds,
                     "steps": steps.len(), "failed_steps": steps.iter().filter(|s| s.state == StepState::Failed).count(),
                     "app": info.target.as_ref().map(|a| a.name.clone()).unwrap_or_default(),
                 }),
             );
             let cache = crate::workflow::replay_cache();
-            if ok && !info.dry && !info.trace.is_empty() && !request.starts_with("Workflow:") && !request.starts_with("Correction for") {
+            if ok
+                && !info.dry
+                && !info.requires_fresh_work
+                && !info.trace.is_empty()
+                && !request.starts_with("Workflow:")
+                && !request.starts_with("Correction for")
+            {
                 cache.record(
                     &request,
                     &info.trace,
@@ -903,8 +958,9 @@ impl Agent {
                 result: run_result,
                 trace: (!info.trace.is_empty()).then(|| info.trace.clone()),
                 read_text: info.read_text.as_ref().map(|t| t.chars().take(8000).collect()),
+                requires_fresh_work: info.requires_fresh_work,
                 task: task_with_follow_ups(info.continuation.as_ref().map(|c| c.task.clone().unwrap_or(c.request.clone())), &request, &info.follow_ups),
-            });
+            }.redacted(&info.secrets));
         }
         self.changed();
         self.last_background.store(info.background, Ordering::SeqCst);
@@ -924,7 +980,13 @@ impl Agent {
         let progressed = steps.iter().filter(|s| s.state == StepState::Ok).count() >= 10;
         let limit = if progressed { 12 } else { 3 };
         let n = self.auto_continues.load(Ordering::Relaxed);
-        if !ok && !info.test && !info.dry && info.qa.is_none() && n < limit && (text.starts_with("Ran out of steps") || text.starts_with("I got stuck on")) {
+        if !ok
+            && !info.test
+            && !info.dry
+            && info.qa.is_none()
+            && n < limit
+            && (text.starts_with("Ran out of steps") || text.starts_with("I got stuck on"))
+        {
             self.auto_continues.store(n + 1, Ordering::Relaxed);
             self.log(&format!("auto-continue {}/{limit} after: {}", n + 1, text.chars().take(60).collect::<String>()));
             let me = self.clone();
@@ -975,7 +1037,10 @@ impl Agent {
             return options.first().cloned();
         }
         let previous = self.phase();
-        self.log(&format!("  waiting for your answer: {}", if sensitive { "(hidden)".to_string() } else { text.chars().take(120).collect() }));
+        self.log(&format!(
+            "  waiting for your answer: {}",
+            if sensitive { "(hidden)".to_string() } else { text.chars().take(120).collect() }
+        ));
         self.buddy.bubble(Some("need your input"), 600.0);
         let (tx, rx) = oneshot::channel();
         *self.answer_waiter.lock() = Some(tx);

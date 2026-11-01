@@ -163,6 +163,9 @@ impl Workflow {
 
     /// From a finished run: typed text becomes a named parameter (the field's label), defaulting to what was typed.
     pub fn from_entry(entry: &Entry) -> Option<Workflow> {
+        if entry.requires_fresh_work {
+            return None;
+        }
         let mut steps = entry.trace.clone().filter(|t| !t.is_empty())?;
         let mut params: Vec<String> = vec![];
         let mut defaults = HashMap::new();
@@ -209,7 +212,9 @@ fn write_json<T: Serialize>(name: &str, value: &T) {
 pub fn workflows() -> &'static Workflows {
     static W: OnceLock<Workflows> = OnceLock::new();
     W.get_or_init(|| Workflows {
-        all: Mutex::new(std::fs::read_to_string(store_path("workflows.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()),
+        all: Mutex::new(
+            std::fs::read_to_string(store_path("workflows.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default(),
+        ),
     })
 }
 
@@ -253,7 +258,9 @@ pub fn normalize(s: &str) -> String {
     static FILL: OnceLock<Regex> = OnceLock::new();
     static TAIL: OnceLock<Regex> = OnceLock::new();
     let t = re(&WS, r"\s+").replace_all(&s.to_lowercase(), " ").trim().to_string();
-    let t = re(&FILL, r"^(hey |hi |ok |okay )?(clinqy[, ]+)?(please |pls |can you |could you |would you |kindly )*").replace(&t, "").to_string();
+    let t = re(&FILL, r"^(hey |hi |ok |okay )?(clinqy[, ]+)?(please |pls |can you |could you |would you |kindly )*")
+        .replace(&t, "")
+        .to_string();
     re(&TAIL, r"[\s.!?,]*(please|pls)?[\s.!?]*$").replace(&t, "").to_string()
 }
 
@@ -281,7 +288,7 @@ pub fn route(request: &str, all: &[Workflow]) -> Option<RouteMatch> {
             .into_iter()
             .filter(|(_, v)| v.len() >= 2 && !normalize(v).is_empty() && name.contains(&normalize(v)))
             .collect();
-        slots.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+        slots.sort_by_key(|a| std::cmp::Reverse(a.1.len()));
         let mut pattern = regex::escape(&name);
         let mut order = vec![];
         for (key, value) in &slots {
@@ -300,7 +307,8 @@ pub fn route(request: &str, all: &[Workflow]) -> Option<RouteMatch> {
         for (i, key) in order.iter().enumerate() {
             let Some(g) = m.get(i + 1) else { continue };
             let lowered = g.as_str();
-            let cased = lower_original.find(lowered).map(|p| original[p..p + lowered.len()].to_string()).unwrap_or_else(|| lowered.to_string());
+            let cased =
+                lower_original.find(lowered).map(|p| original[p..p + lowered.len()].to_string()).unwrap_or_else(|| lowered.to_string());
             params.insert(key.clone(), cased.trim().to_string());
         }
         let literal = name.len().saturating_sub(slots.iter().map(|s| s.1.len()).sum());
@@ -315,6 +323,13 @@ pub fn route(request: &str, all: &[Workflow]) -> Option<RouteMatch> {
 pub fn refers_to_context(request: &str) -> bool {
     static R: OnceLock<Regex> = OnceLock::new();
     re(&R, r"\b(this|that|these|those|it|here|above|below|same|again|ye|yeh|isko|isse|usko|wahi)\b").is_match(&normalize(request))
+}
+
+/// Explicit corrections revise prior instructions rather than approving a cached method.
+pub fn is_correction(request: &str) -> bool {
+    static R: OnceLock<Regex> = OnceLock::new();
+    re(&R, r"^(actually|instead|no[ ,]|wrong|that(?:'s| is) (?:wrong|incorrect)|i meant|change (?:it|that)|correction)\b")
+        .is_match(&normalize(request))
 }
 
 /// "continue", "also …", "now send it to Rahul": builds on the last task.
@@ -357,13 +372,17 @@ pub struct ReplayCache {
 pub fn replay_cache() -> &'static ReplayCache {
     static R: OnceLock<ReplayCache> = OnceLock::new();
     R.get_or_init(|| ReplayCache {
-        all: Mutex::new(std::fs::read_to_string(store_path("replays.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()),
+        all: Mutex::new(
+            std::fs::read_to_string(store_path("replays.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default(),
+        ),
         offered: Mutex::new(None),
     })
 }
 
-const STOP: &[&str] = &["the", "and", "for", "this", "that", "these", "those", "also", "with", "from", "can", "you", "your", "now", "then",
-    "again", "just", "all", "please", "into", "onto", "about", "some", "any", "its", "are", "was", "will"];
+const STOP: &[&str] = &[
+    "the", "and", "for", "this", "that", "these", "those", "also", "with", "from", "can", "you", "your", "now", "then", "again", "just",
+    "all", "please", "into", "onto", "about", "some", "any", "its", "are", "was", "will",
+];
 
 pub fn content_words(request: &str) -> HashSet<String> {
     static R: OnceLock<Regex> = OnceLock::new();
@@ -413,7 +432,15 @@ impl ReplayCache {
         write_json("replays.json", &all);
     }
 
-    pub fn record(&self, request: &str, trace: &[WorkflowStep], app: Option<&str>, url: Option<&str>, title: Option<&str>, redact: &[String]) {
+    pub fn record(
+        &self,
+        request: &str,
+        trace: &[WorkflowStep],
+        app: Option<&str>,
+        url: Option<&str>,
+        title: Option<&str>,
+        redact: &[String],
+    ) {
         let steps: Vec<WorkflowStep> = trace
             .iter()
             .map(|s| {
@@ -436,14 +463,31 @@ impl ReplayCache {
         let mut all = self.all.lock();
         let mut sorted: Vec<String> = words.iter().cloned().collect();
         sorted.sort();
-        if let Some(r) = all.iter_mut().find(|r| r.place == pl && r.title == shape && r.site == site && r.words.iter().cloned().collect::<HashSet<_>>() == words) {
+        if let Some(r) = all
+            .iter_mut()
+            .find(|r| r.place == pl && r.title == shape && r.site == site && r.words.iter().cloned().collect::<HashSet<_>>() == words)
+        {
             r.steps = steps;
             r.request = request.into();
             r.uses += 1;
             r.misses = 0;
             r.last = now();
         } else {
-            all.insert(0, CachedRoute { id: new_id(), place: pl, title: shape, site, request: request.into(), words: sorted, steps, uses: 1, misses: 0, last: now() });
+            all.insert(
+                0,
+                CachedRoute {
+                    id: new_id(),
+                    place: pl,
+                    title: shape,
+                    site,
+                    request: request.into(),
+                    words: sorted,
+                    steps,
+                    uses: 1,
+                    misses: 0,
+                    last: now(),
+                },
+            );
         }
         all.sort_by(|a, b| b.last.cmp(&a.last));
         all.truncate(150);
@@ -505,6 +549,14 @@ impl ReplayCache {
             r.uses,
             steps.join("\n")
         ))
+    }
+
+    pub fn corrected(&self, request: &str) {
+        let mut all = self.all.lock();
+        for route in all.iter_mut().filter(|r| normalize(&r.request) == normalize(request)) {
+            route.misses += 1;
+        }
+        self.save(&all);
     }
 
     pub fn outcome(&self, ok: bool) {

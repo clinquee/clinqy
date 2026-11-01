@@ -112,6 +112,7 @@ impl Bridge {
 
     async fn serve(&'static self, stream: tokio::net::TcpStream, peer_port: u16) -> Result<()> {
         // Browser pages send their own origin; only extensions are let in.
+        #[allow(clippy::result_large_err)] // tungstenite requires an owned HTTP rejection response.
         let check = |req: &Request, resp: Response| -> std::result::Result<Response, ErrorResponse> {
             let origin = req.headers().get("origin").and_then(|v| v.to_str().ok()).unwrap_or("");
             if origin.starts_with("chrome-extension://") || origin.starts_with("moz-extension://") || origin.starts_with("extension://") {
@@ -202,7 +203,7 @@ impl Bridge {
             let conns = self.conns.lock();
             let c = conns.get(&conn).ok_or_else(|| anyhow!("browser extension not connected"))?;
             self.pending.lock().insert(rid.clone(), tx);
-            if c.tx.send(Message::Text(Value::Object(body).to_string().into())).is_err() {
+            if c.tx.send(Message::Text(Value::Object(body).to_string())).is_err() {
                 self.pending.lock().remove(&rid);
                 bail!("browser extension not connected");
             }
@@ -227,7 +228,8 @@ impl Bridge {
             v
         };
         let Some(exe) = exe else { return all };
-        let own: Vec<u64> = all.iter().copied().filter(|id| conns[id].owner.as_deref().map(|o| o.eq_ignore_ascii_case(exe)).unwrap_or(false)).collect();
+        let own: Vec<u64> =
+            all.iter().copied().filter(|id| conns[id].owner.as_deref().map(|o| o.eq_ignore_ascii_case(exe)).unwrap_or(false)).collect();
         if own.is_empty() {
             all.into_iter().filter(|id| conns[id].owner.is_none() || conns[id].owner.as_deref() == Some("?")).collect()
         } else {

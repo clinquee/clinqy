@@ -173,7 +173,15 @@ pub fn parse(phrase: &str, now: DateTime<Local>) -> Option<(DateTime<Local>, Rep
     let has = |pat: &str| Regex::new(pat).map(|r| r.is_match(&p)).unwrap_or(false);
     if let Some(c) = Regex::new(r"\bin (\d+|an?|half an) ?(min|minute|minutes|mins|hour|hours|hr|hrs)\b").unwrap().captures(&p) {
         let n: i64 = c[1].parse().unwrap_or(if &c[1] == "half an" { 0 } else { 1 });
-        let minutes = if c[2].starts_with('h') { if &c[1] == "half an" { 30 } else { n * 60 } } else { n };
+        let minutes = if c[2].starts_with('h') {
+            if &c[1] == "half an" {
+                30
+            } else {
+                n * 60
+            }
+        } else {
+            n
+        };
         return Some((now + Duration::minutes(minutes), Repeat::None));
     }
     let rule = if has(r"\bevery ?hour|\bhourly\b") {
@@ -220,7 +228,9 @@ pub fn parse(phrase: &str, now: DateTime<Local>) -> Option<(DateTime<Local>, Rep
                     h = 0;
                 }
                 // "at 7" said after 7 am: the 7 o'clock still ahead today (7 pm).
-                let named_day = has(r"\b(tomorrow|morning|sun|mon|tue|tues|wed|thu|thurs|fri|sat|sunday|monday|tuesday|wednesday|thursday|friday|saturday)\b");
+                let named_day = has(
+                    r"\b(tomorrow|morning|sun|mon|tue|tues|wed|thu|thurs|fri|sat|sunday|monday|tuesday|wednesday|thursday|friday|saturday)\b",
+                );
                 if ampm.is_empty() && (1..12).contains(&h) && !c[1].starts_with('0') && rule == Repeat::None && !named_day {
                     let today = at(now.date_naive(), h, minute)?;
                     let later = at(now.date_naive(), h + 12, minute)?;
@@ -259,7 +269,7 @@ pub fn parse(phrase: &str, now: DateTime<Local>) -> Option<(DateTime<Local>, Rep
             let want = names.iter().position(|n| *n == &c[1])? as i64;
             let cur = now.weekday().num_days_from_monday() as i64;
             let ahead = ((want - cur + 7) % 7).max(1);
-            day = day + Duration::days(ahead);
+            day += Duration::days(ahead);
             explicit_day = true;
         }
     }
@@ -314,7 +324,7 @@ pub fn due_reminders() -> Vec<Reminder> {
     let mut all = reminders();
     let mut due = vec![];
     for r in all.iter_mut().filter(|r| !r.done && !r.shown) {
-        if let Some(d) = r.due.as_deref().and_then(|d| crate::when::parse_local(d)) {
+        if let Some(d) = r.due.as_deref().and_then(crate::when::parse_local) {
             if d <= now {
                 r.shown = true;
                 due.push(r.clone());
