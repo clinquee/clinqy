@@ -14,6 +14,8 @@ replays on Windows.
 
 The core now archives tasks in `%APPDATA%\Clinqy\task-memory.sqlite` beyond the 200-entry History menu, retrieves relevant past work and follow-up corrections, streams API replies, and supports `delegate`/`collect` with independent sessions, dependencies, duplicate reuse, bounded concurrency and cancellation. Configure `DELEGATION`, `DELEGATE_MODEL`, `DELEGATE_CONCURRENCY` (default 3, maximum 6) and `DELEGATE_TIMEOUT`. Workers read public HTTP text and local text files; authenticated isolated browser sources remain Mac-only. Worker-generated tasks are excluded from automatic UI-only replay.
 
+Clinqy can use the Codex, Antigravity, OpenCode and Cursor CLI logins as model providers. OpenCode and Cursor use ACP; OpenCode runs a deny-all Clinqy agent with external plugins disabled, and Cursor runs Ask mode with project-level tool denials. Choose the account for each new task in the command bar; this one-run choice leaves the saved default in **Dashboard → AI & Model** unchanged. Set `PROVIDER` in `%USERPROFILE%\.config\clinqy\env` to choose that saved default. Automatic provider priority is configurable with `PROVIDER_ORDER`; delegated workers can use another configured account with `DELEGATE_PROVIDER`, also set in the AI & Model dashboard.
+
 Core regression checks (also runnable on macOS):
 
 ```sh
@@ -30,7 +32,7 @@ cargo clippy -p clinqy-core --all-targets -- -D warnings
    `%LOCALAPPDATA%\Programs\Clinqy`, adds a Start menu shortcut, puts `clinqy` on your PATH
    and starts Clinqy.
 2. Paste the setup prompt from the [main README](../README.md#setup-on-windows) (or the website) into your coding agent.
-   It picks the AI you already have (Claude Code, then Codex, then agy, then Ollama), has Clinqy load its own browser
+   It picks the AI you already have (Claude Code, Codex, agy, OpenCode, Cursor, Ollama, then API providers), has Clinqy load its own browser
    extension, connects the agent and checks everything.
 
 The [step-by-step setup guide](SETUP.md) has every step, what you should see and fixes for common problems.

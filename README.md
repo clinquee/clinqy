@@ -20,7 +20,7 @@ Download, paste one prompt into your coding agent, done. It needs macOS 14 or la
 
 **1. Download** **[`Clinqy.dmg`](https://clinqy.vercel.app/api/mac-download)**, open it and drag Clinqy into Applications. Clinqy isn't notarized by Apple yet, so the first time you open it macOS blocks it: open **System Settings → Privacy & Security**, scroll down and click **Open Anyway**. (You can skip this step: the prompt installs Clinqy too, and then macOS doesn't block it.)
 
-**2. Paste this into your coding agent** (Claude Code, Codex, agy, Cursor, Gemini CLI, Windsurf or OpenCode). There's nothing to fill in. It uses the AI you already have, in this order: Claude Code, then Codex, then agy, then an API key. It asks for Clinqy's permissions, adds the browser extension (Clinqy loads it into your browser itself), connects the agent you pasted it into, and checks everything. Want a particular AI? Change the first line to `claude cli`, `codex cli`, `agy cli`, `ollama qwen3-vl` or `anthropic api key` (or `openai`, `gemini`, `openrouter`).
+**2. Paste this into your coding agent** (Claude Code, Codex, agy, Cursor, Gemini CLI, Windsurf or OpenCode). There's nothing to fill in. It uses the configured AI providers in this order: Claude Code, Codex, agy, OpenCode, Cursor, then API/local providers. It asks for Clinqy's permissions, adds the browser extension (Clinqy loads it into your browser itself), connects the agent you pasted it into, and checks everything. Want a particular AI? Change the first line to `claude cli`, `codex cli`, `agy cli`, `opencode`, `cursor`, `ollama qwen3-vl` or `anthropic api key` (or `openai`, `gemini`, `openrouter`).
 
 ````text
 Model: auto
@@ -35,12 +35,12 @@ commands yourself. Only stop when you need my answer or a click that only I can 
      ditto "$v/Clinqy.app" /Applications/Clinqy.app; hdiutil detach -quiet "$v"; open /Applications/Clinqy.app
    From then on use the full path: c=/Applications/Clinqy.app/Contents/MacOS/Clinqy
 2. Set up the model with `$c model <name>`, then read what it prints.
-   - "auto" (or blank): run `$c model auto`. It uses what this Mac has: Claude Code, then Codex, then agy, then an API
-     key. If it has none of them, install Claude Code (`curl -fsSL https://claude.ai/install.sh | bash`) and run
+   - "auto" (or blank): run `$c model auto`. It uses what this Mac has: Claude Code, then Codex, agy, OpenCode,
+     Cursor, then configured API/local providers. If it has none of them, install Claude Code (`curl -fsSL https://claude.ai/install.sh | bash`) and run
      `$c model claude`.
-   - Otherwise map my choice: claude, codex, agy, ollama <model>, or an API key: anthropic, openai, gemini, openrouter.
-   - It checks that the model really answers. If it says a CLI isn't logged in, ask me to run `claude` (or `codex`,
-     `agy`) once in a new terminal and log in, wait for me, then run `$c model test`.
+   - Otherwise map my choice: claude, codex, agy, opencode, cursor, ollama <model>, or an API key: anthropic, openai, gemini, openrouter.
+   - It checks that the model really answers. If a CLI isn't logged in, ask me to run `claude`, `codex login`, `agy`,
+     `opencode auth login`, or `agent login` in a new terminal, wait for me, then run `$c model test`.
    - API key: don't ask me to paste the key into this chat. Run `$c settings` (it opens the file), tell me which line
      to paste the key into, wait until I've saved it, then run `$c model test`.
 3. Run `$c permissions`. Clinqy asks macOS for what it still needs. Tell me to turn each one it lists on for Clinqy in
@@ -127,7 +127,7 @@ Download, paste one prompt into your coding agent, done. It needs Windows 10 (19
 
 **1. Download** **`Clinqy-windows-x64.zip`** from the [latest Windows download](https://clinqy.vercel.app/api/windows-download), unzip it and double-click **`Install Clinqy.bat`**. It installs Clinqy to `%LOCALAPPDATA%\Programs\Clinqy`, adds it to the Start menu, puts the `clinqy` command on your PATH and starts it. Open at login is off until you turn it on in settings (Dashboard → General). The app isn't code-signed yet, so if Windows SmartScreen warns you, click **More info → Run anyway**. If Microsoft Defender quarantines it, open Windows Security → Protection history, choose the Clinqy entry and allow it on your device. (You can skip this step: the prompt installs Clinqy too.)
 
-**2. Paste this into any AI you use** (Claude Code, Codex, agy, Cursor, Gemini CLI, Windsurf, OpenCode, or a chat with no terminal, which walks you through it). There's nothing to fill in. It uses the AI you already have, in this order: Claude Code, then Codex, then agy, then Ollama. It connects your coding agents, has Clinqy add its own browser extension, and checks everything. Want a particular AI? Change the first line to `claude`, `codex`, `agy`, `ollama` or `anthropic` (or `openai`, `gemini`, `openrouter`).
+**2. Paste this into any AI you use** (Claude Code, Codex, agy, Cursor, Gemini CLI, Windsurf, OpenCode, or a chat with no terminal, which walks you through it). There's nothing to fill in. It uses the configured providers in this order: Claude Code, Codex, agy, OpenCode, Cursor, Ollama, then API providers. It connects your coding agents, has Clinqy add its own browser extension, and checks everything. Want a particular AI? Change the first line to `claude`, `codex`, `agy`, `opencode`, `cursor`, `ollama` or `anthropic` (or `openai`, `gemini`, `openrouter`).
 
 ````text
 Model: auto
@@ -143,13 +143,13 @@ commands here, tell me to open PowerShell, give me one command at a time to past
      $c = "$env:LOCALAPPDATA\Programs\Clinqy\clinqy.exe"
 2. Tell me Clinqy is about to use my mouse for a moment to add its browser extension, then run setup:
      & $c setup --model <Model> --connect <Connect to>
-   Model is auto, or one of claude, codex, agy, ollama, anthropic, openai, gemini, openrouter. Auto uses what this PC
-   has: Claude Code, then Codex, then agy, then Ollama. Connect to is all, none, or names with commas from claude, codex,
+   Model is auto, or one of claude, codex, agy, opencode, cursor, ollama, anthropic, openai, gemini, openrouter. Auto uses what this PC
+   has: Claude Code, then Codex, agy, OpenCode, Cursor, Ollama, then API providers. Connect to is all, none, or names with commas from claude, codex,
    agy, cursor, gemini, windsurf, opencode. "this agent" means you. Setup does everything it can and ends with what's ready and a
    "Needs you" list.
 3. Work through "Needs you", then run the same setup command again, until it says everything is ready:
    - No AI installed: install Claude Code with `winget install Anthropic.ClaudeCode`.
-   - A CLI isn't logged in: ask me to run `claude` (or `codex login`, or `agy`) once in a new terminal, and wait for me.
+   - A CLI isn't logged in: ask me to run `claude`, `codex login`, `agy`, `opencode auth login`, or `agent login` once in a new terminal, and wait for me.
    - An API key: don't ask me to paste it into this chat. Run `& $c settings` (it opens the file), tell me which line to
      paste the key into, and wait until I've saved it.
    - The extension: walk me through it by hand with the folder setup printed.
@@ -404,13 +404,15 @@ The server hands tasks to the running app with `clinqy://` links, the same way t
 
 ## Choosing the model
 
-By default Clinqy runs on the Claude Code CLI with your Claude login. To switch to Antigravity CLI (`agy`) with your Google login, pass `--agy` on the command line or set `PROVIDER=agy-cli` (or `USE_AGY=1`) in `~/.config/clinqy/env`. [`env.example`](env.example) has every option ready to uncomment:
+When `PROVIDER` is unset, Clinqy automatically uses the first configured provider in `PROVIDER_ORDER`. The default order starts with Claude Code, Codex, Antigravity (`agy`), OpenCode and Cursor, then checks API and local providers. To save a specific default, set `PROVIDER` in `~/.config/clinqy/env`; [`env.example`](env.example) has every option ready to uncomment:
 
 | Option | Lines in `~/.config/clinqy/env` |
 |---|---|
-| Claude Code CLI (default) | nothing, or `PROVIDER=claude-cli` |
+| Claude Code CLI (first in automatic order) | nothing when it is the first configured provider, or `PROVIDER=claude-cli` |
 | Antigravity CLI (`agy`) | `PROVIDER=agy-cli` or `USE_AGY=1` (or `--agy` flag) |
 | Codex CLI | `PROVIDER=codex-cli` |
+| OpenCode ACP | `PROVIDER=opencode-cli` after `opencode auth login` |
+| Cursor Agent ACP | `PROVIDER=cursor-cli` after `agent login` |
 | Anthropic API | `PROVIDER=anthropic` and `ANTHROPIC_API_KEY=sk-ant-…` |
 | OpenAI API | `PROVIDER=openai` and `OPENAI_API_KEY=sk-…` |
 | Gemini API | `PROVIDER=gemini` and `GEMINI_API_KEY=…` |
@@ -437,7 +439,9 @@ PROVIDER=agy-cli
 
 Put each `KEY=value` on its own line, with no comment after the value. `chmod 600 ~/.config/clinqy/env` keeps your keys private.
 
-If `PROVIDER` isn't set, Clinqy uses the `claude` CLI when it's installed (or `agy` when `--agy` or `USE_AGY=1` is set). Without it, Clinqy uses the first API key it finds, then `agy` or Codex CLI.
+Choose an account from the command bar for each new task. That one-run choice doesn't change the saved default in **Dashboard → AI & Model**. If you want Clinqy to choose that default automatically, leave `PROVIDER` unset and adjust `PROVIDER_ORDER`; `Clinqy model auto` returns to automatic selection. Explicit `PROVIDER` and the dashboard model picker set the saved default.
+
+OpenCode and Cursor run over their supported ACP stdio interfaces. OpenCode gets a temporary project with a deny-all agent, no external plugins, and no MCP servers added by Clinqy. Cursor runs in Ask mode and Clinqy rejects ACP permission requests. These providers return model responses; Clinqy's own action harness remains responsible for screen and computer actions. Each CLI uses the login already stored by that vendor. For OpenCode, run `opencode auth login` first and choose the provider/account there (including ChatGPT Plus/Pro where OpenCode offers its ChatGPT login). For Cursor, run `agent login` first.
 
 `CLAUDE_MODEL` / `AGY_MODEL` (the agent) and `FAST_MODEL` (the helper for routine steps) work with every provider. Leave them as `sonnet` / `haiku` / `opus` to get each provider's matching tier, or set any model id the provider accepts. On macOS, optional `CODEX_MODEL` selects an explicit Codex CLI model ID; leave it unset to use Codex's configured default:
 
@@ -449,6 +453,7 @@ If `PROVIDER` isn't set, Clinqy uses the `claude` CLI when it's installed (or `a
 | gemini | gemini-3.5-flash-lite | gemini-3.6-flash | gemini-3.6-flash |
 | openrouter | anthropic/claude-haiku-5.5 | anthropic/claude-sonnet-5.5 | anthropic/claude-opus-5.5 |
 | codex-cli | the CLI's default | the CLI's default | the CLI's default |
+| opencode-cli, cursor-cli | account/provider default unless an explicit model is set |
 | ollama, openai-compatible | `LOCAL_MODEL` | `LOCAL_MODEL` | `LOCAL_MODEL` |
 
 Notes:
@@ -457,6 +462,8 @@ Notes:
 - **Effort.** `CLAUDE_EFFORT` and `AGY_EFFORT` also set the reasoning effort for models.
 - **Rate limits.** The system prompt is about 10k tokens. A free-tier OpenAI account (10k tokens/min) can't fit it on the larger models.
 - **Which one is in use.** Menu bar → **Check Permissions…** shows the current provider.
+
+The Mac dashboard also routes fast routine steps (`FAST_PROVIDER`) and independent delegated work (`DELEGATE_PROVIDER`) to other configured accounts. Both default to the main provider; Windows supports a separate delegate provider. The task's main provider remains fixed while it controls the screen.
 
 ## Configuration
 
@@ -469,7 +476,11 @@ Optional `KEY=value` lines in `~/.config/clinqy/env` (start from [`env.example`]
 | `OPENAI_BASE_URL` | per provider | Endpoint for `openai`, `ollama` or `openai-compatible` |
 | `LOCAL_MODEL` | `qwen3-vl` | Model for `ollama` / `openai-compatible` |
 | `CLAUDE_PATH` · `AGY_PATH` · `CODEX_PATH` | auto-detected | Path to each CLI |
-| `OPENCODE_PATH` | auto-detected | Path to the OpenCode CLI, for `clinqy connect opencode` |
+| `OPENCODE_PATH` | auto-detected | Path to the OpenCode CLI, used for ACP model runs and `clinqy connect opencode` |
+| `OPENCODE_API_KEY` | unset | Optional OpenCode access key, passed only to the OpenCode provider process |
+| `CURSOR_AGENT_PATH` | auto-detected | Path to Cursor's `agent` CLI |
+| `OPENCODE_MODEL` / `CURSOR_MODEL` | provider default | Optional explicit model IDs for ACP providers |
+| `PROVIDER_ORDER` | Claude, Codex, agy, OpenCode, Cursor, then API/local | Comma-separated auto-selection priority; only configured providers are selected |
 | `CLAUDE_MODEL` / `AGY_MODEL` | `sonnet` | Model for the agent (any provider) |
 | `CODEX_MODEL` (macOS) | Codex default | Optional explicit model ID for Codex CLI |
 | `CLAUDE_EFFORT` / `AGY_EFFORT` | `low` | `low` is noticeably faster per step |
@@ -477,8 +488,10 @@ Optional `KEY=value` lines in `~/.config/clinqy/env` (start from [`env.example`]
 | `VOICE_MODEL` | `speech` | Mac: which of Apple's models hears languages both cover, `speech` (SpeechTranscriber) or `dictation` (DictationTranscriber, the system Dictation's). Hindi always uses `dictation` |
 | `WHISPER_MODEL` | `small-q5_1` | Windows only: the whisper.cpp model |
 | `FAST_MODEL` | `haiku` | Faster model for routine steps; `off` to use only the main model |
+| `FAST_PROVIDER` (Mac) | main provider | Route the Mac fast helper to a different configured provider |
 | `DELEGATION` | on | `off`: disable independent task workers |
-| `DELEGATE_MODEL` | Mac: `FAST_MODEL` or lead; Windows: sonnet tier | Model for independent workers; follows the lead's provider |
+| `DELEGATE_MODEL` | Mac: `FAST_MODEL` or lead; Windows: sonnet tier | Model for independent workers |
+| `DELEGATE_PROVIDER` | main provider | Route independent workers to another configured provider |
 | `DELEGATE_CONCURRENCY` | 3 | Simultaneous independent workers, clamped to 1–6; at most 24 jobs per task |
 | `DELEGATE_TIMEOUT` | 90 | Seconds per running worker, clamped to 10–300; queued jobs wait for a slot/dependencies |
 | `DELEGATE_EFFORT` | low | Mac worker reasoning effort; the lead checks and combines results |
@@ -515,6 +528,7 @@ zsh tests/background-tasks.sh          # task checkpoints and background routing
 zsh tests/scheduler.sh                 # durable handoff, restart dedupe and missed-run policy
 zsh tests/observations.sh              # immutable capture coordinates and geometry guards
 zsh tests/codex-session.sh             # persistent protocol/isolation tests, no model calls
+zsh tests/acp-session.sh               # OpenCode/Cursor ACP stream, auth and tool-denial tests; fake agents only
 .build/debug/Clinqy --selftest     # safety rules, reply parsing, stats parsing, replay fixtures, scripting dictionaries
 .build/debug/Clinqy replay tests/replay   # recorded runs re-checked offline
 zsh tests/task-memory.sh              # archive, follow-ups, redaction, retention
@@ -601,7 +615,7 @@ tests/qa/            example plain-English QA tests (compiled scripts in tests/q
 
 ## Privacy
 
-Everything except the model calls stays on your Mac. That covers screen reading, voice (the Mac's own speech model, on-device), memory, history, skills and logs. Requests and screen summaries go only to the model provider you chose: your Claude, Antigravity (`agy`), or Codex CLI login, the API you gave a key for, or a local model, in which case nothing leaves your Mac.
+Everything except the model calls stays on your Mac. That covers screen reading, voice (the Mac's own speech model, on-device), memory, history, skills and logs. Requests and screen summaries go only to the model provider you chose: your Claude, Antigravity (`agy`), Codex, OpenCode or Cursor CLI login, the API you gave a key for, or a local model, in which case nothing leaves your Mac.
 
 ### Direct controls for coding agents
 
