@@ -179,8 +179,9 @@ struct CachedRoute: Codable, Identifiable, Equatable {
 final class ReplayCache {
     static let shared = ReplayCache()
     private(set) var all: [CachedRoute] = []
-    /// The replay offered to the current run, so its outcome can be booked.
-    private var offered: UUID?
+    /// The replay offered to each run, so its outcome is booked against that run's offer and no other's.
+    private var offers = ReplayOffers()
+    private var currentRun: UUID? { TaskExecution.current?.id }
 
     private static var defaultURL: URL {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -193,7 +194,11 @@ final class ReplayCache {
 
     init(file: URL? = nil) {
         self.url = file ?? Self.defaultURL
-        if let data = try? Data(contentsOf: url), let saved = try? JSONDecoder.iso8601.decode([CachedRoute].self, from: data) { all = saved }
+        switch StoreFile.load(url, decode: { try? JSONDecoder.iso8601.decode([CachedRoute].self, from: $0) }) {
+        case .value(let saved): all = saved
+        case .unreadable: StoreFile.quarantine(url)   // set aside, so the next save can't replace it with an empty cache
+        case .absent: break
+        }
         do {
             let store = try ProcedureStore(file: url.appendingPathExtension("sqlite"))
             try store.save(all, importing: true)
@@ -226,7 +231,7 @@ final class ReplayCache {
         }
         all.sort { $0.last > $1.last }
         if all.count > 150 { all.removeLast(all.count - 150) }
-        offered = nil
+        offers.clear(run: currentRun)
         Embedder.shared.warm([request])
         save()
     }
@@ -273,8 +278,8 @@ final class ReplayCache {
 
     /// Text for the lead's first message when a similar run worked before (nil = nothing close).
     func hint(request: String, app: String?, url: String?, title: String?) -> String? {
-        guard let r = match(request: request, app: app, url: url, title: title) else { offered = nil; return nil }
-        offered = r.id
+        guard let r = match(request: request, app: app, url: url, title: title) else { offers.clear(run: currentRun); return nil }
+        offers.offer(r.id, to: currentRun)
         let where_ = r.site ?? r.place
         return "\nYou did a very similar task before (“\(r.request.prefix(80))” on \(where_), worked \(r.uses)×). These steps worked then:\n"
             + r.steps.enumerated().map { "\($0.offset + 1). \($0.element.summary)" }.joined(separator: "\n")
@@ -286,7 +291,7 @@ final class ReplayCache {
     /// Books how the run that was offered a replay went: a failure counts against it, and one that keeps failing is dropped.
     /// (A success is booked by `record`.)
     func outcome(ok: Bool) {
-        defer { offered = nil }
+        let offered = offers.take(run: currentRun)
         guard !ok, let id = offered, let i = all.firstIndex(where: { $0.id == id }) else { return }
         all[i].misses += 1
         if all[i].misses >= 2, all[i].misses >= all[i].uses { all.remove(at: i) }
@@ -299,7 +304,7 @@ final class ReplayCache {
         guard let r = match(request: request, app: app, url: url, title: title), r.uses >= 2, r.misses == 0,
               Router.normalize(r.request) == Router.normalize(request),
               !r.steps.contains(where: Self.isRisky) else { return nil }
-        offered = r.id
+        offers.offer(r.id, to: currentRun)
         return Workflow(name: String(r.request.prefix(60)), summary: "Replayed from an earlier run", params: [], steps: r.steps, created: r.last)
     }
 
@@ -366,9 +371,11 @@ final class ReplayCache {
 enum Persist {
     private static let queue = DispatchQueue(label: "clinqy.persist", qos: .utility)
 
-    static func write<T: Encodable>(_ value: T, to url: URL, encoder: JSONEncoder) {
-        guard let data = try? encoder.encode(value) else { return }
-        queue.async { try? data.write(to: url, options: .atomic) }
+    /// `onError` is told when the value couldn't be encoded or written (called off the main thread).
+    static func write<T: Encodable>(_ value: T, to url: URL, encoder: JSONEncoder, onError: (@Sendable (Error) -> Void)? = nil) {
+        let data: Data
+        do { data = try encoder.encode(value) } catch { onError?(error); return }
+        queue.async { if let error = StoreFile.write(data, to: url) { onError?(error) } }
     }
 
     /// Waits for pending writes (before the app quits).

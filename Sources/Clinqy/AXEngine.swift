@@ -21,6 +21,12 @@ struct UIElementInfo: @unchecked Sendable {
     /// Window and observation that supplied this reference. Positional e-ids are valid only within this observation.
     var observationID: UUID? = nil
     var windowID: CGWindowID? = nil
+    /// Accessibility state when the element reports it (nil = not reported, which is not the same as false).
+    var enabled: Bool? = nil
+    var expanded: Bool? = nil
+    var selected: Bool? = nil
+    /// Caret (length 0) or selection of a text input, in UTF-16 offsets.
+    var selection: NSRange? = nil
 
     var center: CGPoint { CGPoint(x: frame.midX, y: frame.midY) }
 }
@@ -51,9 +57,11 @@ enum AXEngine {
     /// Electron apps (Cursor, VS Code, Slack, Discord…) only publish their UI to Accessibility when asked.
     static func enableManualAccessibility(_ app: NSRunningApplication) {
         guard !enabledElectron.contains(app.processIdentifier) else { return }
-        enabledElectron.insert(app.processIdentifier)
         let root = AXUIElementCreateApplication(app.processIdentifier)
-        AXUIElementSetAttributeValue(root, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+        // Remembered only once the app accepted it, so a denied or not-yet-ready request is retried next time.
+        if AXUIElementSetAttributeValue(root, "AXManualAccessibility" as CFString, kCFBooleanTrue) == .success {
+            enabledElectron.insert(app.processIdentifier)
+        }
     }
 
     // MARK: - Scan
@@ -62,6 +70,7 @@ enum AXEngine {
     private static let scanAttrs = [
         kAXRoleAttribute, kAXSubroleAttribute, kAXPositionAttribute, kAXSizeAttribute, kAXTitleAttribute,
         kAXDescriptionAttribute, kAXHelpAttribute, kAXPlaceholderValueAttribute, kAXValueAttribute, kAXIdentifierAttribute,
+        kAXEnabledAttribute, kAXExpandedAttribute, kAXSelectedAttribute, kAXSelectedTextRangeAttribute,
     ]
     /// Children read per node; a 5000-file list would otherwise cost more than the whole rest of the window.
     private static let childCap = 200
@@ -81,7 +90,8 @@ enum AXEngine {
         if menuBar, let bar: AXUIElement = attr(root, kAXMenuBarAttribute) { roots.append((bar, false)) }
         let windowTitle = window.flatMap { attr($0, kAXTitleAttribute) as String? } ?? ""
 
-        let screenBounds = NSScreen.screens.reduce(CGRect.null) { $0.union(flipped($1.frame)) }
+        // Visible means on an actual display: the bounding box of several monitors also covers the gaps between them.
+        let displays = NSScreen.screens.map { flipped($0.frame) }
         // Roots are walked one after another (not interleaved), so the sheet's controls come first.
         var pending = ArraySlice(roots.map { (element: $0.0, depth: 0, inDialog: $0.1) })
         var queue: [(element: AXUIElement, depth: Int, inDialog: Bool)] = []
@@ -104,7 +114,7 @@ enum AXEngine {
             let role = v[0] as? String ?? ""
 
             if actionableRoles.contains(role), let frame = frame(position: v[2], size: v[3]),
-               frame.width > 2, frame.height > 2, screenBounds.intersects(frame) {
+               frame.width > 2, frame.height > 2, ObservationGeometry.intersectsAnyDisplay(frame, displays: displays) {
                 // A password field's value never reaches the model: not as its label, not as its value.
                 let secure = role == "AXSecureTextField" || v[1] as? String == "AXSecureTextField"
                 let raw: Any? = secure ? Safety.redacted(v[8] as? String, role: role, subrole: v[1] as? String) : v[8]
@@ -125,7 +135,9 @@ enum AXEngine {
                         label: label.isEmpty ? "(unlabeled \(role.dropFirst(2)))" : label,
                         frame: frame, element: element,
                         ref: n == 1 ? base : "\(base)~\(n)",
-                        value: valueText(raw, role: role), inDialog: inDialog, observationID: snapshot?.id, windowID: snapshot?.windowID))
+                        value: valueText(raw, role: role), inDialog: inDialog, observationID: snapshot?.id, windowID: snapshot?.windowID,
+                        enabled: v[10] as? Bool, expanded: v[11] as? Bool, selected: v[12] as? Bool,
+                        selection: input && !secure ? textRange(v[13]) : nil))
                 }
             }
 
@@ -138,8 +150,27 @@ enum AXEngine {
         if found.count > limit { found = trimmed(found, to: limit) }
         return found.enumerated().map { i, e in
             UIElementInfo(id: "e\(i)", role: e.role, label: e.label, frame: e.frame, element: e.element,
-                          ref: e.ref, value: e.value, inDialog: e.inDialog, observationID: e.observationID, windowID: e.windowID)
+                          ref: e.ref, value: e.value, inDialog: e.inDialog, observationID: e.observationID, windowID: e.windowID,
+                          enabled: e.enabled, expanded: e.expanded, selected: e.selected, selection: e.selection)
         }
+    }
+
+    /// A CFRange-valued Accessibility attribute as an NSRange.
+    private static func textRange(_ raw: Any?) -> NSRange? {
+        guard let raw, CFGetTypeID(raw as CFTypeRef) == AXValueGetTypeID() else { return nil }
+        var range = CFRange()
+        guard AXValueGetValue(raw as! AXValue, .cfRange, &range), range.location >= 0, range.length >= 0 else { return nil }
+        return NSRange(location: range.location, length: range.length)
+    }
+
+    /// Short state flags worth showing the model: only what differs from the unremarkable default.
+    static func stateFlags(_ e: UIElementInfo) -> String {
+        var flags: [String] = []
+        if e.enabled == false { flags.append("disabled") }
+        if e.expanded == true { flags.append("expanded") } else if e.expanded == false { flags.append("collapsed") }
+        if e.selected == true { flags.append("selected") }
+        if let r = e.selection, isInput(e.role) { flags.append(r.length == 0 ? "caret@\(r.location)" : "selection \(r.location)+\(r.length)") }
+        return flags.isEmpty ? "" : " [" + flags.joined(separator: ", ") + "]"
     }
 
     private static func isInput(_ role: String) -> Bool {
@@ -168,7 +199,7 @@ enum AXEngine {
     /// half-cut label), and a closing note says how many.
     static func listing(_ elements: [UIElementInfo], budget: Int = 8000, refs: Bool = false) -> String {
         let lines = elements.map { e in
-            "\(e.id)\(refs ? " #\(e.ref)" : "") \(e.role.dropFirst(2)): \(e.label)"
+            "\(e.id)\(refs ? " #\(e.ref)" : "") \(e.role.dropFirst(2)): \(e.label)\(stateFlags(e))"
                 + (e.value.map { isInput(e.role) && !e.label.contains($0) ? " = \($0.prefix(60).debugDescription)" : "" } ?? "")
         }
         var total = lines.reduce(0) { $0 + $1.count + 1 }
@@ -378,6 +409,7 @@ enum AXEngine {
         return Safety.redacted(attr(f, kAXValueAttribute), of: f)
     }
 
+    static let activityMarker = "◉ Clinqy · "
     private static let fingerprintAttrs = [kAXRoleAttribute, kAXTitleAttribute, kAXDescriptionAttribute, kAXValueAttribute]
 
     /// Cheap signature of what's on screen; if it doesn't change after an action, the action missed.
@@ -392,11 +424,22 @@ enum AXEngine {
         var hasher = Hasher()
         var queue: [AXUIElement] = [window]
         var head = 0
+        // A browser window's toolbar, bookmarks bar, tab strip and the page itself change layout and content continuously
+        // (re-rendering pages, lazy lists) without invalidating the click the model planned. Page content is guarded by the
+        // extension's document/snapshot tokens and per-element identity checks; here a browser window is identified by its
+        // title (which changes when the page navigates or its state changes). Native apps keep their whole tree.
+        var pid: pid_t = 0
+        AXUIElementGetPid(window, &pid)
+        if NSRunningApplication(processIdentifier: pid).map({ Launcher.isBrowser($0) }) == true {
+            hasher.combine((attrs(window, fingerprintAttrs)[1] as? String).map { $0.replacingOccurrences(of: Self.activityMarker, with: "") })
+            return hasher.finalize()
+        }
         while head < queue.count, head < 600 {
             let el = queue[head]
             head += 1
             let v = attrs(el, fingerprintAttrs)
-            for x in v { hasher.combine(x as? String) }
+            // Clinqy's own "◉ Clinqy · " title marker (added to the page once it starts working) is not page content.
+            for x in v { hasher.combine((x as? String).map { $0.replacingOccurrences(of: Self.activityMarker, with: "") }) }
             if let n = v[3] as? NSNumber { hasher.combine(n) }
             queue.append(contentsOf: children(of: el, role: v[0] as? String ?? ""))
         }
@@ -627,13 +670,14 @@ enum AXEngine {
     static func paste(_ text: String) {
         guard !Task.isCancelled else { return }
         let board = NSPasteboard.general
-        let saved = board.string(forType: .string)
+        let saved = PasteboardSnapshot(board)
         board.clearContents()
         board.setString(text, forType: .string)
+        let owned = board.changeCount
         press(shortcutKey("v"), flags: .maskCommand)
         usleep(250_000)
-        board.clearContents()
-        if let saved { board.setString(saved, forType: .string) }
+        // Every format comes back, and only if nobody copied something new while the paste was in flight.
+        saved.restore(to: board, ifUnchangedSince: owned)
     }
 
     /// Frame of the app's focused (or first) window.
@@ -749,20 +793,17 @@ enum AXEngine {
     /// Presses ⌘C in `app`, reads the pasteboard with `read`, then puts back what the user had copied.
     private static func copied<T>(from app: NSRunningApplication, _ read: (NSPasteboard) -> T?) -> T? {
         let pb = NSPasteboard.general
-        let saved = pb.pasteboardItems?.map { item -> NSPasteboardItem in
-            let copy = NSPasteboardItem()
-            for type in item.types { if let data = item.data(forType: type) { copy.setData(data, forType: type) } }
-            return copy
-        } ?? []
+        let saved = PasteboardSnapshot(pb)
         let before = pb.changeCount
         // A private source ignores the ⌃⌥ the user may still be holding.
         keystroke(shortcutKey("c"), flags: .maskCommand, source: CGEventSource(stateID: .privateState), to: app.processIdentifier)
         let deadline = Date().addingTimeInterval(0.25)
         while pb.changeCount == before, Date() < deadline { RunLoop.current.run(until: Date().addingTimeInterval(0.02)) }
         guard pb.changeCount != before else { return nil }   // nothing selected → app copied nothing
+        let appCopy = pb.changeCount
         let value = read(pb)
-        pb.clearContents()
-        if !saved.isEmpty { pb.writeObjects(saved) }
+        // If the user copied something themselves in the meantime, that copy stays.
+        saved.restore(to: pb, ifUnchangedSince: appCopy)
         return value
     }
 
@@ -820,26 +861,35 @@ enum AXEngine {
 
     /// Scrolls the app's focused window; positive is up.
     static func scroll(_ lines: Int32, in app: NSRunningApplication) {
+        scroll(dy: lines, dx: 0, pixels: false, at: nil, in: app)
+    }
+
+    /// One wheel burst at `anchor` (else the window's middle). Positive `dy` scrolls up, positive `dx` left.
+    static func scroll(dy: Int32, dx: Int32, pixels: Bool, at anchor: CGPoint?, in app: NSRunningApplication) {
         let root = AXUIElementCreateApplication(app.processIdentifier)
-        var point = CGPoint(x: 600, y: 400)
-        if let w = mainWindow(root, orFirst: false), let f = frame(of: w) {
+        var point = anchor ?? CGPoint(x: 600, y: 400)
+        if anchor == nil, let w = mainWindow(root, orFirst: false), let f = frame(of: w) {
             point = CGPoint(x: f.midX, y: f.midY)
         }
+        let units: CGScrollEventUnit = pixels ? .pixel : .line
         // In a background run the wheel goes to the app at its window's middle; the pointer stays with the user.
         if backgroundPid == app.processIdentifier {
-            let event = CGEvent(scrollWheelEvent2Source: nil, units: .line, wheelCount: 1, wheel1: lines, wheel2: 0, wheel3: 0)
+            let event = CGEvent(scrollWheelEvent2Source: nil, units: units, wheelCount: 2, wheel1: dy, wheel2: dx, wheel3: 0)
             event?.location = point
             event?.postToPid(app.processIdentifier)
             return
         }
         CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: point, mouseButton: .left)?
             .post(tap: .cghidEventTap)
-        let event = CGEvent(scrollWheelEvent2Source: nil, units: .line, wheelCount: 1, wheel1: lines, wheel2: 0, wheel3: 0)
+        let event = CGEvent(scrollWheelEvent2Source: nil, units: units, wheelCount: 2, wheel1: dy, wheel2: dx, wheel3: 0)
         event?.location = point
         event?.post(tap: .cghidEventTap)
     }
 
     static func selectAll() { press(shortcutKey("a"), flags: .maskCommand) }
+
+    /// ⌘V on the user's layout (the key the letter V sits on), to the current key target.
+    static func pressPaste() { press(shortcutKey("v"), flags: .maskCommand) }
 
     /// The key a ⌘-shortcut letter sits on for this layout (⌘Z is a different key on AZERTY); US on layouts
     /// without Latin letters, which is what macOS itself does for shortcuts there.
@@ -848,43 +898,34 @@ enum AXEngine {
         return usKeys[ch]?.code ?? 0
     }
 
-    /// Keys with a name, which sit in the same place on every layout.
-    private static let namedKeys: [String: CGKeyCode] = [
-        "return": 0x24, "enter": 0x24, "tab": 0x30, "space": 0x31, "delete": 0x33, "backspace": 0x33,
-        "esc": 0x35, "escape": 0x35, "forwarddelete": 0x75, "home": 0x73, "end": 0x77, "pageup": 0x74, "pagedown": 0x79,
-        "left": 0x7B, "right": 0x7C, "down": 0x7D, "up": 0x7E,
-        "f1": 0x7A, "f2": 0x78, "f3": 0x63, "f4": 0x76, "f5": 0x60, "f6": 0x61, "f7": 0x62, "f8": 0x64,
-        "f9": 0x65, "f10": 0x6D, "f11": 0x67, "f12": 0x6F, "spacebar": 0x31, "del": 0x33,
-    ]
-    /// Names the model spells out for punctuation ("cmd+minus", "cmd+plus" for zoom).
-    private static let namedChars: [String: Character] = [
-        "minus": "-", "hyphen": "-", "dash": "-", "plus": "=", "equal": "=", "equals": "=", "comma": ",",
-        "period": ".", "dot": ".", "slash": "/", "backslash": "\\", "semicolon": ";", "quote": "'",
-        "backtick": "`", "grave": "`", "leftbracket": "[", "rightbracket": "]",
-    ]
+    /// Why a shortcut is malformed (unknown token, several keys, only modifiers), or nil. Nothing is pressed for these.
+    static func chordProblem(_ combo: String) -> String? {
+        if case .failure(let e) = KeyChord.parse(combo) { return e.message }
+        return resolve(combo) == nil ? "no key on this keyboard layout produces \(combo.debugDescription)" : nil
+    }
 
-    /// Presses a combo like "cmd+shift+t", "return" or "ctrl+a". Returns false for an unknown key.
+    private static func resolve(_ combo: String) -> (key: CGKeyCode, flags: CGEventFlags)? {
+        guard case .success(let chord) = KeyChord.parse(combo) else { return nil }
+        var flags: CGEventFlags = []
+        if chord.modifiers.contains(.command) { flags.insert(.maskCommand) }
+        if chord.modifiers.contains(.shift) { flags.insert(.maskShift) }
+        if chord.modifiers.contains(.option) { flags.insert(.maskAlternate) }
+        if chord.modifiers.contains(.control) { flags.insert(.maskControl) }
+        if chord.modifiers.contains(.function) { flags.insert(.maskSecondaryFn) }
+        switch chord.key {
+        case .named(let code): return (CGKeyCode(code), flags)
+        case .character(let ch):
+            // A letter or symbol goes to whichever key makes it on this layout (adding Shift/Option if that key needs it).
+            guard let k = layoutKeys()?[ch] ?? usKeys[ch] else { return nil }
+            flags.formUnion(k.flags)
+            return (k.code, flags)
+        }
+    }
+
+    /// Presses a combo like "cmd+shift+t", "return" or "ctrl+a". Returns false, pressing nothing, for a malformed one.
     @discardableResult
     static func press(combo: String) -> Bool {
-        var flags: CGEventFlags = []
-        var key: CGKeyCode?
-        for raw in combo.lowercased().replacingOccurrences(of: " ", with: "").split(separator: "+").map(String.init) {
-            // "Page_Down", "page-up": the same keys as "pagedown", "pageup".
-            let part = raw.count > 1 ? raw.replacingOccurrences(of: "_", with: "").replacingOccurrences(of: "-", with: "") : raw
-            switch part {
-            case "cmd", "command", "⌘": flags.insert(.maskCommand)
-            case "shift", "⇧": flags.insert(.maskShift)
-            case "opt", "option", "alt", "⌥": flags.insert(.maskAlternate)
-            case "ctrl", "control", "⌃": flags.insert(.maskControl)
-            case "fn": flags.insert(.maskSecondaryFn)
-            default:
-                if let code = namedKeys[part] { key = code; continue }
-                guard let ch = namedChars[part] ?? (part.count == 1 ? part.first : nil) else { key = nil; continue }
-                // A letter or symbol goes to whichever key makes it on this layout (adding Shift/Option if that key needs it).
-                if let k = layoutKeys()?[ch] ?? usKeys[ch] { key = k.code; flags.formUnion(k.flags) } else { key = nil }
-            }
-        }
-        guard let key else { return false }
+        guard let (key, flags) = resolve(combo) else { return false }
         press(key, flags: flags)
         return true
     }
@@ -901,39 +942,60 @@ extension AXEngine {
     /// Chooses a menu item by path ("File > Export…", "view > zoom in"), tolerant of case, accents and "…" vs
     /// "...". Presses the item directly (no menus flash open); opens the chain first only if the app needs that.
     /// On a miss the note lists what that level does offer.
-    static func pressMenu(_ path: String, in app: NSRunningApplication) -> (ok: Bool, note: String) {
+    /// `uncertain` means the press may have been applied although the reply was lost or timed out: the caller must
+    /// look at the result and must not press again.
+    static func pressMenu(_ path: String, in app: NSRunningApplication) -> (ok: Bool, note: String, uncertain: Bool) {
         let parts = path.components(separatedBy: CharacterSet(charactersIn: ">›→")).map(menuKey).filter { !$0.isEmpty }
         let root = AXUIElementCreateApplication(app.processIdentifier)
         AXUIElementSetMessagingTimeout(root, 0.5)
-        guard !parts.isEmpty, let bar: AXUIElement = attr(root, kAXMenuBarAttribute) else { return (false, "no menu bar") }
+        guard !parts.isEmpty, let bar: AXUIElement = attr(root, kAXMenuBarAttribute) else { return (false, "no menu bar", false) }
         var items = children(of: bar, role: "AXMenuBar")
         var chain: [AXUIElement] = []
         for (i, part) in parts.enumerated() {
             let titled = items.map { ($0, (attr($0, kAXTitleAttribute) as String?) ?? "") }.filter { !$0.1.isEmpty }
             let keyed = titled.map { ($0.0, $0.1, menuKey($0.1)) }
-            guard let hit = keyed.first(where: { $0.2 == part }) ?? keyed.first(where: { $0.2.hasPrefix(part) })
-                    ?? keyed.first(where: { $0.2.contains(part) }) else {
+            let level = i == 0 ? "the menu bar" : "that menu"
+            switch TitleChoice.choose(titles: titled.map(\.1), wanted: part, normalize: menuKey) {
+            case .none:
                 let offered = titled.prefix(30).map(\.1).joined(separator: ", ")
-                return (false, "no “\(part)” in \(i == 0 ? "the menu bar" : "that menu"); it has: \(offered)")
+                return (false, "no “\(part)” in \(level); it has: \(offered)", false)
+            case .ambiguous(let hits):
+                return (false, "“\(part)” matches several items in \(level): \(hits.map { titled[$0].1 }.joined(separator: ", ")); name one exactly", false)
+            case .one(let index):
+                let hit = keyed[index]
+                chain.append(hit.0)
+                if i == parts.count - 1 { return choose(hit.0, title: hit.1, openers: chain.dropLast()) }
+                // A menu bar item or submenu holds its items in a single AXMenu child.
+                guard let menu = children(of: hit.0, role: "").first(where: { (attr($0, kAXRoleAttribute) as String?) == "AXMenu" }) else {
+                    return (false, "“\(hit.1)” has no submenu", false)
+                }
+                items = children(of: menu, role: "AXMenu")
             }
-            chain.append(hit.0)
-            if i == parts.count - 1 {
-                let enabled = { (attr(hit.0, kAXEnabledAttribute) as Bool?) != false }
-                if enabled(), axPress(hit.0) { return (true, "chose \(hit.1)") }
-                // Enabled states are only refreshed when a menu opens, and some apps only act on items in an open
-                // menu: open each level, then try again.
-                for opener in chain.dropLast() { _ = axPress(opener); usleep(80_000) }
-                if enabled(), axPress(hit.0) { return (true, "chose \(hit.1)") }
-                press(0x35)   // close whatever opened
-                return (false, enabled() ? "“\(hit.1)” wouldn't press" : "“\(hit.1)” is greyed out")
-            }
-            // A menu bar item or submenu holds its items in a single AXMenu child.
-            guard let menu = children(of: hit.0, role: "").first(where: { (attr($0, kAXRoleAttribute) as String?) == "AXMenu" }) else {
-                return (false, "“\(hit.1)” has no submenu")
-            }
-            items = children(of: menu, role: "AXMenu")
         }
-        return (false, "empty path")
+        return (false, "empty path", false)
+    }
+
+    /// Presses the final menu item once. An unsupported or greyed item may be retried through opened menus; an
+    /// ambiguous reply (timeout, cannot-complete) is reported as uncertain and never pressed again.
+    private static func choose(_ item: AXUIElement, title: String, openers: ArraySlice<AXUIElement>) -> (ok: Bool, note: String, uncertain: Bool) {
+        let enabled = { (attr(item, kAXEnabledAttribute) as Bool?) != false }
+        func attempt() -> PressDelivery? { enabled() ? axPressDelivery(item) : nil }
+        let uncertain = (false, "“\(title)” was pressed but the app did not confirm; check whether it took effect before trying again", true)
+        switch attempt() {
+        case .delivered?: return (true, "chose \(title)", false)
+        case .uncertain?: return uncertain
+        default: break
+        }
+        // Enabled states are only refreshed when a menu opens, and some apps only act on items in an open
+        // menu: open each level, then try again.
+        for opener in openers { _ = axPress(opener); usleep(80_000) }
+        switch attempt() {
+        case .delivered?: return (true, "chose \(title)", false)
+        case .uncertain?: return uncertain
+        default: break
+        }
+        press(0x35)   // close whatever opened
+        return (false, enabled() ? "“\(title)” wouldn't press" : "“\(title)” is greyed out", false)
     }
 
     /// Menu title reduced for matching: no case, accents, ellipsis or stray spaces.
@@ -960,8 +1022,14 @@ extension AXEngine {
         let windows: [AXUIElement] = attr(root, kAXWindowsAttribute) ?? []
         let window: AXUIElement?
         if let title, !title.isEmpty {
-            let want = menuKey(title)
-            window = windows.first { menuKey(attr($0, kAXTitleAttribute) ?? "").contains(want) }
+            // Several windows that could be the one named (repeated titles, a shared substring) are not guessed at.
+            let titles = windows.map { (attr($0, kAXTitleAttribute) as String?) ?? "" }
+            switch TitleChoice.choose(titles: titles, wanted: title, normalize: menuKey) {
+            case .one(let i): window = windows[i]
+            case .none: window = nil
+            case .ambiguous(let hits):
+                return (false, "“\(title)” matches \(hits.count) windows (\(hits.map { titles[$0].debugDescription }.joined(separator: ", "))); use a more specific title or raise one first")
+            }
         } else if case .restore = action {
             // Minimized windows can drop out of AXWindows, so remember the one we minimized.
             let remembered = minimizedWindows[app.processIdentifier].flatMap { (attr($0, kAXMinimizedAttribute) as Bool?) == true ? $0 : nil }
@@ -996,23 +1064,28 @@ extension AXEngine {
             minimizedWindows[app.processIdentifier] = window
             return (true, "minimized")
         case .restore:
-            guard flag(kAXMinimizedAttribute) else { return (true, "not minimized") }
+            let minimized: Bool? = attr(window, kAXMinimizedAttribute)
+            if minimized == false { return (true, "not minimized") }
+            // nil means the window does not report the flag: restoring is still attempted and only a read-back of false counts.
             AXUIElementSetAttributeValue(window, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
             AXUIElementPerformAction(window, kAXRaiseAction as CFString)
             app.activate()
             // A window that vanished reads as nil, not false, so ask for an explicit false.
-            guard settle(0.6, { (attr(window, kAXMinimizedAttribute) as Bool?) == false }) else { return (false, "the window stayed minimized") }
+            guard settle(0.6, { (attr(window, kAXMinimizedAttribute) as Bool?) == false }) else {
+                return (false, minimized == nil ? "the window does not report whether it is minimized, so the restore is unconfirmed" : "the window stayed minimized")
+            }
             minimizedWindows[app.processIdentifier] = nil
             return (true, "restored")
         case .fullscreen(let on):
-            if flag("AXFullScreen") == on { return (true, on ? "already full screen" : "already windowed") }
+            let current: Bool? = attr(window, "AXFullScreen")
+            if current == on { return (true, on ? "already full screen" : "already windowed") }
             if AXUIElementSetAttributeValue(window, "AXFullScreen" as CFString, on ? kCFBooleanTrue : kCFBooleanFalse) != .success,
                let button: AXUIElement = attr(window, kAXFullScreenButtonAttribute) {
                 _ = axPress(button)
             }
             // The Spaces animation takes about a second.
-            return settle(1.5) { flag("AXFullScreen") == on } ? (true, on ? "full screen" : "left full screen")
-                : (false, "full screen didn't change")
+            if settle(1.5, { (attr(window, "AXFullScreen") as Bool?) == on }) { return (true, on ? "full screen" : "left full screen") }
+            return (false, current == nil ? "the window does not report its full-screen state, so the change is unconfirmed" : "full screen didn't change")
         case .close:
             guard let button: AXUIElement = attr(window, kAXCloseButtonAttribute), axPress(button) else {
                 return (false, "the window has no close button")
@@ -1073,5 +1146,86 @@ extension AXEngine {
             usleep(50_000)
         } while Date() < deadline
         return check()
+    }
+}
+
+// MARK: - Control state and text edits
+
+extension AXEngine {
+    enum StateOutcome: Equatable {
+        case already
+        case changed
+        /// The request was delivered but the control did not reach the state, or could not be read back.
+        case unverified(String)
+        case unsupported(String)
+        case refused(String)
+    }
+
+    /// Brings a checkbox, radio button or range control to `desired` and confirms by reading it back.
+    /// An unsupported control is reported, never pressed blindly; an ambiguous press reply is never repeated.
+    static func setState(_ element: AXUIElement, to desired: DesiredState) -> StateOutcome {
+        let role: String = attr(element, kAXRoleAttribute) ?? ""
+        guard Safety.isSecureField(element) == false else { return .refused("secure fields are never set") }
+        if (attr(element, kAXEnabledAttribute) as Bool?) == false { return .refused("the control is disabled") }
+        var tolerance = 0.0
+        if case .value(let want) = desired {
+            let lo = (attr(element, kAXMinValueAttribute) as NSNumber?)?.doubleValue
+            let hi = (attr(element, kAXMaxValueAttribute) as NSNumber?)?.doubleValue
+            if let lo, want < lo { return .refused("\(want) is below the minimum \(lo)") }
+            if let hi, want > hi { return .refused("\(want) is above the maximum \(hi)") }
+            tolerance = ((hi ?? 100) - (lo ?? 0)) / 1000
+        }
+        func current() -> Any? { attr(element, kAXValueAttribute) as CFTypeRef? }
+        if desired.matches(current(), tolerance: tolerance) { return .already }
+        switch desired {
+        case .on, .off:
+            switch axPressDelivery(element) {
+            case .unsupported: return .unsupported("the \(role.dropFirst(2).lowercased()) has no press action; click it instead")
+            case .uncertain, .delivered:
+                let reached = settle(0.6) { desired.matches(current()) }
+                if reached { return .changed }
+                return .unverified("pressed, but it reads \(String(describing: current() ?? "unknown" as Any)) rather than \(desired == .on ? "on" : "off")")
+            }
+        case .value(let want):
+            var settable = DarwinBoolean(false)
+            guard AXUIElementIsAttributeSettable(element, kAXValueAttribute as CFString, &settable) == .success, settable.boolValue else {
+                return .unsupported("the control's value cannot be set directly")
+            }
+            let err = AXUIElementSetAttributeValue(element, kAXValueAttribute as CFString, NSNumber(value: want))
+            if err != .success && err != .cannotComplete { return .unsupported("the app refused the value (\(err.rawValue))") }
+            if settle(0.6, { desired.matches(current(), tolerance: tolerance) }) { return .changed }
+            return .unverified("set \(want), but it reads \(String(describing: current() ?? "unknown" as Any))")
+        }
+    }
+
+    enum EditOutcome: Equatable {
+        case done(String)
+        case unsupported(String)
+        case refused(String)
+        case unverified(String)
+    }
+
+    /// Inserts or appends text through Accessibility at the real caret, with a read-back. Fields that expose no
+    /// settable selection or value are reported as unsupported so the caller can say so instead of pretending.
+    static func edit(_ text: String, mode: TextEditMode, field: AXUIElement) -> EditOutcome {
+        guard !Safety.isSecureField(field) else { return .refused("secure fields are never edited") }
+        guard let value: String = attr(field, kAXValueAttribute) else { return .unsupported("the field does not expose its text") }
+        var valueSettable = DarwinBoolean(false)
+        guard AXUIElementIsAttributeSettable(field, kAXValueAttribute as CFString, &valueSettable) == .success, valueSettable.boolValue else {
+            return .unsupported("the field's text cannot be set through Accessibility")
+        }
+        let selection = textRange(attr(field, kAXSelectedTextRangeAttribute) as CFTypeRef?)
+        if mode == .insertAtCaret, selection == nil { return .unsupported("the field does not report its caret position") }
+        guard let result = mode.apply(to: value, selection: selection, text: text) else {
+            return .unsupported("the reported selection does not fit the field's text")
+        }
+        guard AXUIElementSetAttributeValue(field, kAXValueAttribute as CFString, result.value as CFString) == .success else {
+            return .unsupported("the app refused the new text")
+        }
+        var caret = CFRange(location: result.caret, length: 0)
+        if let ax = AXValueCreate(.cfRange, &caret) { AXUIElementSetAttributeValue(field, kAXSelectedTextRangeAttribute as CFString, ax) }
+        let read: String? = attr(field, kAXValueAttribute)
+        guard read == result.value else { return .unverified("the field now reads differently from what was written") }
+        return .done("\(mode == .append ? "appended" : mode == .insertAtCaret ? "inserted at the caret" : "replaced")")
     }
 }

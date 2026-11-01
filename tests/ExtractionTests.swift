@@ -11,6 +11,7 @@ struct NativeWindowObservation {
 }
 enum Screenshot {
     struct Capture { let window: NativeWindowObservation; let rawImage: CGImage }
+    static func backingScale(for frame: CGRect) -> CGFloat { 1 }
 }
 enum AXEngine { static func documentURL(of app: NSRunningApplication) -> URL? { nil } }
 enum Pdf {

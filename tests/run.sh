@@ -52,13 +52,18 @@ case_() {
   if [[ $front != "$BROWSER" || $url != $BASE/* ]]; then echo "SKIP  $name (test page not in front: $front $url)"; return; fi
   local start=$(wc -l < $LOG) t0=$(date +%s)
   open -g "clinqy://run?task=$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1]))' "$task")&test=1$extra&token=$(cat ~/.config/clinqy/cli-token)"
-  local answered=0
+  local answered=0 unconfirmed=0
   for i in $(seq 1 90); do
     sleep 1
     local out=$(tail -n +$((start+1)) $LOG)
     if [[ -n $reply && $answered == 0 && $out == *"Ask:"* || -n $reply && $answered == 0 && $out == *"About to click"* \
           || -n $reply && $answered == 0 && $out == *"review “"*": waiting"* ]]; then
       sleep 1; open -g "clinqy://answer?text=$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1]))' "$reply")&token=$(cat ~/.config/clinqy/cli-token)"; answered=1
+    fi
+    # A model that cannot confirm an outcome itself may ask the user; an unattended test answers "no" so it fails honestly
+    # instead of blocking every test queued behind it.
+    if [[ $unconfirmed == 0 && $out == *"Clinqy couldn't confirm this itself"* ]]; then
+      sleep 1; open -g "clinqy://answer?text=$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1]))' "No, it did not happen")&token=$(cat ~/.config/clinqy/cli-token)"; unconfirmed=1
     fi
     echo $out | grep -qE "\] (✓|✗)" && break
   done

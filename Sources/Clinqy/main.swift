@@ -596,7 +596,7 @@ if command == "selftest" {
               "streaming: nothing until the first action is complete")
         let first = Brain.firstAction(inPartial: String(full.prefix(full.range(of: "{\"do\":\"click")!.lowerBound.utf16Offset(in: full))))
         check(first?["do"] as? String == "type" && first?["text"] as? String == "a {brace} and \"quote\"", "streaming: first action parsed past braces and quotes in strings")
-        check(Agent.startsEarly(["do": "click", "id": "w1"]) && !Agent.startsEarly(["do": "ask", "question": "?"]) && !Agent.startsEarly(["do": "email"]),
+        check(Agent.startsEarly(["do": "read"]) && !Agent.startsEarly(["do": "click", "id": "w1"]) && !Agent.startsEarly(["do": "type", "id": "w1", "text": "x"]) && !Agent.startsEarly(["do": "ask", "question": "?"]) && !Agent.startsEarly(["do": "email"]),
               "streaming: only on-screen steps start early")
         check(Agent.canonical(["b": 1, "a": "x"]) == Agent.canonical(["a": "x", "b": 1]), "streaming: actions compare by content")
     }

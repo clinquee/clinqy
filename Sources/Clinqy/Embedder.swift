@@ -33,9 +33,17 @@ final class Embedder: @unchecked Sendable {
     private init() {
         guard let data = try? Data(contentsOf: url),
               let saved = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Data] else { return }
-        for (key, blob) in saved {
-            cache[key] = blob.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
+        for (key, blob) in saved where blob.count > 0 && blob.count % MemoryLayout<Float>.size == 0 {
+            let vector = blob.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
+            // A damaged cache entry (wrong width for its model, NaN/inf) would poison similarity scores: recompute it instead.
+            guard Self.usable(vector, bge: key.hasPrefix("bge:")) else { continue }
+            cache[key] = vector
         }
+    }
+
+    /// Whether a vector is plausible output of its model: the right width for the retrieval model, every value finite.
+    static func usable(_ v: [Float], bge: Bool) -> Bool {
+        !v.isEmpty && (!bge || v.count == 384) && v.allSatisfy(\.isFinite) && v.contains { $0 != 0 }
     }
 
     var available: Bool { model != nil || usesModel }
@@ -51,6 +59,10 @@ final class Embedder: @unchecked Sendable {
     func activate(warming texts: [String] = [], wait: Bool = false) {
         let work = { [self] in
             guard !usesModel, let enc = TextEncoder.load() else { return }
+            // Smoke test before trusting the weights: a unit-length, finite, 384-wide vector for a sentence, and different
+            // sentences must not collapse to the same vector (garbage or zeroed weights do).
+            let a = enc.embed("memory test sentence"), b = enc.embed("an unrelated question about travel")
+            guard Self.usable(a, bge: true), Self.usable(b, bge: true), abs(Self.cosine(a, a) - 1) < 1e-2, Self.cosine(a, b) < 0.9999 else { return }
             lock.lock()
             encoder = enc
             lock.unlock()
@@ -93,6 +105,7 @@ final class Embedder: @unchecked Sendable {
         let v: [Float]
         if let enc {
             v = enc.embed(Self.normalize(text))
+            guard Self.usable(v, bge: true) else { return nil }   // never cache or return a broken vector
         } else {
             guard let model else { return nil }
             modelLock.lock()
@@ -100,6 +113,7 @@ final class Embedder: @unchecked Sendable {
             modelLock.unlock()
             guard let raw else { return nil }
             v = raw.map(Float.init)
+            guard Self.usable(v, bge: false) else { return nil }
         }
         lock.lock()
         cache[k] = v
@@ -160,8 +174,9 @@ final class Embedder: @unchecked Sendable {
         let snapshot = cache
         lock.unlock()
         let blobs = snapshot.mapValues { v in v.withUnsafeBufferPointer { Data(buffer: $0) } }
-        if let data = try? PropertyListSerialization.data(fromPropertyList: blobs, format: .binary, options: 0) {
-            try? data.write(to: url, options: .atomic)
-        }
+        // A cache: if it can't be written the vectors are simply recomputed next launch, so keep them marked unsaved.
+        if let data = try? PropertyListSerialization.data(fromPropertyList: blobs, format: .binary, options: 0),
+           StoreFile.write(data, to: url) == nil { return }
+        lock.lock(); dirty = true; lock.unlock()
     }
 }

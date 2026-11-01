@@ -27,7 +27,7 @@ import SQLite3
             for i in 0..<20 {
                 let t = Date()
                 precondition(store.beginAction(id, kind: "read"))
-                store.endAction(id, kind: "read", ok: true, completedSteps: i)
+                store.endAction(id, kind: "read", outcome: .confirmed, completedSteps: i)
                 samples.append(ms(t))
             }
             let bytes = (try FileManager.default.attributesOfItem(atPath: file.path)[.size] as? Int) ?? 0

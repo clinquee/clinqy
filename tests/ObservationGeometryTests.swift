@@ -27,6 +27,13 @@ import CoreGraphics
         var changed = patch; changed[20] = 180; changed[21] = 180
         check(!ObservationGeometry.visuallyMatches(patch, changed), "changed target pixels refused even without AX changes")
         check(!ObservationGeometry.visuallyMatches([], []) && !ObservationGeometry.visuallyMatches(patch, [1]), "missing or incompatible visual evidence refused")
+        let left = CGRect(x: 0, y: 0, width: 1000, height: 800), right = CGRect(x: 1200, y: 0, width: 1000, height: 800)
+        let gap = CGRect(x: 1050, y: 100, width: 100, height: 100)
+        check(left.union(right).intersects(gap), "the bounding box of two displays covers the gap between them")
+        check(!ObservationGeometry.intersectsAnyDisplay(gap, displays: [left, right]), "an element wholly in the display gap is not visible")
+        check(ObservationGeometry.intersectsAnyDisplay(CGRect(x: 950, y: 100, width: 150, height: 50), displays: [left, right]), "an element straddling a display edge is visible")
+        check(!ObservationGeometry.intersectsAnyDisplay(CGRect(x: 1000, y: 0, width: 50, height: 50), displays: [left]), "touching an edge only is not visible")
+        check(!ObservationGeometry.intersectsAnyDisplay(gap, displays: []), "no displays means nothing visible")
         print("PASS: \(checks) observation geometry checks")
     }
 }

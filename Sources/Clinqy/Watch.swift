@@ -18,14 +18,16 @@ enum Watch {
     /// Last scan time per pid, shared by every watcher (two waits on one app don't double the work).
     private static var lastScan: [pid_t: Date] = [:]
 
+    /// With `window` the wait is bound to that observed window (and its sheets); without it, any window of the app counts.
     /// True once `text` is on screen in `app` (or, with `gone`, once it isn't); false after `timeout` seconds.
     /// Falls back to polling every 0.5 s when the app can't be observed (no Accessibility permission, odd process).
-    static func until(app: NSRunningApplication, text: String, gone: Bool = false, timeout: TimeInterval) async -> Bool {
+    static func until(app: NSRunningApplication, text: String, gone: Bool = false, timeout: TimeInterval,
+                      window scope: AXUIElement? = nil) async -> Bool {
         let want = text.lowercased()
         let pid = app.processIdentifier
         // Chromium and Electron only publish web content once an assistive client asks for it.
         AXEngine.enableManualAccessibility(app)
-        let met = { contains(pid: pid, want) != gone }
+        let met = { contains(pid: pid, want, window: scope) != gone }
         if met() { return true }
         return await withCheckedContinuation { (done: CheckedContinuation<Bool, Never>) in
             Watcher(pid: pid, check: met, timeout: timeout, done: done).start()
@@ -33,12 +35,12 @@ enum Watch {
     }
 
     /// Case-insensitive search of every window's titles, descriptions and values (bounded, so huge trees stay cheap).
-    static func contains(pid: pid_t, _ want: String) -> Bool {
+    static func contains(pid: pid_t, _ want: String, window scope: AXUIElement? = nil) -> Bool {
         lastScan[pid] = Date()
         let root = AXUIElementCreateApplication(pid)
         AXUIElementSetMessagingTimeout(root, 0.5)
-        var queue: [AXUIElement] = (attr(root, kAXWindowsAttribute) as [AXUIElement]?) ?? []
-        if queue.isEmpty, let w: AXUIElement = attr(root, kAXFocusedWindowAttribute) { queue.append(w) }
+        var queue: [AXUIElement] = scope.map { [$0] } ?? (attr(root, kAXWindowsAttribute) as [AXUIElement]?) ?? []
+        if queue.isEmpty, scope == nil, let w: AXUIElement = attr(root, kAXFocusedWindowAttribute) { queue.append(w) }
         var head = 0
         while head < queue.count, head < 5000 {
             let el = queue[head]

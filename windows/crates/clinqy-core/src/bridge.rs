@@ -18,7 +18,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 pub const PORT: u16 = 47823;
 /// The extension version this app expects (extension/manifest.json). An older copy still running is asked to reload.
-pub const EXTENSION_VERSION: &str = "1.9.15";
+pub const EXTENSION_VERSION: &str = "1.9.16";
 
 /// Finds which program is on the other end of a local TCP connection (by its port): "chrome.exe".
 pub type OwnerLookup = Box<dyn Fn(u16) -> Option<String> + Send + Sync>;

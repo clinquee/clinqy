@@ -205,6 +205,10 @@ final class APIChat: @unchecked Sendable {
     private let system: String
     private let model: String
     private let effort: String
+    /// The reasoning effort that was asked for (argument or configuration); nil when none was, so a CLI's own default stands.
+    private let requestedEffort: String?
+    private let requestedModel: String
+    private let transport: String
     private let codexServer: CodexAppServer?
     private let lock = NSLock()
     private var turns: [Turn] = []
@@ -226,13 +230,47 @@ final class APIChat: @unchecked Sendable {
         self.key = key
         self.system = system
         self.model = provider.model(model)
-        self.effort = (effort ?? Config.value("AGY_EFFORT") ?? Config.value("CLAUDE_EFFORT") ?? "low").lowercased()
+        let asked = effort ?? Config.value("AGY_EFFORT") ?? Config.value("CLAUDE_EFFORT")
+        requestedEffort = asked.map { $0.lowercased() }.flatMap { $0.isEmpty ? nil : $0 }
+        requestedModel = model
+        self.effort = (asked ?? "low").lowercased()
         let transport = (Config.value("CODEX_TRANSPORT") ?? "exec").lowercased()
         if provider == .codexCLI, !["exec", "app-server"].contains(transport) {
             throw AgySession.BrainError.failed("CODEX_TRANSPORT must be exec or app-server")
         }
+        self.transport = provider == .codexCLI ? transport : "http"
         codexServer = provider == .codexCLI && transport == "app-server"
-            ? CodexAppServer(executable: provider.cliPath!, system: system, model: provider.model(model)) : nil
+            ? CodexAppServer(executable: provider.cliPath!, system: system, model: provider.model(model),
+                             effort: ModelRoute.codexEffort(requestedEffort)) : nil
+        let route = self.route
+        DispatchQueue.main.async { Agent.writeLog(route.summary) }
+    }
+
+    /// The session's effective configuration (see ModelRoute): requested vs resolved vs sent.
+    var route: ModelRoute {
+        let sent: String?
+        switch provider {
+        case .codexCLI: sent = ModelRoute.codexEffort(requestedEffort)
+        case .gemini: sent = ModelRoute.geminiLevel(effort)
+        case .openai: sent = ModelRoute.openAIEffort(model: model, effort: effort)
+        default: sent = nil
+        }
+        let images: String
+        let tools: String
+        switch (provider, transport) {
+        case (.codexCLI, "app-server"):
+            images = "per-turn (the thread keeps earlier turns; each screenshot is sent once)"
+            tools = "none (environments empty, features/MCP/web search verified disabled)"
+        case (.codexCLI, _):
+            images = "latest-only (text transcript replayed each turn, newest screenshot attached)"
+            tools = "none requested (exec, read-only sandbox)"
+        default:
+            images = "latest-only (earlier screenshots replaced by a note)"
+            tools = "none"
+        }
+        return ModelRoute(provider: provider.rawValue, requestedModel: requestedModel, resolvedModel: model,
+                          requestedEffort: requestedEffort, sentEffort: sent, transport: transport,
+                          imageHistory: images, tools: tools)
     }
 
     var isAlive: Bool { lock.withLock { !closed } }
@@ -332,7 +370,7 @@ final class APIChat: @unchecked Sendable {
                 return ["role": t.user ? "user" : "model", "parts": parts]
             }
             var generation: [String: Any] = ["maxOutputTokens": 8192]
-            if !plain { generation["thinkingConfig"] = ["thinkingLevel": effort == "high" || effort == "max" ? "high" : "low"] }
+            if !plain { generation["thinkingConfig"] = ["thinkingLevel": ModelRoute.geminiLevel(effort)] }
             body = ["systemInstruction": ["parts": [["text": system]]], "contents": contents, "generationConfig": generation]
         case .openai, .openrouter, .ollama, .compatible:
             req = URLRequest(url: URL(string: provider.baseURL + "/chat/completions")!)
@@ -350,8 +388,8 @@ final class APIChat: @unchecked Sendable {
                 }
             }
             body = ["model": model, "messages": messages]
-            if !plain, provider == .openai, model.hasPrefix("gpt-5") || model.range(of: #"^o\d"#, options: .regularExpression) != nil {
-                body["reasoning_effort"] = ["min", "minimal", "none"].contains(effort) ? "minimal" : effort == "max" ? "high" : effort
+            if !plain, provider == .openai, let level = ModelRoute.openAIEffort(model: model, effort: effort) {
+                body["reasoning_effort"] = level
             }
         case .agyCLI, .claudeCLI, .codexCLI:
             throw ClaudeSession.BrainError.failed("\(provider.rawValue) isn't an HTTP provider")
@@ -467,6 +505,8 @@ final class APIChat: @unchecked Sendable {
         var args = ["exec", "--skip-git-repo-check", "--sandbox", "read-only", "--color", "never", "--output-last-message", lastURL.path]
         if hasImage { args += ["--image", imageURL.path] }
         if !model.isEmpty { args += ["--model", model] }
+        // Only an explicitly configured effort is forwarded; otherwise the CLI keeps its own default.
+        if let level = ModelRoute.codexEffort(requestedEffort) { args += ["-c", "model_reasoning_effort=\"\(level)\""] }
         args.append("-")
 
         let promptURL = dir.appendingPathComponent("prompt.txt")

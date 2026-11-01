@@ -150,3 +150,12 @@ assert(!calls.slice(parallelCallsStart).some(c => c[0] === 'focusWindow' || (c[0
 chrome.debugger.sendCommand = originalSend;
 await context.serializedHandle({ cmd: 'clinqyDone', tabIds: [parallelA.id] });
 console.log('PASS parallel cross-tab commands, ordered same-tab commands, per-task cleanup and no foreground activation');
+
+const longAssignmentURL='https://course.test/learn/programming/assignment/lab?path='+encodeURIComponent('/?folder=/home/coder/project')+'&context='+'x'.repeat(260);
+tabs.get(1).url=longAssignmentURL;
+const metadataBefore=calls.length;
+const metadata=await context.serializedHandle({cmd:'tabs'});
+assert.equal(metadata.tabs.find(tab=>tab.id===1).url,longAssignmentURL);
+assert(!calls.slice(metadataBefore).some(call=>['attach','update','focusWindow','create','remove'].includes(call[0])));
+await assert.rejects(context.handle({cmd:'snapshot',workOnly:true,tabId:1}),/does not belong/);
+console.log('PASS existing-tab metadata preserves full lab URLs without granting page access, attaching, focusing or modifying tabs');

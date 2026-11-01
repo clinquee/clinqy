@@ -126,6 +126,7 @@ final class BrowserJobs: ObservableObject {
         }
         TaskExecution.$current.withValue(job.context) {
             Background.chooseBrowser(job.browser)
+            BrowserBridge.shared.allowsExistingTabDiscovery = BrowserTaskRouting.requestsExistingTabs(job.request)
             worker.submit(job.request, test: job.test, model: job.model, provider: job.provider, background: true, taskID: job.test ? nil : job.id)
         }
         if !worker.isRunning {

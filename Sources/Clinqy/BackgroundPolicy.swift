@@ -4,11 +4,13 @@ import Foundation
 enum BackgroundPolicy {
     enum Route: Equatable { case api, browser, attention(String) }
 
-    static func route(_ action: [String: Any], hasWorkerPage: Bool) -> Route {
+    static func route(_ action: [String: Any], hasWorkerPage: Bool, allowTabDiscovery: Bool = false) -> Route {
         let kind = (action["do"] as? String ?? "").lowercased()
         let webID = (action["id"] as? String)?.lowercased().hasPrefix("w") == true
         switch kind {
         case "parallel_browser": return .api
+        case "tab" where allowTabDiscovery && (action["op"] as? String ?? "list").lowercased() == "list":
+            return .browser // Explicit existing-tab requests may discover URLs before creating a task page.
         case "open_url": return .browser
         case "open_app":
             let name = (action["name"] as? String ?? "").lowercased()
@@ -20,7 +22,13 @@ enum BackgroundPolicy {
             return hasWorkerPage && webID && (kind != "drag" || destinationIsWeb) ? .browser
                 : .attention("Gestures need current element ids on the owned browser page; native gestures require foreground mode.")
         case "click", "type", "choose", "fill":
-            return hasWorkerPage && (webID || (action["id"] == nil && kind == "type")) ? .browser
+            if hasWorkerPage, !(webID || (action["id"] == nil && kind == "type")) {
+                // The task's own tab exists; this action just has no page-element target in background mode.
+                return .attention(action["text"] != nil || action["x"] != nil
+                    ? "Background tabs act on page element ids (w<number>) only, not on text labels or screen coordinates. Read the page and use the element's w-id."
+                    : "Use a current page element id (w<number>) from the owned task tab. I won't use your active window.")
+            }
+            return hasWorkerPage ? .browser
                 : .attention("No owned browser page target is available. I won't use your active window.")
         case "key":
             let key = (action["keys"] as? String ?? "").lowercased().replacingOccurrences(of: " ", with: "")
@@ -30,7 +38,7 @@ enum BackgroundPolicy {
             }
             return hasWorkerPage ? .browser : .attention("No owned browser page is available for this key.")
         case "verify":
-            if action["path"] as? String != nil { return .api }
+            if action["path"] as? String != nil || action["user_confirms"] != nil { return .api }
             return hasWorkerPage && (!((action["value"] as? String) != nil) || webID) ? .browser
                 : .attention("Verify a saved file path or an outcome on the owned browser page. I won't inspect your foreground window.")
         case "image" where action["path"] != nil: return .api

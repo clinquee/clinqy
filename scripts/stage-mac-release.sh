@@ -22,12 +22,12 @@ fi
 ./scripts/verify-mac-release.sh
 printf '%s\n' "$COMMIT" > dist/Clinqy.source-commit.txt
 cat > dist/Clinqy.release-notes.md <<'NOTES'
-- Run browser tasks in parallel in your signed-in Chrome or Arc, with queued work and compact task cursors.
-- Add another typed or spoken task with Ctrl+Option while work continues.
-- Choose Normal or Background in Telegram; use one task card and task-specific questions, screenshots and results.
-- Inspect uploaded/page images and receive actual photos with acknowledged delivery.
-- Keep the Mac awake while tasks run, releasing power assertions on completion, failure, stop and quit.
-- Improve native screenshot forwarding, file-picker targeting and cancellation cleanup.
+- Integrate persistent task memory, corrections, replay history and bounded delegation.
+- Improve browser request ownership, cancellation cleanup and cross-origin iframe control.
+- Support basic foreground browser control without requiring extension installation.
+- Strengthen native input contracts, outcome verification and recovery checkpoints.
+- Preserve unreadable data stores and report failed saves instead of silently overwriting data.
+- Expand Mac, browser, memory and delegation regression coverage.
 
 Requires Apple silicon and macOS 14+. The app uses the existing stable signing identity and is not Apple notarized.
 NOTES

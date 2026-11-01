@@ -118,16 +118,7 @@ enum Tables {
                 // Add to the end; skip the header row if the file already starts with the same one.
                 guard let old = readSample(url, maxRows: 1) else { throw Pdf.Failure("couldn't read the existing CSV header") }
                 let add = old.rows.first.map { $0 == rows.first ?? [] } == true ? Array(rows.dropFirst()) : rows
-                let handle = try FileHandle(forWritingTo: url)
-                defer { try? handle.close() }
-                let end = handle.seekToEndOfFile()
-                if end > 0, let reader = try? FileHandle(forReadingFrom: url) {
-                    defer { try? reader.close() }
-                    try reader.seek(toOffset: end - 1)
-                    let last = try reader.read(upToCount: 1)?.first
-                    if last != 10 && last != 13 { try handle.write(contentsOf: Data([10])) }
-                }
-                if !add.isEmpty { try handle.write(contentsOf: Data(csv(add).utf8)) }
+                try appendRows(add, to: url)
                 if destination == "numbers", let app = numbersURL() {
                     _ = try? await NSWorkspace.shared.open([url], withApplicationAt: app, configuration: .init())
                 }
@@ -157,6 +148,20 @@ enum Tables {
         default:
             throw Pdf.Failure("table to: csv, numbers, excel or clipboard (for a web form, type the values in)")
         }
+    }
+
+    /// Appends CSV rows to an existing file, starting a new line first when the file doesn't end with one.
+    static func appendRows(_ add: [[String]], to url: URL) throws {
+        let handle = try FileHandle(forUpdating: url)
+        defer { try? handle.close() }
+        let size = try handle.seekToEnd()
+        var prefix = ""
+        if size > 0 {
+            try handle.seek(toOffset: size - 1)
+            if let last = try handle.read(upToCount: 1)?.first, last != 0x0A, last != 0x0D { prefix = "\n" }
+            try handle.seekToEnd()
+        }
+        try handle.write(contentsOf: Data((prefix + csv(add)).utf8))
     }
 
     private static func numbersURL() -> URL? { NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.iWork.Numbers") }

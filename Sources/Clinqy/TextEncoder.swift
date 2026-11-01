@@ -27,13 +27,41 @@ final class TextEncoder: @unchecked Sendable {
         guard Config.value("CLINQY_EMBEDDINGS")?.lowercased() != "system" else { return nil }
         guard let vocabText = try? String(contentsOf: dir.appendingPathComponent("vocab.txt"), encoding: .utf8),
               let file = try? NSData(contentsOf: dir.appendingPathComponent("model.safetensors"), options: .alwaysMapped),
-              let weights = safetensors(file) else { return nil }
+              let tensors = safetensors(file) else { return nil }
         var vocab: [String: Int32] = [:]
         for (i, line) in vocabText.split(separator: "\n", omittingEmptySubsequences: false).enumerated() where !line.isEmpty {
-            vocab[String(line)] = Int32(i)
+            // A repeated token would make ids ambiguous; a vocabulary beyond Int32 can't be indexed.
+            guard i <= Int(Int32.max), vocab.updateValue(Int32(i), forKey: String(line)) == nil else { return nil }
         }
-        let enc = TextEncoder(vocab: vocab, file: file, weights: weights)
-        return enc.weights["embeddings.word_embeddings.weight"] != nil && enc.weights["encoder.layer.11.output.dense.weight"] != nil ? enc : nil
+        guard validate(tensors: tensors, vocab: vocab) else { return nil }
+        return TextEncoder(vocab: vocab, file: file, weights: tensors.mapValues(\.pointer))
+    }
+
+    /// Everything `embed` reads must exist with exactly the shape of bge-small (a truncated, renamed or different model
+    /// would otherwise crash on a missing tensor or read outside it), and every token id must have an embedding row.
+    static func validate(tensors: [String: Tensor], vocab: [String: Int32], hidden d: Int = 384, layers: Int = 12, inner: Int = 1536) -> Bool {
+        func has(_ name: String, _ shape: [Int]) -> Bool { tensors[name]?.shape == shape }
+        func hasAtLeast(_ name: String, rows minimum: Int, columns: Int) -> Bool {
+            guard let shape = tensors[name]?.shape, shape.count == 2 else { return false }
+            return shape[0] >= minimum && shape[1] == columns
+        }
+        guard ["[CLS]", "[SEP]", "[UNK]"].allSatisfy({ vocab[$0] != nil }), let top = vocab.values.max() else { return false }
+        guard hasAtLeast("embeddings.word_embeddings.weight", rows: Int(top) + 1, columns: d),
+              hasAtLeast("embeddings.position_embeddings.weight", rows: 512, columns: d),
+              hasAtLeast("embeddings.token_type_embeddings.weight", rows: 1, columns: d),
+              has("embeddings.LayerNorm.weight", [d]), has("embeddings.LayerNorm.bias", [d]) else { return false }
+        for l in 0..<layers {
+            let p = "encoder.layer.\(l)."
+            for part in ["attention.self.query", "attention.self.key", "attention.self.value", "attention.output.dense"] {
+                guard has(p + part + ".weight", [d, d]), has(p + part + ".bias", [d]) else { return false }
+            }
+            guard has(p + "intermediate.dense.weight", [inner, d]), has(p + "intermediate.dense.bias", [inner]),
+                  has(p + "output.dense.weight", [d, inner]), has(p + "output.dense.bias", [d]) else { return false }
+            for norm in ["attention.output.LayerNorm", "output.LayerNorm"] {
+                guard has(p + norm + ".weight", [d]), has(p + norm + ".bias", [d]) else { return false }
+            }
+        }
+        return true
     }
 
     private init(vocab: [String: Int32], file: NSData, weights: [String: UnsafePointer<Float>]) {
@@ -60,20 +88,38 @@ final class TextEncoder: @unchecked Sendable {
 
     // MARK: Safetensors
 
-    /// Tensor name → its floats inside the file (F32 only; the file stays mapped for the encoder's lifetime).
-    private static func safetensors(_ data: NSData) -> [String: UnsafePointer<Float>]? {
+    struct Tensor {
+        let pointer: UnsafePointer<Float>
+        let shape: [Int]
+    }
+
+    /// Tensor name → its floats and shape inside the file (F32 only; the file stays mapped for the encoder's lifetime).
+    /// Nil when the header is malformed or any tensor's byte range doesn't match its shape or lies outside the file.
+    static func safetensors(_ data: NSData) -> [String: Tensor]? {
         guard data.length > 8 else { return nil }
         let base = data.bytes
-        let n = Int(UInt64(littleEndian: base.loadUnaligned(as: UInt64.self)))
-        guard n > 0, 8 + n <= data.length,
+        let raw = UInt64(littleEndian: base.loadUnaligned(as: UInt64.self))
+        guard raw > 0, raw <= UInt64(data.length - 8), let n = Int(exactly: raw),
               let header = try? JSONSerialization.jsonObject(with: Data(bytes: base + 8, count: n)) as? [String: Any] else { return nil }
-        var out: [String: UnsafePointer<Float>] = [:]
-        for (name, value) in header {
-            guard let info = value as? [String: Any], info["dtype"] as? String == "F32",
-                  let range = info["data_offsets"] as? [Int], range.count == 2 else { continue }
-            let start = 8 + n + range[0], end = 8 + n + range[1]
-            guard start <= end, end <= data.length, start % MemoryLayout<Float>.alignment == 0 else { return nil }
-            out[name] = (base + start).assumingMemoryBound(to: Float.self)
+        var out: [String: Tensor] = [:]
+        for (name, value) in header where name != "__metadata__" {
+            // Other dtypes (bge ships an int64 position_ids) aren't read by the encoder: skipped, and any tensor it does
+            // need is checked for by name and shape in `validate`.
+            guard let info = value as? [String: Any] else { return nil }
+            guard info["dtype"] as? String == "F32" else { continue }
+            guard let range = info["data_offsets"] as? [Int], range.count == 2,
+                  let shape = info["shape"] as? [Int], shape.allSatisfy({ $0 >= 0 }) else { return nil }
+            let (dataStart, o1) = (8 + n).addingReportingOverflow(range[0])
+            let (dataEnd, o2) = (8 + n).addingReportingOverflow(range[1])
+            guard !o1, !o2, range[0] >= 0, range[0] <= range[1], dataEnd <= data.length, dataStart % MemoryLayout<Float>.alignment == 0 else { return nil }
+            var elements = 1
+            for dim in shape {
+                let (product, overflow) = elements.multipliedReportingOverflow(by: dim)
+                guard !overflow else { return nil }
+                elements = product
+            }
+            guard elements.multipliedReportingOverflow(by: MemoryLayout<Float>.size) == (range[1] - range[0], false) else { return nil }
+            out[name] = Tensor(pointer: (base + dataStart).assumingMemoryBound(to: Float.self), shape: shape)
         }
         return out
     }

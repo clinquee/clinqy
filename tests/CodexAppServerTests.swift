@@ -29,6 +29,15 @@ import Foundation
         check(firstItems.count == 2 && firstItems[1]["type"] as? String == "image", "image is a structured input")
         let secondItems = (turns[1]["params"] as! [String: Any])["input"] as! [[String: Any]]
         check(secondItems.count == 1 && secondItems[0]["text"] as? String == "Second input", "history and old screenshots are not replayed")
+        // Effort: forwarded on every turn only when one was configured; otherwise the CLI's default stands.
+        check((turns[0]["params"] as! [String: Any])["effort"] == nil, "no effort configured sends none")
+        let efforted = CodexAppServer(executable: "/usr/bin/python3",
+                                      arguments: [script, "success", root.appendingPathComponent("effort.jsonl").path],
+                                      system: "Reply with a Clinqy action.", effort: "high", timeout: 2)
+        check(try await efforted.send("Think", image: nil) == "Reply 1", "effort session answers")
+        await efforted.close()
+        let effortTurns = try records("effort").filter { $0["method"] as? String == "turn/start" }
+        check(effortTurns.count == 1 && (effortTurns[0]["params"] as! [String: Any])["effort"] as? String == "high", "effort reaches turn/start")
         let early = session("early")
         check(try await early.send("Early first", image: nil) == "Early 1", "buffers events before RPC acknowledgement")
         check(try await early.send("Early second", image: nil) == "Early 2", "rejects old turn completion before acknowledgement")

@@ -5,8 +5,9 @@ import SQLite3
 struct Workflow { var name: String; var steps: [String]; var defaults: [String: String]? }
 struct WorkflowStep: Codable, Equatable { var action: String; var text: String? }
 enum Persist {
-    static func write<T: Encodable>(_ value: T, to url: URL, encoder: JSONEncoder) {
-        try! encoder.encode(value).write(to: url, options: .atomic)
+    static func write<T: Encodable>(_ value: T, to url: URL, encoder: JSONEncoder, onError: (@Sendable (Error) -> Void)? = nil) {
+        do { try encoder.encode(value).write(to: url, options: .atomic) }
+        catch { onError?(error) }
     }
 }
 

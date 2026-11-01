@@ -44,6 +44,14 @@ final class Voice: ObservableObject {
     private var lastChange = Date()
     private var silenceTimer: Timer?
     private var delivered = false
+    /// Identity of the recording in progress (bumped by every `begin`). Delayed finalization and recognizer
+    /// callbacks carry the one they started under and are dropped once a newer recording owns the shared state.
+    private var recording = 0
+    /// Identity of the latest `start` request: a permission prompt answered after `cancel()` or a newer `start`
+    /// must not open the mic.
+    private var startRequest = 0
+    /// The recording id of the last delivered/cancelled stop, readable by tests and logs.
+    var currentRecording: Int { recording }
 
     /// Speech works only inside the app bundle (it needs the usage strings in Info.plist).
     static var isSupported: Bool {
@@ -53,11 +61,14 @@ final class Voice: ObservableObject {
     /// `giveUpAfter`: close the mic quietly if nothing is said within that many seconds (follow-up listening).
     func start(autoStop: Bool = true, giveUpAfter: TimeInterval? = nil) {
         guard !isListening else { return }
+        startRequest += 1
+        let requestID = startRequest
         isFollowUp = giveUpAfter != nil
         guard Self.isSupported else { error = "Voice needs the Clinqy app bundle (run ./build.sh run)"; return }
         error = nil
         SFSpeechRecognizer.requestAuthorization { status in
             Task { @MainActor in
+                guard requestID == self.startRequest, !self.isListening else { return }
                 // The Mac's speech model needs only the microphone; Apple dictation also needs Speech Recognition.
                 guard status == .authorized || SpeechModel.shared.isReady else {
                     self.error = "Allow Speech Recognition for Clinqy in System Settings → Privacy & Security"
@@ -65,6 +76,7 @@ final class Voice: ObservableObject {
                 }
                 AVCaptureDevice.requestAccess(for: .audio) { ok in
                     Task { @MainActor in
+                        guard requestID == self.startRequest, !self.isListening else { return }
                         if ok { self.begin(autoStop: autoStop, giveUpAfter: giveUpAfter) } else {
                             self.error = "Allow Microphone for Clinqy in System Settings → Privacy & Security"
                         }
@@ -130,6 +142,8 @@ final class Voice: ObservableObject {
             recognizer = Self.recognizer(for: SpeechModel.language)
             guard let recognizer, recognizer.isAvailable else { error = "Speech recognition isn't available right now"; return }
         }
+        recording += 1
+        isTranscribing = false
         transcript = ""
         committed = ""
         partial = ""
@@ -209,9 +223,18 @@ final class Voice: ObservableObject {
     private func startTranscription() {
         feed.hold()
         let feed = self.feed
+        let id = recording
         transcription = Task {
             let session = await SpeechModel.shared.start { [weak self] text in
-                Task { @MainActor in self?.heard(text) }
+                Task { @MainActor in
+                    guard let self, self.recording == id else { return }
+                    self.heard(text)
+                }
+            }
+            if self.recording != id {
+                // A newer recording owns the feed now: this session is orphaned.
+                (session as? Transcription)?.cancel()
+                return nil
             }
             if let session {
                 feed.attach(session.feed)
@@ -239,9 +262,11 @@ final class Voice: ObservableObject {
         teardownAudio()
         transcription = nil
         isTranscribing = true
+        let id = recording
         Task {
             let session = await pending.value as? Transcription
             let text = await session?.finish() ?? ""
+            guard recording == id else { return }   // a newer recording started: it owns the flags and the text
             isTranscribing = false
             guard !delivered else { return }
             delivered = true
@@ -264,6 +289,7 @@ final class Voice: ObservableObject {
         request.addsPunctuation = true
         request.contextualStrings = NameHints.vocabulary   // the user's people, chats and places
         self.request = request
+        let id = recording
         feed.set(request)
         partial = ""
 
@@ -279,13 +305,13 @@ final class Voice: ObservableObject {
                     }
                     if result.isFinal {
                         self.commitPartial()
-                        if self.isListening { self.startSegment(recognizer) } else { self.deliver() }
+                        if self.isListening { self.startSegment(recognizer) } else { self.deliver(id) }
                         return
                     }
                 }
                 if err != nil {
                     self.commitPartial()
-                    if self.isListening { self.startSegment(recognizer) } else { self.deliver() }
+                    if self.isListening { self.startSegment(recognizer) } else { self.deliver(id) }
                 }
             }
         }
@@ -312,11 +338,13 @@ final class Voice: ObservableObject {
         }
         request?.endAudio()
         // Give the recognizer a moment to finalize the last words (its final result delivers sooner if it comes).
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in self?.deliver() }
+        let id = recording
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in self?.deliver(id) }
         teardownAudio()
     }
 
     func cancel() {
+        startRequest += 1   // a permission prompt still open must not start this recording after all
         delivered = true
         recognition?.cancel()
         if let transcription {
@@ -339,8 +367,8 @@ final class Voice: ObservableObject {
         onLevel(0)
     }
 
-    private func deliver() {
-        guard !delivered else { return }
+    private func deliver(_ id: Int) {
+        guard id == recording, !delivered else { return }
         delivered = true
         teardownAudio()
         recognition?.cancel()

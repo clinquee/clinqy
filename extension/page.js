@@ -2,7 +2,7 @@
 // all page-side logic lives here so helpers are available to every command.
 (() => {
   const HELPER_VERSION = 2;
-  if (window.__clinqy?.protocolVersion === 4 && window.__clinqy?.version === HELPER_VERSION) return;
+  if (window.__clinqy?.protocolVersion === 7 && window.__clinqy?.version === HELPER_VERSION) return;
   window.__clinqy?.dispose?.();
   const documentID = typeof crypto.randomUUID === "function" ? crypto.randomUUID()
     : Array.from(crypto.getRandomValues(new Uint8Array(16)), (v) => v.toString(16).padStart(2, "0")).join("");
@@ -333,12 +333,32 @@ function nodeIdentity(el, d) {
 }
 
 function frameBoxes() {
+  const vw = innerWidth, vh = innerHeight;
   const frames = [...document.querySelectorAll("iframe, frame")].map((f) => {
       const r = f.getBoundingClientRect(), cs = getComputedStyle(f);
       if (!frameNodes.has(f)) frameNodes.set(f, ++nextFrameNode);
-      return { nodeToken: frameNodes.get(f), src: f.src || "", x: r.left + f.clientLeft + (parseFloat(cs.paddingLeft) || 0), y: r.top + f.clientTop + (parseFloat(cs.paddingTop) || 0),
-               w: f.clientWidth, h: f.clientHeight, hidden: cs.visibility === "hidden" || cs.display === "none" };
-    }).filter((f) => !f.hidden && f.w >= 80 && f.h >= 40 && f.x < vw && f.y < vh && f.x + f.w > 0 && f.y + f.h > 0);
+      // Deterministic identity: the extension API names the frame this element hosts (Chrome 132+), so the bridge
+      // needn't guess from URL/size. Absent API or a detached element leaves it null and the bridge falls back.
+      let frameId = null;
+      try { if (typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.getFrameId) { const id = chrome.runtime.getFrameId(f); if (Number.isInteger(id) && id >= 0) frameId = id; } } catch {}
+      // CSS transforms: a scaled frame draws its content at rect.width / offsetWidth; a rotated or skewed one has
+      // no translation-only placement, which the bridge refuses to guess at.
+      const ow = f.offsetWidth || 0, oh = f.offsetHeight || 0;
+      const sx = ow > 0 && r.width > 0 ? r.width / ow : 1, sy = oh > 0 && r.height > 0 ? r.height / oh : 1;
+      let rotated = false;
+      for (let n = f; n && n.nodeType === 1 && !rotated; n = n.parentElement) {
+        const t = n === f ? cs.transform : getComputedStyle(n).transform;
+        if (!t || t === "none") continue;
+        const m = /^matrix\(([^)]+)\)$/.exec(t);
+        if (!m) { rotated = true; break; }
+        const v = m[1].split(",").map(Number);
+        if (Math.abs(v[1]) > 1e-6 || Math.abs(v[2]) > 1e-6) rotated = true;
+      }
+      const scaleX = Math.abs(sx - 1) < 0.005 ? 1 : sx, scaleY = Math.abs(sy - 1) < 0.005 ? 1 : sy;
+      return { nodeToken: frameNodes.get(f), frameId, src: f.src || "", x: r.left + (f.clientLeft + (parseFloat(cs.paddingLeft) || 0)) * scaleX,
+               y: r.top + (f.clientTop + (parseFloat(cs.paddingTop) || 0)) * scaleY,
+               w: f.clientWidth, h: f.clientHeight, sx: scaleX, sy: scaleY, rotated, hidden: cs.visibility === "hidden" || cs.display === "none" };
+    }).filter((f) => !f.hidden && f.w >= 80 && f.h >= 40 && f.x < vw && f.y < vh && f.x + f.w * f.sx > 0 && f.y + f.h * f.sy > 0);
   return { frames };
 }
 
@@ -776,7 +796,12 @@ function tables() {
 
 function readText() {
   const main = document.querySelector("main, article, [role=main]") || document.body;
-  return { url: location.href, title: document.title, text: main.innerText.replace(/\n{3,}/g, "\n\n").slice(0, 8000) };
+  // Portalled help/dialog content can sit outside <main>. Read the visible overlay too,
+  // so verification sees the same confirmation the snapshot lists instead of deadlocking.
+  const overlays = [...document.querySelectorAll('[role="dialog"], [role="alertdialog"], dialog[open], [aria-modal="true"]')]
+    .filter(el => !main.contains(el) && visible(el)).map(el => el.innerText || "");
+  const text = [...new Set([...overlays, main.innerText || ""])].join("\n\n").replace(/\n{3,}/g, "\n\n").slice(0, 8000);
+  return { url: location.href, title: document.title, text };
 }
 
 
@@ -880,9 +905,11 @@ function readText() {
   }
   function scroll(dy) {
     const el = scroller();
-    if (el) { el.scrollBy({ top: dy, behavior: "instant" }); return { y: el.scrollTop }; }
+    // Reports movement, not just a delivered wheel: a page at its boundary (or one that swallows the scroll) says so.
+    if (el) { const before = el.scrollTop; el.scrollBy({ top: dy, behavior: "instant" }); return { y: el.scrollTop, before, moved: el.scrollTop !== before, container: "element" }; }
+    const before = scrollY;
     window.scrollBy({ top: dy, behavior: "instant" });
-    return { y: scrollY };
+    return { y: scrollY, before, moved: scrollY !== before, container: "page" };
   }
   // The selected text plus where its links go: "Apply here" alone loses the application URL the user meant.
   function selection() {
@@ -965,7 +992,7 @@ function readText() {
     });
   }
 
-  window.__clinqy = { version: HELPER_VERSION, dispose: () => candidateObserver.disconnect(), protocolVersion: 4, documentID, validate, invoke, check: () => ({ ok: true }),
+  window.__clinqy = { version: HELPER_VERSION, dispose: () => candidateObserver.disconnect(), protocolVersion: 7, documentID, validate, invoke, check: () => ({ ok: true }),
     focusStatus: () => ({ documentID, hasFocus: document.hasFocus(), frame: /^(IFRAME|FRAME)$/.test((deepActive() || {}).tagName || "") }),
     frameBoxes, snapshot, locate, alive, activityPoint, focusFor, activeOption, markUpload, click, clickOption, focus, fill, findOption, chosen, upload, fileInputCount, review, readText, tables, images, isActive, value, values, activeValue, fillActive, prepare, state, scroll, selection, waitText };
 })();

@@ -48,11 +48,14 @@ final class History: ObservableObject {
     private let url: URL
     private let archive: TaskMemory
 
+    /// Set when the last save failed, so the UI can say history isn't being kept instead of implying it is.
+    @Published private(set) var saveError: String?
+
     init(file: URL? = nil, archive: TaskMemory = .shared) {
         self.url = file ?? Self.defaultURL
         self.archive = archive
-        if let data = try? Data(contentsOf: url),
-           let saved = try? JSONDecoder.iso.decode([Entry].self, from: data) {
+        switch StoreFile.load(url, decode: { try? JSONDecoder.iso.decode([Entry].self, from: $0) }) {
+        case .value(let saved):
             entries = saved
             // Import retained history once per ID. Older builds only saved the original request of a thread.
             var roots: [String: UUID] = [:]
@@ -62,8 +65,14 @@ final class History: ObservableObject {
                 roots[entries[i].request] = root
             }
             archive.record(entries.compactMap(\.episode))
+        case .unreadable:
+            // Set the unreadable file aside, so the next save can't replace it with an empty history.
+            if StoreFile.quarantine(url) == nil { saveError = "History couldn't be read and couldn't be set aside; new runs are not being saved." ; readOnly = true }
+        case .absent: break
         }
     }
+
+    private var readOnly = false
 
     func add(_ entry: Entry) {
         // The archive receives the full redacted record before the UI's recent-history window is trimmed.
@@ -87,7 +96,14 @@ final class History: ObservableObject {
         save()
     }
 
-    private func save() { Persist.write(entries, to: url, encoder: .iso) }
+    private func save() {
+        guard !readOnly else { return }
+        saveError = nil
+        Persist.write(entries, to: url, encoder: .iso) { [weak self] error in
+            let message = "History couldn't be saved: \(error.localizedDescription)"
+            Task { @MainActor in self?.saveError = message }
+        }
+    }
 }
 
 /// Something a task produced for the user to look at: options, a plan, prices, a summary.

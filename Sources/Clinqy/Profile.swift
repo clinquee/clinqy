@@ -54,18 +54,29 @@ enum Profile {
 
     /// The saved profile (seeded from memory and the tracker the first time).
     static var current: Data {
-        if let data = try? Foundation.Data(contentsOf: url), let saved = try? JSONDecoder().decode(Data.self, from: data) {
+        switch StoreFile.load(url, decode: { try? JSONDecoder().decode(Data.self, from: $0) }) {
+        case .value(let saved):
             return saved
+        case .unreadable:
+            // Never replace a profile the user can't see loading with a fresh seed: set it aside first. If that fails the
+            // seed is used for this run only and nothing is written over the original.
+            guard StoreFile.quarantine(url) != nil else { return seed() }
+        case .absent:
+            break
         }
         let seeded = seed()
         save(seeded)
         return seeded
     }
 
-    static func save(_ profile: Data) {
+    /// Saves the profile; false when it could not be written (the caller must not say it was saved).
+    @discardableResult
+    static func save(_ profile: Data) -> Bool {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
-        try? encoder.encode(profile).write(to: url, options: .atomic)
+        guard let data = try? encoder.encode(profile),
+              StoreFile.clearForWrite(url, decodes: { (try? JSONDecoder().decode(Data.self, from: $0)) != nil }) else { return false }
+        return StoreFile.write(data, to: url) == nil
     }
 
     /// Menu: Job Profile… (creates it if needed, then opens the JSON in the default editor).
@@ -162,41 +173,79 @@ enum Profile {
         return Double(shared) / Double(wa.union(wb).count)
     }
 
+    private static let negations: Set<String> = ["not", "no", "never", "without", "non", "cannot", "cant", "dont", "wont", "isnt", "arent", "neither", "nor", "unwilling", "unable", "unauthorized", "unauthorised", "ineligible"]
+    private static let places: Set<String> = [
+        "us", "usa", "uk", "eu", "uae", "india", "canada", "australia", "germany", "france", "singapore", "china", "japan",
+        "europe", "asia", "america", "american", "british", "indian", "canadian", "european", "ireland", "netherlands",
+        "california", "texas", "york", "london", "remote", "onsite", "hybrid", "visa", "sponsorship", "citizen", "citizenship",
+    ]
+
+    /// Whether a saved answer to `saved` can stand in for `question` without being a different question: the
+    /// questions must agree on negation, numbers and places (jurisdictions), or the answer could be the opposite fact.
+    private static func sameMeaning(_ question: String, _ saved: String) -> Bool {
+        func tokens(_ s: String) -> [String] {
+            s.lowercased().replacingOccurrences(of: "n't", with: "nt").replacingOccurrences(of: "'", with: "")
+                .split { !$0.isLetter && !$0.isNumber }.map(String.init)
+        }
+        let a = tokens(question), b = tokens(saved)
+        if a == b { return true }
+        let sa = Set(a), sb = Set(b)
+        let differing = sa.symmetricDifference(sb)
+        if differing.contains(where: { negations.contains($0) || places.contains($0) || $0.contains(where: \.isNumber) }) { return false }
+        // Capitalised words (names of countries, companies, cities) that only one side has.
+        func proper(_ s: String) -> Set<String> {
+            Set(s.split { !$0.isLetter && !$0.isNumber }.dropFirst().filter { $0.first?.isUppercase == true && $0.count > 1 }.map { $0.lowercased() })
+        }
+        return proper(question).symmetricDifference(proper(saved)).isEmpty
+    }
+
+    /// A saved yes/no style field answers only the positive form of its question, and an authorization answer only for
+    /// the jurisdiction it was written for ("Authorized to work in India" says nothing about the US).
+    private static func fieldAnswerFits(_ f: Field, question: String, value: String) -> Bool {
+        guard f == .relocate || f == .authorization else { return true }
+        let q = Set(question.lowercased().replacingOccurrences(of: "n't", with: "nt").split { !$0.isLetter && !$0.isNumber }.map(String.init))
+        if !q.isDisjoint(with: negations) { return false }
+        let v = Set(value.lowercased().split { !$0.isLetter && !$0.isNumber }.map(String.init))
+        if f == .authorization { return q.intersection(places).subtracting(["visa", "sponsorship", "remote", "onsite", "hybrid"]).isSubset(of: v) }
+        return true
+    }
+
     /// The saved answer to a form question, if the profile has one: a close earlier question first (the user's own
     /// wording for that exact question wins), then the matching profile field. nil when nothing fits.
     static func answer(for question: String, in p: Data = current) -> String? {
         let q = question.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !q.isEmpty else { return nil }
-        if let best = p.qa.map({ ($0, similarity(q, $0.question)) }).max(by: { $0.1 < $1.1 }), best.1 >= 0.6,
-           !best.0.answer.isEmpty {
-            return best.0.answer
+        // Only questions that mean the same thing share an answer: "...require sponsorship" and "...not require
+        // sponsorship", or "authorized to work in the US" and "...in India", are different questions.
+        func bestMatch(minimum: Double) -> QA? {
+            p.qa.filter { !$0.answer.isEmpty && sameMeaning(q, $0.question) }
+                .map { ($0, similarity(q, $0.question)) }.filter { $0.1 >= minimum }.max(by: { $0.1 < $1.1 })?.0
         }
-        if let f = field(for: q), let v = value(of: f, in: p, question: q) { return v }
-        if let best = p.qa.map({ ($0, similarity(q, $0.question)) }).max(by: { $0.1 < $1.1 }), best.1 >= 0.45,
-           !best.0.answer.isEmpty {
-            return best.0.answer
-        }
+        if let hit = bestMatch(minimum: 0.6) { return hit.answer }
+        if let f = field(for: q), let v = value(of: f, in: p, question: q), fieldAnswerFits(f, question: q, value: v) { return v }
+        if let hit = bestMatch(minimum: 0.45) { return hit.answer }
         return nil
     }
 
     /// Saves the user's answer to a form question: into its profile field when it is one of them (only if that
     /// field is still empty, so a one-off answer can't overwrite the profile), otherwise as a Q&A pair (replacing an
     /// earlier answer to the same question).
-    static func remember(question: String, answer: String) {
+    /// Returns whether the answer is now stored (false when it was empty, too long, or the file couldn't be written).
+    @discardableResult
+    static func remember(question: String, answer: String) -> Bool {
         let q = question.trimmingCharacters(in: .whitespacesAndNewlines)
         let a = answer.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !q.isEmpty, !a.isEmpty, a.count < 2000 else { return }
+        guard !q.isEmpty, !a.isEmpty, a.count < 2000 else { return false }
         var p = current
         if let f = field(for: q), fill(f, with: a, in: &p) {
-            save(p)
-            return
+            return save(p)
         }
         if let i = p.qa.firstIndex(where: { similarity(q, $0.question) >= 0.8 }) {
             p.qa[i] = QA(question: q, answer: a)
         } else {
             p.qa.append(QA(question: q, answer: a))
         }
-        save(p)
+        return save(p)
     }
 
     /// Fills an empty profile field; false when the field already has a value (the answer goes to Q&A instead).
@@ -240,12 +289,13 @@ enum Profile {
             return Double(t[r].prefix { $0.isNumber || $0 == "." })
         }
         let years = number(before: #"(years?|yrs?)\b"#), months = number(before: #"(months?|mos?)\b"#)
+        // "nan", "inf" and "1e100" parse as doubles but are not experience: only a sane, finite span is accepted.
+        func span(_ v: Double) -> Int? { v.isFinite && v >= 0 && v <= 1200 ? Int(v.rounded()) : nil }
         if years == nil, months == nil {
-            guard let only = Double(t.trimmingCharacters(in: .whitespaces)) else { return nil }
-            let total = Int((only * 12).rounded())
+            guard let only = Double(t.trimmingCharacters(in: .whitespaces)), let total = span(only * 12) else { return nil }
             return (total / 12, total % 12)
         }
-        let total = Int(((years ?? 0) * 12 + (months ?? 0)).rounded())
+        guard let total = span((years ?? 0) * 12 + (months ?? 0)) else { return nil }
         return (total / 12, total % 12)
     }
 

@@ -234,7 +234,17 @@ final class OnboardingModel: ObservableObject {
             if persistProgress { UserDefaults.standard.set(step.rawValue, forKey: OnboardingWindow.stepKey) }
         }
     }
-    @Published var choice: ModelChoice { didSet { if oldValue != choice { test = .idle } } }
+    @Published var choice: ModelChoice {
+        didSet {
+            guard oldValue != choice else { return }
+            // Each provider keeps its own key draft: one service's key is never saved under another's name.
+            drafts.stash(apiKey, for: oldValue.rawValue)
+            apiKey = drafts.draft(for: choice.rawValue, saved: choice.keyName.flatMap { Config.value($0) })
+            drafts.beginTest()   // a test still running for the old provider must not report on this one
+            test = .idle
+        }
+    }
+    private var drafts = ConnectionDrafts()
     @Published var apiKey = ""
     @Published var localModel: String
     @Published var baseURL: String
@@ -321,6 +331,7 @@ final class OnboardingModel: ObservableObject {
 
     func refreshConfiguration() {
         guard [choice.rawValue, apiKey, localModel, baseURL] == savedConfiguration else { return }
+        drafts.reset()
         choice = ModelChoice.from(Provider.current)
         apiKey = choice.keyName.flatMap { Config.value($0) } ?? ""
         localModel = Config.value("LOCAL_MODEL") ?? "qwen3-vl"
@@ -341,6 +352,7 @@ final class OnboardingModel: ObservableObject {
     func runTest() {
         save()
         if case .failed = test { return }
+        let generation = drafts.beginTest()
         test = .running
         let provider = choice.provider
         let modelID = Brain.defaultModel(for: provider)
@@ -363,8 +375,10 @@ final class OnboardingModel: ObservableObject {
                     return first
                 }
                 let short = reply.trimmingCharacters(in: .whitespacesAndNewlines).prefix(60)
+                guard drafts.accepts(generation) else { return }
                 test = .passed("It answered: “\(short)”")
             } catch {
+                guard drafts.accepts(generation) else { return }
                 test = .failed(error.localizedDescription)
             }
         }

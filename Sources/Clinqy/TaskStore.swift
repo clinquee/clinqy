@@ -17,6 +17,26 @@ final class TaskStore: ObservableObject {
         }
     }
     enum Source: String, Codable { case mac, telegram }
+    /// What the user's request pinned down exactly. Kept apart from mutation freshness: a requirement stays open until
+    /// evidence for that very requirement exists, however many unrelated verifications pass.
+    struct Requirement: Codable, Equatable, Identifiable {
+        enum Kind: String, Codable { case exactValue, name, setting, screenshot, caption, deliverable }
+        var id = UUID()
+        var kind: Kind
+        var text: String
+        var provenance: String
+        var satisfied = false
+        var evidence: String?
+    }
+    /// Where an unresolved input happened, retained across continuation so the barrier survives a rebuilt run.
+    struct PendingProvenance: Codable, Equatable {
+        var kind: String
+        var startedAt: Date
+        var url: String?
+        var tabID: Int?
+        var visualOK: Bool
+        var delivery: ActionOutcome.Delivery
+    }
     struct Record: Codable, Identifiable, Equatable {
         var id = UUID()
         var request: String
@@ -42,6 +62,9 @@ final class TaskStore: ObservableObject {
         var coordinating: Bool?
         var parentID: UUID?
         var outputs: [String]?
+        var requirements: [Requirement]?
+        var pendingProvenance: PendingProvenance?
+        var openRequirements: [Requirement] { (requirements ?? []).filter { !$0.satisfied } }
 
         var shortID: String { String(id.uuidString.prefix(8)).lowercased() }
         var status: String {
@@ -49,6 +72,9 @@ final class TaskStore: ObservableObject {
             if let lastConfirmedStep { lines.append("Last confirmed step: " + lastConfirmedStep) }
             if let pendingAction { lines.append("Outcome needs checking: " + pendingAction + ". It will not be replayed automatically.") }
             if let unverifiedAction { lines.append("Unverified outcome: " + unverifiedAction + ". Check the real state before retrying.") }
+            if !openRequirements.isEmpty {
+                lines.append("Still required: " + openRequirements.map { $0.kind.rawValue + " " + $0.text }.joined(separator: "; "))
+            }
             if let result { lines.append(result) }
             if requiresReview { lines.append(reviewReason ?? "Review this queued task before starting it after a restart.") }
             return lines.joined(separator: "\n")
@@ -182,7 +208,7 @@ final class TaskStore: ObservableObject {
         return change(id) { $0.state = .running; $0.pendingAction = kind; $0.stage = "Working: " + kind }
     }
     @discardableResult
-    func endAction(_ id: UUID?, kind: String, outcome: ActionOutcome, completedSteps: Int) -> Bool {
+    func endAction(_ id: UUID?, kind: String, outcome: ActionOutcome, completedSteps: Int, provenance: PendingProvenance? = nil) -> Bool {
         guard let id else { return true }
         guard let item = record(id), !item.state.terminal else { return false }
         return change(id) {
@@ -190,7 +216,7 @@ final class TaskStore: ObservableObject {
             $0.completedSteps = completedSteps
             $0.lastActionOutcome = outcome
             if outcome.isConfirmed { $0.lastConfirmedStep = kind }
-            if outcome.needsVerification { $0.unverifiedAction = kind }
+            if outcome.needsVerification { $0.unverifiedAction = kind; $0.pendingProvenance = provenance }
         }
     }
     /// Only a successful, explicit state assertion resolves an uncertain side effect.
@@ -201,6 +227,48 @@ final class TaskStore: ObservableObject {
         return change(id) {
             if let action = $0.unverifiedAction { $0.lastConfirmedStep = action + " (" + redact(evidence) + ")" }
             $0.unverifiedAction = nil
+            $0.pendingProvenance = nil
+        }
+    }
+    /// The user (or another explicit non-evidence route) reports that the uncertain effect did not happen: the barrier
+    /// is lifted without claiming a confirmed step.
+    @discardableResult
+    func resolveAction(_ id: UUID?, evidence: String) -> Bool {
+        guard let id else { return true }
+        guard let item = record(id), !item.state.terminal else { return false }
+        return change(id) {
+            $0.stage = redact(evidence)
+            $0.unverifiedAction = nil
+            $0.pendingProvenance = nil
+        }
+    }
+
+    // MARK: Requirements ledger
+
+    /// Adds requirements once (same kind and text are not duplicated). Returns false when the record can't be saved.
+    @discardableResult
+    func addRequirements(_ id: UUID?, _ items: [(Requirement.Kind, String)], provenance: String) -> Bool {
+        guard let id else { return true }
+        guard let item = record(id), !item.state.terminal else { return false }
+        let existing = item.requirements ?? []
+        let fresh = items.filter { kind, text in !existing.contains { $0.kind == kind && $0.text == redact(text) } }
+        guard !fresh.isEmpty else { return true }
+        return change(id) {
+            $0.requirements = existing + fresh.map { Requirement(kind: $0.0, text: redact($0.1), provenance: provenance) }
+        }
+    }
+    /// Marks every open requirement of `kind` (optionally only the one matching `text`) as met by `evidence`.
+    @discardableResult
+    func satisfyRequirement(_ id: UUID?, kind: Requirement.Kind, matching text: String? = nil, evidence: String) -> Bool {
+        guard let id else { return true }
+        guard let item = record(id), let list = item.requirements,
+              list.contains(where: { !$0.satisfied && $0.kind == kind && (text == nil || $0.text == redact(text!)) }) else { return true }
+        return change(id) {
+            guard var all = $0.requirements else { return }
+            for index in all.indices where !all[index].satisfied && all[index].kind == kind && (text == nil || all[index].text == redact(text!)) {
+                all[index].satisfied = true; all[index].evidence = redact(evidence)
+            }
+            $0.requirements = all
         }
     }
     func setOutputs(_ id: UUID?, files: [URL]) {
@@ -259,4 +327,32 @@ final class TaskStore: ObservableObject {
         rebuildPositions()
     }
     private func rebuildPositions() { positions = Dictionary(uniqueKeysWithValues: records.enumerated().map { ($0.element.id, $0.offset) }) }
+}
+
+/// Pulls the exact constraints out of a request so they outlive the model's context: quoted values, requested
+/// screenshots and captions, and the identity of the deliverable. Conservative by design: only literal text is kept.
+enum RequirementExtractor {
+    static func extract(_ request: String) -> [(TaskStore.Requirement.Kind, String)] {
+        let text = request.components(separatedBy: "\n\nPrevious Telegram task").first ?? request
+        var found: [(TaskStore.Requirement.Kind, String)] = []
+        func add(_ kind: TaskStore.Requirement.Kind, _ value: String) {
+            let clean = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !clean.isEmpty, clean.count <= 300, !found.contains(where: { $0.0 == kind && $0.1 == clean }) else { return }
+            found.append((kind, clean))
+        }
+        func matches(_ pattern: String) -> [[String]] {
+            guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return [] }
+            let ns = text as NSString
+            return regex.matches(in: text, range: NSRange(location: 0, length: ns.length)).map { m in
+                (0..<m.numberOfRanges).map { m.range(at: $0).location == NSNotFound ? "" : ns.substring(with: m.range(at: $0)) }
+            }
+        }
+        for m in matches(#"["“]([^"”\n]{1,200})["”]"#) { add(.exactValue, m[1]) }
+        for m in matches(#"\b(?:named|called|titled)\s+(?:it\s+)?["“]?([A-Za-z0-9][^"”\n,;]{0,80}?)["”]?(?=[,.;\n]|\s+(?:and|with|in|on|to|then)\b|$)"#) { add(.name, m[1]) }
+        for m in matches(#"(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+(?:separate\s+)?(?:screenshots?|screen\s*shots?|screen\s*captures?)"#) { add(.screenshot, m[1] + " screenshot(s)") }
+        if text.range(of: #"(?i)\bcaptions?\b"#, options: .regularExpression) != nil { add(.caption, "every requested screenshot carries its caption") }
+        for m in matches(#"((?:~|/Users/[^\s/]+)/[^\s"”,;]*\.[A-Za-z0-9]{1,6})"#) { add(.deliverable, m[1]) }
+        if TaskCompletionPolicy.requestsWriteUp(text) { add(.deliverable, "write-up document") }
+        return found
+    }
 }

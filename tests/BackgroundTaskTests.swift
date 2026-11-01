@@ -65,6 +65,13 @@ enum Secrets { static func mask(_ text: String) -> String { text.replacingOccurr
         check(!VerificationEvidence.changedValue(before: "new", after: "new", expected: "new", sameTarget: true, fieldInput: true), "preexisting field value does not establish an uncertain input")
         check(!VerificationEvidence.changedValue(before: nil, after: "new", expected: "new", sameTarget: true, fieldInput: true), "unreadable baseline does not confirm input")
         check(VerificationEvidence.changedValue(before: "old", after: "new", expected: "new", sameTarget: true, fieldInput: true), "fresh changed target value confirms field input")
+        check(!VerificationEvidence.appears("Paid", in: "pay:unpaid"), "a word fragment inside \"unpaid\" is not the word Paid")
+        check(VerificationEvidence.appears("paid", in: "Status: PAID."), "whole word matches regardless of case and punctuation")
+        check(!VerificationEvidence.appears("Order", in: "Your Orders"), "a plural is not the singular")
+        check(VerificationEvidence.appears("for i, n in enumerate", in: "for\u{00A0}i,\u{00A0}\u{00A0}n in\tenumerate(nums)"), "non-breaking and repeated spaces match ordinary spaces")
+        check(VerificationEvidence.appears("name=Amrit Nigam", in: "form:Keynote|name=Amrit Nigam|city=Pune"), "field-style text still matches inside a title")
+        check(VerificationEvidence.appears("₹500", in: "Total ₹500 due"), "symbol edges match as written")
+        check(!VerificationEvidence.newText("Paid", before: "pay:unpaid", after: "pay:unpaid"), "unchanged unpaid page is not a new Paid confirmation")
         check(!VerificationEvidence.newText("Receipt", before: "Receipt already present", after: "Receipt already present"), "preexisting receipt text cannot confirm another submit")
         check(!VerificationEvidence.newText("Receipt", before: nil, after: "Receipt 123"), "missing baseline cannot confirm new text")
         check(VerificationEvidence.newText("Receipt", before: "Submit", after: "Receipt 123"), "new receipt text is independent confirmation")
@@ -93,6 +100,66 @@ enum Secrets { static func mask(_ text: String) -> String { text.replacingOccurr
         check(BackgroundPolicy.route(["do":"collect"], hasWorkerPage: false) == .api, "worker collection doesn't require foreground access")
         check(BackgroundPolicy.route(["do":"type","id":"w2"], hasWorkerPage: true) == .browser, "owned web field allowed")
         check(BackgroundPolicy.route(["do":"key","keys":"cmd+a"], hasWorkerPage: true) == .browser, "owned select-all allowed")
+        check(BackgroundPolicy.route(["do":"tab","op":"list"], hasWorkerPage: false, allowTabDiscovery: true) == .browser, "explicit existing-tab request can discover URLs before opening a task page")
+        if case .attention = BackgroundPolicy.route(["do":"tab","op":"list"], hasWorkerPage: false) {
+            check(true, "ordinary workers cannot discover personal tabs")
+        } else { check(false, "ordinary workers cannot discover personal tabs") }
+        for op in ["switch", "close", "read", "look"] {
+            if case .attention = BackgroundPolicy.route(["do":"tab","op":op], hasWorkerPage: false, allowTabDiscovery: true) {
+                check(true, "discovery does not authorize input or page access: \(op)")
+            } else { check(false, "discovery does not authorize input or page access: \(op)") }
+        }
+        // --- Requirements ledger, pending provenance and explicit resolution ---
+        let ledgerFile = FileManager.default.temporaryDirectory.appendingPathComponent("clinqy-ledger-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: ledgerFile) }
+        let ledger = TaskStore(file: ledgerFile)
+        let wanted = "Create a doc named \"Lab 7 Report\" with 3 screenshots and captions, saved at ~/Documents/lab7.pdf"
+        let ledgerID = ledger.enqueue(wanted, source: .mac, background: false)!
+        check(ledger.start(ledgerID), "ledger task starts")
+        let extracted = RequirementExtractor.extract(wanted)
+        check(extracted.contains { $0.0 == .exactValue && $0.1 == "Lab 7 Report" }, "quoted exact name captured")
+        check(extracted.contains { $0.0 == .screenshot && $0.1.hasPrefix("3") }, "required screenshot count captured")
+        check(extracted.contains { $0.0 == .caption }, "caption requirement captured")
+        check(extracted.contains { $0.0 == .deliverable && $0.1 == "~/Documents/lab7.pdf" }, "deliverable identity captured")
+        check(ledger.addRequirements(ledgerID, extracted, provenance: "user request"), "requirements persist")
+        check(ledger.addRequirements(ledgerID, extracted, provenance: "user request"), "adding again is idempotent")
+        check(ledger.record(ledgerID)?.requirements?.count == extracted.count, "no duplicate requirements")
+        // An unrelated true verification must not satisfy a different requirement.
+        _ = ledger.beginAction(ledgerID, kind: "click")
+        let origin = TaskStore.PendingProvenance(kind: "click", startedAt: Date(), url: "https://x.test/lab", tabID: 7, visualOK: true, delivery: .delivered)
+        _ = ledger.endAction(ledgerID, kind: "click", outcome: .unverified, completedSteps: 1, provenance: origin)
+        check(ledger.confirmAction(ledgerID, evidence: "text verified"), "text verification resolves the pending input")
+        check(ledger.record(ledgerID)?.openRequirements.count == extracted.count, "an unrelated verification satisfies no requirement")
+        check(ledger.satisfyRequirement(ledgerID, kind: .exactValue, matching: "Lab 7 Report", evidence: "field readback"), "exact value satisfied by its own evidence")
+        check(ledger.record(ledgerID)?.openRequirements.contains { $0.kind == .exactValue } == false, "satisfied requirement closes")
+        check(ledger.record(ledgerID)?.openRequirements.contains { $0.kind == .deliverable } == true, "deliverable stays open")
+        // Provenance and requirements survive a restart (the task is interrupted, never replayed).
+        _ = ledger.beginAction(ledgerID, kind: "click")
+        _ = ledger.endAction(ledgerID, kind: "click", outcome: .unverified, completedSteps: 2, provenance: origin)
+        let reloaded = TaskStore(file: ledgerFile)
+        check(reloaded.record(ledgerID)?.pendingProvenance == origin, "pending provenance persists across restart")
+        check(reloaded.record(ledgerID)?.unverifiedAction == "click", "pending uncertainty persists across restart")
+        check(reloaded.record(ledgerID)?.openRequirements.contains { $0.kind == .deliverable } == true, "open requirements persist across restart")
+        check(reloaded.record(ledgerID)?.state == .interrupted, "restart interrupts rather than replays")
+        // User reports the effect absent: barrier lifted with no confirmed step claimed.
+        let resolved = TaskStore(file: FileManager.default.temporaryDirectory.appendingPathComponent("clinqy-resolve-\(UUID().uuidString).json"))
+        let rid = resolved.enqueue("click the lab help button", source: .mac, background: false)!
+        _ = resolved.start(rid); _ = resolved.beginAction(rid, kind: "click")
+        _ = resolved.endAction(rid, kind: "click", outcome: .unverified, completedSteps: 1, provenance: origin)
+        check(resolved.record(rid)?.unverifiedAction == "click", "unknown click is pending")
+        check(resolved.resolveAction(rid, evidence: "user reported no effect"), "explicit resolution persists")
+        check(resolved.record(rid)?.unverifiedAction == nil && resolved.record(rid)?.pendingProvenance == nil, "resolution lifts the barrier")
+        check(resolved.record(rid)?.lastConfirmedStep == nil, "a reported non-effect never becomes a confirmed step")
+        // --- C: background routing says why, instead of claiming the owned tab is missing ---
+        if case .attention(let reason) = BackgroundPolicy.route(["do": "click", "text": "PROJECT"], hasWorkerPage: true) {
+            check(!reason.contains("No owned browser page target"), "owned tab present: text click is not blamed on a missing tab")
+            check(reason.contains("w-id") || reason.contains("w<number>"), "text click in background points at element ids")
+        } else { check(false, "background text click is not silently routed") }
+        if case .attention(let reason) = BackgroundPolicy.route(["do": "click", "id": "w1"], hasWorkerPage: false) {
+            check(reason.contains("No owned browser page target"), "missing owned tab is still reported")
+        } else { check(false, "click without owned tab needs attention") }
+        check(BackgroundPolicy.route(["do": "verify", "user_confirms": "uploaded"], hasWorkerPage: false) == .api, "user confirmation needs no page")
+        check(BackgroundPolicy.route(["do": "click", "id": "w1"], hasWorkerPage: true) == .browser, "w-id click on owned tab allowed")
         print("PASS: \(checks) task recovery and background policy checks")
     }
 }

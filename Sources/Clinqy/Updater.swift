@@ -178,20 +178,45 @@ final class Updater {
     }
 
     /// Hands the swap to a small script that waits for this process to quit, replaces the app and opens the new one.
-    nonisolated static func swapInAndReopen(_ staged: URL, replacing target: URL, waitingFor pid: Int32?, reopen: Bool = true) throws {
+    /// The new copy is first staged as a sibling (`<app>.new`) so the installed bundle is only touched once a complete
+    /// replacement exists next to it; the original is renamed to `<app>.old` and removed only after the new one is in
+    /// place. If the first rename fails the original is left exactly as it was (nothing is deleted), and a rollback only
+    /// ever restores a backup that actually exists. The outcome is written to `receipt` when given
+    /// (installed / unchanged / rolled-back / failed-staging).
+    @discardableResult
+    nonisolated static func swapInAndReopen(_ staged: URL, replacing target: URL, waitingFor pid: Int32?, reopen: Bool = true, receipt: URL? = nil) throws -> Process {
         func q(_ s: String) -> String { "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'" }
+        let t = q(target.path), old = q(target.path + ".old"), new = q(target.path + ".new")
+        let rec = receipt.map { q($0.path) }
         let script = """
         \(pid.map { "while kill -0 \($0) 2>/dev/null; do sleep 0.2; done" } ?? "")
-        rm -rf \(q(target.path)).old
-        mv \(q(target.path)) \(q(target.path)).old && /usr/bin/ditto \(q(staged.path)) \(q(target.path)) && rm -rf \(q(target.path)).old \
-          || { rm -rf \(q(target.path)); mv \(q(target.path)).old \(q(target.path)); }
+        report() { \(rec.map { "echo \"$1\" > \($0)" } ?? ":") ; }
+        # A backup left by an interrupted earlier swap is the only copy if the app itself is gone: restore, never delete it.
+        if [ -e \(old) ] && [ ! -e \(t) ]; then mv \(old) \(t); fi
+        rm -rf \(new)
+        if /usr/bin/ditto \(q(staged.path)) \(new); then
+          if [ -e \(old) ]; then rm -rf \(old); fi
+          if mv \(t) \(old); then
+            if mv \(new) \(t); then rm -rf \(old); report installed
+            else
+              rm -rf \(new)
+              if [ -e \(old) ] && [ ! -e \(t) ]; then mv \(old) \(t); fi
+              report rolled-back
+            fi
+          else
+            rm -rf \(new); report unchanged
+          fi
+        else
+          rm -rf \(new); report failed-staging
+        fi
         rm -rf \(q(staged.deletingLastPathComponent().path))
-        \(reopen ? "/usr/bin/open \(q(target.path))" : "")
+        \(reopen ? "/usr/bin/open \(t)" : "")
         """
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/bin/sh")
         p.arguments = ["-c", script]
         try p.run()
+        return p
     }
 
     @discardableResult

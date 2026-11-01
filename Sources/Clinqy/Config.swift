@@ -66,3 +66,52 @@ enum Config {
         reload()
     }
 }
+
+/// Shared rules for the files Clinqy keeps about the user (memory, profile, history, skills, replay fixtures):
+/// a write that fails is reported to the caller, and a file that exists but can't be read is set aside as
+/// `<name>.corrupt-<timestamp>` instead of being replaced by an empty state on the next save.
+enum StoreFile {
+    /// Writes atomically; nil on success, the error otherwise. Creates the folder when needed.
+    @discardableResult
+    static func write(_ data: Data, to url: URL) -> Error? {
+        do {
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try data.write(to: url, options: .atomic)
+            return nil
+        } catch { return error }
+    }
+
+    /// Renames an unreadable file to `<name>.corrupt-<timestamp>` (never overwriting an earlier one); returns where it went.
+    @discardableResult
+    static func quarantine(_ url: URL) -> URL? {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: url.path) else { return nil }
+        let stamp = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-")
+        var target = url.deletingLastPathComponent().appendingPathComponent(url.lastPathComponent + ".corrupt-" + stamp)
+        var n = 2
+        while fm.fileExists(atPath: target.path) {
+            target = url.deletingLastPathComponent().appendingPathComponent(url.lastPathComponent + ".corrupt-" + stamp + "-\(n)")
+            n += 1
+        }
+        do { try fm.moveItem(at: url, to: target); return target } catch { return nil }
+    }
+
+    /// Reads `url` and decodes it with `decode`. `.absent` when there is no file; `.unreadable` when there is one that
+    /// can't be read or decoded (the caller should quarantine it before writing anything there).
+    enum Loaded<T> { case absent, value(T), unreadable }
+
+    static func load<T>(_ url: URL, decode: (Data) -> T?) -> Loaded<T> {
+        guard FileManager.default.fileExists(atPath: url.path) else { return .absent }
+        guard let data = try? Data(contentsOf: url), let value = decode(data) else { return .unreadable }
+        return .value(value)
+    }
+
+    /// True when `url` can be written without losing anything: it is absent or readable, or it was unreadable and has
+    /// now been set aside. False when it is unreadable and could not be moved (the write must not go ahead).
+    static func clearForWrite(_ url: URL, decodes: (Data) -> Bool) -> Bool {
+        switch load(url, decode: { decodes($0) ? true : nil }) {
+        case .absent, .value: return true
+        case .unreadable: return quarantine(url) != nil
+        }
+    }
+}

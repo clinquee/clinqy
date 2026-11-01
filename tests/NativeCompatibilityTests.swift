@@ -1,9 +1,13 @@
 import AppKit
 
+// This fixture creates native AppKit windows rather than a browser.
+enum Launcher { static func isBrowser(_ app: NSRunningApplication) -> Bool { false } }
+
 // Fixture controls contain only test strings; production redaction is irrelevant to this isolated driver probe.
 enum Safety {
     static func redacted(_ value: String?, role: String, subrole: String?) -> String? { value }
     static func redacted(_ value: String?, of element: AXUIElement) -> String? { value }
+    static func isSecureField(_ element: AXUIElement) -> Bool { false }
 }
 
 @MainActor private final class Fixture: NSObject {

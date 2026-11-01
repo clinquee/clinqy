@@ -27,13 +27,22 @@ final class Skills: ObservableObject {
         return dir.appendingPathComponent("skills.json")
     }()
 
+    private var readOnly = false
+
     private init() {
-        if let data = try? Data(contentsOf: url), let saved = try? JSONDecoder().decode([Skill].self, from: data) { all = saved }
+        switch StoreFile.load(url, decode: { try? JSONDecoder().decode([Skill].self, from: $0) }) {
+        case .value(let saved): all = saved
+        case .unreadable:
+            // Set the unreadable file aside, so the next save can't replace it with an empty list.
+            if StoreFile.quarantine(url) == nil { readOnly = true; lastError = "Your saved skills couldn't be read and couldn't be set aside; changes are not being saved." }
+        case .absent: break
+        }
     }
 
-    func remove(_ skill: Skill) {
+    @discardableResult
+    func remove(_ skill: Skill) -> Bool {
         all.removeAll { $0.id == skill.id }
-        save()
+        return save()
     }
 
     /// Turns a recording into a skill with the agent (a one-off session).
@@ -61,7 +70,7 @@ final class Skills: ObservableObject {
             }
             all.insert(Skill(name: name, summary: json["summary"] as? String ?? "",
                              parameters: json["parameters"] as? [String] ?? [], steps: steps, created: Date()), at: 0)
-            save()
+            if !save() { lastError = "Learned “\(name)”, but couldn't save it to disk" }
         } catch {
             lastError = error.localizedDescription
         }
@@ -76,7 +85,11 @@ final class Skills: ObservableObject {
         }.joined(separator: "\n")
     }
 
-    private func save() {
-        if let data = try? JSONEncoder().encode(all) { try? data.write(to: url, options: .atomic) }
+    /// False when the skills could not be written (the in-memory list still has the change until the app quits).
+    @discardableResult
+    private func save() -> Bool {
+        guard !readOnly, let data = try? JSONEncoder().encode(all) else { return false }
+        if let error = StoreFile.write(data, to: url) { lastError = "Skills couldn't be saved: \(error.localizedDescription)"; return false }
+        return true
     }
 }

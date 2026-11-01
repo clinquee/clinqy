@@ -10,7 +10,8 @@ enum Reader {
     /// Text of the document a window has open (its AXDocument file), if it's a readable kind.
     static func documentText(of app: NSRunningApplication) async -> (name: String, text: String)? {
         guard let url = AXEngine.documentURL(of: app) else { return nil }
-        return await fileText(url).map { (url.lastPathComponent, $0) }
+        // The file on disk, which may differ from what the window shows if there are unsaved edits.
+        return await fileText(url).map { (url.lastPathComponent, "[saved copy on disk; unsaved edits in the window are not included]\n" + $0) }
     }
 
     /// Text of a local or downloadable file: PDFs through PDFKit, Word/RTF/HTML/text through AppKit.
@@ -59,7 +60,7 @@ enum Reader {
 
     static func ocr(_ capture: Screenshot.Capture) async -> String? {
         guard capture.window.staleness(includeContent: true) == nil else { return nil }
-        return await ocr(image: capture.rawImage)
+        return await ocr(image: await ocrImage(for: capture))
     }
 
     private static func ocr(image: CGImage) async -> String? {
@@ -83,7 +84,7 @@ enum Reader {
 
     static func textBoxes(_ capture: Screenshot.Capture, want: String? = nil) async -> [(text: String, rect: CGRect)]? {
         guard capture.window.staleness(includeContent: true) == nil else { return nil }
-        return await textBoxes(image: capture.rawImage, frame: capture.window.frame, want: want)
+        return await textBoxes(image: await ocrImage(for: capture), frame: capture.window.frame, want: want)
     }
 
     private static func textBoxes(image: CGImage, frame: CGRect, want: String?) async -> [(text: String, rect: CGRect)] {
@@ -112,6 +113,17 @@ enum Reader {
         }.value
     }
 
+    /// The model's screenshot is downscaled to the vision budget; text recognition does better on the display's own
+    /// pixels. A fresh full-resolution grab of the same exact window is used when the capture is clearly smaller,
+    /// else the capture's own image.
+    private static func ocrImage(for capture: Screenshot.Capture) async -> CGImage {
+        let wanted = Screenshot.backingScale(for: capture.window.frame) * capture.window.frame.width
+        guard Double(capture.rawImage.width) < Double(wanted) * 0.9,
+              let app = NSRunningApplication(processIdentifier: capture.window.pid),
+              let full = await windowCapture(app, window: capture.window) else { return capture.rawImage }
+        return full.image
+    }
+
     /// Capture only the selected AX window; another, larger window of the app must never substitute for it.
     private static func windowCapture(_ app: NSRunningApplication, window requested: NativeWindowObservation?) async -> (image: CGImage, frame: CGRect)? {
         guard let snapshot = requested ?? NativeWindowObservation.capture(app), snapshot.pid == app.processIdentifier,
@@ -122,9 +134,10 @@ enum Reader {
         else { return nil }
         let config = SCStreamConfiguration()
         // Full resolution for OCR. Geometry stays in screen points regardless of the backing pixel scale.
-        let scale = NSScreen.main?.backingScaleFactor ?? 2
-        config.width = Int(window.frame.width * scale)
-        config.height = Int(window.frame.height * scale)
+        // The scale of the display the window is on (not always the main one), bounded so a huge window stays tractable.
+        let scale = min(Screenshot.backingScale(for: window.frame), 8192 / max(window.frame.width, window.frame.height, 1))
+        config.width = max(1, Int(window.frame.width * scale))
+        config.height = max(1, Int(window.frame.height * scale))
         config.showsCursor = false
         guard let image = try? await SCScreenshotManager.captureImage(contentFilter: SCContentFilter(desktopIndependentWindow: window),
                                                                       configuration: config),
@@ -138,9 +151,13 @@ enum Reader {
         return handle.readData(ofLength: 5) == Data("%PDF-".utf8)
     }
 
+    static let maxCharacters = 12_000
+
     private static func clean(_ text: String) -> String? {
         let t = text.replacingOccurrences(of: #"\n{3,}"#, with: "\n\n", options: .regularExpression)
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        return t.isEmpty ? nil : String(t.prefix(12_000))
+        guard !t.isEmpty else { return nil }
+        guard t.count > maxCharacters else { return t }
+        return String(t.prefix(maxCharacters)) + "\n[truncated: showing the first \(maxCharacters) of \(t.count) characters]"
     }
 }

@@ -49,7 +49,10 @@ enum MemoryTidy {
                 Agent.writeLog("🧠 memory tidy skipped: facts changed while it was running")
                 return nil
             }
-            Memory.replaceAll(with: cleaned, backup: true)
+            guard Memory.replaceAll(with: cleaned, backup: true) else {
+                Agent.writeLog("🧠 memory tidy skipped: memory couldn't be rewritten")
+                return nil
+            }
             for (fact, why) in removed where !fact.isEmpty && !cleaned.contains(fact) { Memory.record(old: fact, new: nil, why: "tidy: \(why)") }
             UserDefaults.standard.set(cleaned.count, forKey: lastCountKey)
             let report = "memory tidied: \(facts.count) → \(cleaned.count) facts"

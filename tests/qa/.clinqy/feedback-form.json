@@ -1,20 +1,12 @@
 {
-  "created" : "2026-09-29T06:50:57Z",
-  "id" : "E1AB5501-21E3-4E43-A1F4-F32F1B0EF303",
+  "created" : "2026-11-01T09:33:07Z",
+  "id" : "78A64FC8-6633-4312-8B7C-6381A18F063C",
   "name" : "Feedback form: name and sessions",
   "params" : [
 
   ],
   "runs" : 0,
   "steps" : [
-    {
-      "action" : "open_url",
-      "url" : "http:\/\/127.0.0.1:8765\/form.html"
-    },
-    {
-      "action" : "open_app",
-      "name" : "Arc"
-    },
     {
       "action" : "open_url",
       "url" : "http:\/\/127.0.0.1:8765\/form.html"

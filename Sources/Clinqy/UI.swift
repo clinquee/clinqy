@@ -542,6 +542,8 @@ struct CommandView: View {
                 .foregroundStyle(DS.secondary).symbolEffect(.pulse)
         } else if let error = skills.lastError {
             Label(error, systemImage: "exclamationmark.circle").font(.system(size: 13)).foregroundStyle(DS.secondary)
+        } else if let error = History.shared.saveError {
+            Label(error, systemImage: "exclamationmark.triangle").font(.system(size: 13)).foregroundStyle(DS.secondary)
         }
         if let status = speech.statusText, agent.steps.isEmpty {
             Label(status, systemImage: "waveform.badge.plus").font(.system(size: 12)).foregroundStyle(DS.tertiary)

@@ -115,7 +115,13 @@ enum Files {
 
     // MARK: Moving things (logged for undo)
 
-    private static let logDir: URL = {
+    /// Tests point this at a scratch folder.
+    nonisolated(unsafe) static var logDirOverride: URL?
+    private static var logDir: URL {
+        if let logDirOverride { try? FileManager.default.createDirectory(at: logDirOverride, withIntermediateDirectories: true); return logDirOverride }
+        return defaultLogDir
+    }
+    private static let defaultLogDir: URL = {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Clinqy/file-moves", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
@@ -137,7 +143,8 @@ enum Files {
         if !done.isEmpty {
             let log = done.map { ["from": $0.0.path, "to": $0.1.path] }
             let name = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-") + ".json"
-            try? JSONSerialization.data(withJSONObject: log, options: .prettyPrinted).write(to: logDir.appendingPathComponent(name))
+            do { try JSONSerialization.data(withJSONObject: log, options: .prettyPrinted).write(to: logDir.appendingPathComponent(name)) }
+            catch { skipped.append("the undo record couldn't be saved (\(error.localizedDescription)): these moves can't be undone automatically") }
         }
         return (done, skipped)
     }
@@ -149,15 +156,30 @@ enum Files {
               let data = try? Data(contentsOf: last), let moves = try? JSONSerialization.jsonObject(with: data) as? [[String: String]] else {
             throw Pdf.Failure("nothing to undo")
         }
-        var back = 0
+        var back = 0, kept: [[String: String]] = [], gone = 0
         for m in moves.reversed() {
-            guard let from = m["from"], let to = m["to"], FileManager.default.fileExists(atPath: to),
-                  !FileManager.default.fileExists(atPath: from) else { continue }
-            try? FileManager.default.createDirectory(at: URL(fileURLWithPath: from).deletingLastPathComponent(), withIntermediateDirectories: true)
-            if (try? FileManager.default.moveItem(atPath: to, toPath: from)) != nil { back += 1 }
+            guard let from = m["from"], let to = m["to"] else { continue }
+            let fm = FileManager.default
+            if !fm.fileExists(atPath: to) {
+                // Already back (or removed since): nothing left to restore for this record.
+                if !fm.fileExists(atPath: from) { gone += 1 }
+                continue
+            }
+            if fm.fileExists(atPath: from) { kept.append(m); continue }   // something now sits at the original path: don't overwrite it
+            try? fm.createDirectory(at: URL(fileURLWithPath: from).deletingLastPathComponent(), withIntermediateDirectories: true)
+            if (try? fm.moveItem(atPath: to, toPath: from)) != nil { back += 1 } else { kept.append(m) }
         }
-        try? FileManager.default.removeItem(at: last)
-        return "put back \(back) of \(moves.count) files"
+        // A record stays on disk until it is resolved, so a conflict can be retried after the user clears the path.
+        if kept.isEmpty {
+            try? FileManager.default.removeItem(at: last)
+        } else {
+            let remaining = Array(kept.reversed())
+            if let data = try? JSONSerialization.data(withJSONObject: remaining, options: .prettyPrinted) { try? data.write(to: last) }
+        }
+        var note = "put back \(back) of \(moves.count) files"
+        if !kept.isEmpty { note += "; \(kept.count) couldn't be put back (the original location is occupied or the move failed), so they're still recorded for another undo" }
+        if gone > 0 { note += "; \(gone) no longer exist" }
+        return note
     }
 
     /// Top-level files of a folder grouped into subfolders by kind (Downloads → Images, PDFs, Documents…).

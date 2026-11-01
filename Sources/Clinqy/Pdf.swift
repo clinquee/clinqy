@@ -23,7 +23,13 @@ enum Pdf {
         guard !files.isEmpty || op == "info" else { throw Failure("no files given") }
         for f in files where !FileManager.default.fileExists(atPath: f.path) { throw Failure("no such file: \(f.path)") }
         let pages = o["pages"] as? String
-        let out = (o["out"] as? String).map { URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath) }
+        let overwrite = o["overwrite"] as? Bool == true
+        // An explicit output path may not be one of the inputs, and an existing file there is only replaced when asked to.
+        let folderOp = op == "split" || op == "to_images"
+        let out = try (o["out"] as? String).map { raw -> URL in
+            let url = URL(fileURLWithPath: (raw as NSString).expandingTildeInPath)
+            return folderOp ? try resolveFolder(url, sources: files) : try resolveOutput(url, sources: files, overwrite: overwrite)
+        }
 
         switch op {
         case "merge":
@@ -48,11 +54,12 @@ enum Pdf {
             }
             let folder = out ?? unique(files[0].deletingLastPathComponent()
                 .appendingPathComponent(files[0].deletingPathExtension().lastPathComponent + "-split"))
-            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
             let stem = files[0].deletingPathExtension().lastPathComponent
-            for group in groups {
-                let name = group.count == 1 ? "\(stem)-p\(group[0] + 1).pdf" : "\(stem)-p\(group[0] + 1)-\(group.last! + 1).pdf"
-                try save(subset(doc, group), to: folder.appendingPathComponent(name))
+            try inFolder(folder, overwrite: overwrite) { place in
+                for group in groups {
+                    let name = group.count == 1 ? "\(stem)-p\(group[0] + 1).pdf" : "\(stem)-p\(group[0] + 1)-\(group.last! + 1).pdf"
+                    try save(subset(doc, group), to: place(name))
+                }
             }
             return "split into \(groups.count) files in \(folder.path)"
 
@@ -95,11 +102,17 @@ enum Pdf {
 
         case "to_pdf":
             var made: [URL] = []
-            for f in files {
-                let doc = try await asPDF(f)
-                let dest = files.count == 1 ? (out ?? output(for: f, suffix: nil)) : output(for: f, suffix: nil)
-                try save(doc, to: dest)
-                made.append(dest)
+            do {
+                for f in files {
+                    let doc = try await asPDF(f)
+                    let dest = files.count == 1 ? (out ?? output(for: f, suffix: nil)) : output(for: f, suffix: nil)
+                    try save(doc, to: dest)
+                    made.append(dest)
+                }
+            } catch {
+                // With several inputs every output is a fresh file made by this job (never an explicit, pre-existing path).
+                if files.count > 1 { for m in made { try? FileManager.default.removeItem(at: m) } }
+                throw error
             }
             if o["combine"] as? Bool == true, made.count > 1 {
                 let merged = PDFDocument()
@@ -117,15 +130,17 @@ enum Pdf {
             let doc = try open(files[0])
             let folder = out ?? unique(files[0].deletingLastPathComponent()
                 .appendingPathComponent(files[0].deletingPathExtension().lastPathComponent + "-images"))
-            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
             let stem = files[0].deletingPathExtension().lastPathComponent
             let list = try pages.map { try pageList($0, count: doc.pageCount) } ?? Array(0..<doc.pageCount)
-            for i in list {
-                guard let page = doc.page(at: i), let image = render(page, scale: dpi / 72) else { continue }
-                let rep = NSBitmapImageRep(cgImage: image)
-                let data = format == "png" ? rep.representation(using: .png, properties: [:])
-                    : rep.representation(using: .jpeg, properties: [.compressionFactor: 0.85])
-                try data?.write(to: folder.appendingPathComponent("\(stem)-\(i + 1).\(format == "png" ? "png" : "jpg")"))
+            try inFolder(folder, overwrite: overwrite) { place in
+                for i in list {
+                    guard let page = doc.page(at: i), let image = render(page, scale: dpi / 72) else { continue }
+                    let rep = NSBitmapImageRep(cgImage: image)
+                    let data = format == "png" ? rep.representation(using: .png, properties: [:])
+                        : rep.representation(using: .jpeg, properties: [.compressionFactor: 0.85])
+                    guard let data else { throw Failure("couldn't encode page \(i + 1)") }
+                    try data.write(to: place("\(stem)-\(i + 1).\(format == "png" ? "png" : "jpg")"))
+                }
             }
             return "saved \(list.count) \(format == "png" ? "PNG" : "JPG") images in \(folder.path)"
 
@@ -254,8 +269,9 @@ enum Pdf {
             guard let best = candidates.min(by: { fileSize($0) < fileSize($1) }), fileSize(best) < original * 97 / 100 else {
                 return "\(f.lastPathComponent) is already as small as it gets at this level (\(bytes(f)))\(quality > 0.5 ? "; level \"extreme\" may shrink it further at lower image quality" : "")"
             }
-            if FileManager.default.fileExists(atPath: dest.path) { try FileManager.default.removeItem(at: dest) }
-            try FileManager.default.copyItem(at: best, to: dest)
+            let staged = scratch(for: dest)
+            try FileManager.default.copyItem(at: best, to: staged)
+            try commit(staged, to: dest)
             let saved = 100 - Int(Double(fileSize(dest)) / Double(max(original, 1)) * 100)
             return "compressed \(f.lastPathComponent): \(bytes(f)) → \(bytes(dest)) (−\(saved)%) → \(dest.path)"
         }.joined(separator: "\n")
@@ -427,7 +443,93 @@ enum Pdf {
 
     private static func save(_ doc: PDFDocument, to dest: URL) throws {
         try FileManager.default.createDirectory(at: dest.deletingLastPathComponent(), withIntermediateDirectories: true)
-        guard doc.write(to: dest) else { throw Failure("couldn't write \(dest.path)") }
+        // Written beside the destination and moved into place, so a failure never leaves a partial file or damages an existing one.
+        let temp = scratch(for: dest)
+        guard doc.write(to: temp) else { try? FileManager.default.removeItem(at: temp); throw Failure("couldn't write \(dest.path)") }
+        try commit(temp, to: dest)
+    }
+
+    // MARK: - Output paths
+
+    /// Whether two URLs name the same file (same path once resolved, or the same inode, which also catches hard links).
+    static func sameFile(_ a: URL, _ b: URL) -> Bool {
+        let pa = a.resolvingSymlinksInPath().standardizedFileURL.path, pb = b.resolvingSymlinksInPath().standardizedFileURL.path
+        if pa == pb || pa.lowercased() == pb.lowercased() && caseInsensitiveVolume(a) { return true }
+        let keys: Set<URLResourceKey> = [.fileResourceIdentifierKey]
+        guard let x = try? a.resourceValues(forKeys: keys).fileResourceIdentifier,
+              let y = try? b.resourceValues(forKeys: keys).fileResourceIdentifier else { return false }
+        return x.isEqual(y)
+    }
+
+    private static func caseInsensitiveVolume(_ url: URL) -> Bool {
+        var probe = url
+        while !FileManager.default.fileExists(atPath: probe.path), probe.path != "/" { probe = probe.deletingLastPathComponent() }
+        return (try? probe.resourceValues(forKeys: [.volumeSupportsCaseSensitiveNamesKey]).volumeSupportsCaseSensitiveNames) != true
+    }
+
+    /// An explicit output file: never one of the inputs; an existing file there is replaced only when `overwrite` is set,
+    /// otherwise the result gets a free numbered name next to it (the reply states the real path).
+    static func resolveOutput(_ out: URL, sources: [URL], overwrite: Bool) throws -> URL {
+        if let clash = sources.first(where: { sameFile($0, out) }) {
+            throw Failure("the output path \(out.path) is the same file as the input \(clash.lastPathComponent); choose a different output")
+        }
+        var isDir: ObjCBool = false
+        if FileManager.default.fileExists(atPath: out.path, isDirectory: &isDir) {
+            if isDir.boolValue { throw Failure("the output path \(out.path) is a folder; give a file name") }
+            return overwrite ? out : unique(out)
+        }
+        return out
+    }
+
+    /// An explicit output folder: it may already exist, but it can't be a file or an input.
+    static func resolveFolder(_ out: URL, sources: [URL]) throws -> URL {
+        if let clash = sources.first(where: { sameFile($0, out) }) {
+            throw Failure("the output folder \(out.path) is the same path as the input \(clash.lastPathComponent)")
+        }
+        var isDir: ObjCBool = false
+        if FileManager.default.fileExists(atPath: out.path, isDirectory: &isDir), !isDir.boolValue {
+            throw Failure("the output path \(out.path) is a file; give a folder")
+        }
+        return out
+    }
+
+    /// Runs `body` with a function that names each output file inside `folder` (numbered when the name is taken, unless
+    /// `overwrite`). If the job fails, only the files and folder this job created are removed.
+    static func inFolder(_ folder: URL, overwrite: Bool, _ body: ((String) -> URL) throws -> Void) throws {
+        let fm = FileManager.default
+        let folderExisted = fm.fileExists(atPath: folder.path)
+        try fm.createDirectory(at: folder, withIntermediateDirectories: true)
+        var created: [URL] = []
+        var claimed = Set<String>()
+        func place(_ name: String) -> URL {
+            var url = folder.appendingPathComponent(name)
+            if !overwrite || claimed.contains(url.path) { url = unique(url) }
+            while claimed.contains(url.path) { url = unique(url.deletingLastPathComponent().appendingPathComponent(url.lastPathComponent + "_")) }
+            claimed.insert(url.path)
+            if !fm.fileExists(atPath: url.path) { created.append(url) }
+            return url
+        }
+        do { try body(place) } catch {
+            for url in created { try? fm.removeItem(at: url) }
+            if !folderExisted, ((try? fm.contentsOfDirectory(atPath: folder.path)) ?? ["x"]).isEmpty { try? fm.removeItem(at: folder) }
+            throw error
+        }
+    }
+
+    /// A hidden sibling of `dest` to write into before moving into place.
+    static func scratch(for dest: URL) -> URL {
+        dest.deletingLastPathComponent().appendingPathComponent(".clinqy-\(UUID().uuidString.prefix(8))-" + dest.lastPathComponent)
+    }
+
+    /// Moves a finished temp file to `dest`, replacing what is there (the caller has already decided that's allowed).
+    static func commit(_ temp: URL, to dest: URL) throws {
+        let fm = FileManager.default
+        do {
+            if fm.fileExists(atPath: dest.path) { _ = try fm.replaceItemAt(dest, withItemAt: temp) } else { try fm.moveItem(at: temp, to: dest) }
+        } catch {
+            try? fm.removeItem(at: temp)
+            throw error
+        }
     }
 
     private static func subset(_ doc: PDFDocument, _ indices: [Int]) -> PDFDocument {

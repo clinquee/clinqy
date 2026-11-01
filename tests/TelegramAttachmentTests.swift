@@ -126,7 +126,7 @@ final class TelegramAPI: URLProtocol {
         func check(_ test: @autoclosure () -> Bool, _ label: String) { precondition(test(), label); print("PASS \(label)") }
 
         // The user's exact failure: trailing normal mode must override every global background setting.
-        for text in ["Apply to this Luma use normal mode clinqy", "normal mode: open Cursor", "use normal mode open Calculator", "foreground: open Arc", "apply to this, not in the background"] {
+        for text in ["Apply to this Luma use normal mode clinqy", "normal mode: open Cursor", "use normal mode open Calculator", "foreground: open Arc", "use foreground: open the browser", "use the browser in foreground mode", "open the browser in the foreground", "apply to this, not in the background"] {
             var value = text; check(ExecutionMode.choice(&value) == false, "explicit Normal routing: \(text)")
         }
         for text in ["in the background: open https://example.com", "read the file in background mode"] { var value = text; check(ExecutionMode.choice(&value) == true, "explicit Background routing") }

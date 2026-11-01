@@ -51,3 +51,35 @@ enum Clipboard {
         seconds < 60 ? "just now" : "\(Int(seconds / 60)) min ago"
     }
 }
+
+/// Every item and every type on a pasteboard, so a temporary use of the clipboard can put back rich content
+/// (images, files, styled text), and only while the clipboard is still the one Clinqy wrote: if the user copied
+/// something meanwhile, their copy is theirs and is left alone.
+struct PasteboardSnapshot {
+    private let items: [[NSPasteboard.PasteboardType: Data]]
+
+    init(_ board: NSPasteboard = .general) {
+        items = (board.pasteboardItems ?? []).map { item in
+            var data: [NSPasteboard.PasteboardType: Data] = [:]
+            for type in item.types { if let d = item.data(forType: type) { data[type] = d } }
+            return data
+        }
+    }
+
+    var isEmpty: Bool { items.isEmpty }
+
+    /// Puts the snapshot back if the pasteboard's change count is still `ownedCount` (our own last write).
+    /// Returns false, touching nothing, when something else wrote to the clipboard in between.
+    @discardableResult
+    func restore(to board: NSPasteboard = .general, ifUnchangedSince ownedCount: Int) -> Bool {
+        guard board.changeCount == ownedCount else { return false }
+        board.clearContents()
+        let restored = items.map { entry -> NSPasteboardItem in
+            let item = NSPasteboardItem()
+            for (type, data) in entry { item.setData(data, forType: type) }
+            return item
+        }
+        if !restored.isEmpty { board.writeObjects(restored) }
+        return true
+    }
+}

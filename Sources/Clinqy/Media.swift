@@ -15,7 +15,8 @@ enum Media {
         for f in files where !videoTypes.contains(f.pathExtension.lowercased()) && !audioTypes.contains(f.pathExtension.lowercased()) {
             throw Pdf.Failure("can't open .\(f.pathExtension) files (works with \((videoTypes.union(audioTypes)).sorted().joined(separator: ", ")); for others try ffmpeg)")
         }
-        let out = (o["out"] as? String).map { URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath) }
+        let overwrite = o["overwrite"] as? Bool == true
+        let out = try (o["out"] as? String).map { try Pdf.resolveOutput(URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath), sources: files, overwrite: overwrite) }
         let audioOnly = files.allSatisfy { audioTypes.contains($0.pathExtension.lowercased()) }
         let ext = audioOnly ? "m4a" : "mp4"
 
@@ -66,11 +67,14 @@ enum Media {
             default: (0.45, 4320)
             }
             let dest = out ?? Pdf.output(for: files[0], suffix: "compressed", ext: "mp4")
-            try await transcode(AVURLAsset(url: files[0]), to: dest, bitrateShare: share, maxHeight: maxHeight, progress: progress)
-            guard fileSize(dest) < fileSize(files[0]) else {
-                try? FileManager.default.removeItem(at: dest)
+            // Encoded beside the destination first; it only replaces/creates `dest` when it is actually smaller.
+            let candidate = Pdf.scratch(for: dest)
+            try await transcode(AVURLAsset(url: files[0]), to: candidate, bitrateShare: share, maxHeight: maxHeight, progress: progress)
+            guard fileSize(candidate) < fileSize(files[0]) else {
+                try? FileManager.default.removeItem(at: candidate)   // only the file this job just created
                 return "\(files[0].lastPathComponent) is already well compressed (\(size(files[0]))); \(level == "extreme" ? "it can't get smaller" : "level \"extreme\" lowers the resolution to shrink it")"
             }
+            try Pdf.commit(candidate, to: dest)
             return "compressed \(files[0].lastPathComponent): \(size(files[0])) → \(size(dest)) (−\(100 - fileSize(dest) * 100 / max(fileSize(files[0]), 1))%) → \(dest.path)"
 
         case "to_mp4":
@@ -110,8 +114,10 @@ enum Media {
             guard let session = AVAssetExportSession(asset: asset, presetName: preset) else { continue }
             let type: AVFileType = dest.pathExtension.lowercased() == "m4a" ? .m4a : .mp4
             guard session.supportedFileTypes.contains(type) else { continue }
-            try? FileManager.default.removeItem(at: dest)
-            session.outputURL = dest
+            // Written to a hidden sibling and moved into place on success: a failed or cancelled export never touches `dest`.
+            let temp = Pdf.scratch(for: dest)
+            try? FileManager.default.removeItem(at: temp)
+            session.outputURL = temp
             session.outputFileType = type
             session.shouldOptimizeForNetworkUse = true
             if let range { session.timeRange = range }
@@ -127,9 +133,12 @@ enum Media {
                 }
             } onCancel: { session.cancelExport() }
             ticker.cancel()
-            if session.status == .completed { return i > 0 && preset != AVAssetExportPresetAppleM4A ? " (re-encoded: the clips' formats differ)" : "" }
+            if session.status == .completed {
+                try Pdf.commit(temp, to: dest)
+                return i > 0 && preset != AVAssetExportPresetAppleM4A ? " (re-encoded: the clips' formats differ)" : ""
+            }
             lastError = session.error
-            try? FileManager.default.removeItem(at: dest)
+            try? FileManager.default.removeItem(at: temp)
             if Task.isCancelled { throw CancellationError() }
         }
         throw Pdf.Failure("export failed: \(lastError?.localizedDescription ?? "unsupported format")")
@@ -149,6 +158,8 @@ enum Media {
         let (w, h) = (even(natural.width), even(natural.height))
         let bitrate = max(250_000, sourceRate * bitrateShare * Double(scale * scale))
 
+        let finalDest = dest
+        let dest = Pdf.scratch(for: finalDest)   // moved over `finalDest` only when the whole transcode succeeded
         try? FileManager.default.removeItem(at: dest)
         let reader = try AVAssetReader(asset: asset)
         let writer = try AVAssetWriter(outputURL: dest, fileType: .mp4)
@@ -175,8 +186,8 @@ enum Media {
             writer.add(aIn)
             pairs.append((aOut, aIn))
         }
-        guard reader.startReading() else { throw Pdf.Failure("couldn't read the video: \(reader.error?.localizedDescription ?? "")") }
-        guard writer.startWriting() else { throw Pdf.Failure("couldn't write the video: \(writer.error?.localizedDescription ?? "")") }
+        guard reader.startReading() else { try? FileManager.default.removeItem(at: dest); throw Pdf.Failure("couldn't read the video: \(reader.error?.localizedDescription ?? "")") }
+        guard writer.startWriting() else { try? FileManager.default.removeItem(at: dest); throw Pdf.Failure("couldn't write the video: \(writer.error?.localizedDescription ?? "")") }
         writer.startSession(atSourceTime: .zero)
 
         let cancelled = { Task.isCancelled }
@@ -213,7 +224,11 @@ enum Media {
             throw Pdf.Failure("couldn't read the video: \(reader.error?.localizedDescription ?? "")")
         }
         await writer.finishWriting()
-        guard writer.status == .completed else { throw Pdf.Failure("couldn't write the video: \(writer.error?.localizedDescription ?? "")") }
+        guard writer.status == .completed else {
+            try? FileManager.default.removeItem(at: dest)
+            throw Pdf.Failure("couldn't write the video: \(writer.error?.localizedDescription ?? "")")
+        }
+        try Pdf.commit(dest, to: finalDest)
     }
 
     private static func fileSize(_ url: URL) -> Int {

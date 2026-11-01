@@ -25,6 +25,15 @@ struct ObservationGeometry: Sendable {
         return abs(frame.minX - other.minX) <= tolerance && abs(frame.minY - other.minY) <= tolerance
             && abs(frame.width - other.width) <= tolerance && abs(frame.height - other.height) <= tolerance
     }
+    /// Whether any part of `frame` lies on an actual display. The bounding box of several monitors also covers
+    /// the dead gaps between them, so visibility is decided display by display.
+    static func intersectsAnyDisplay(_ frame: CGRect, displays: [CGRect]) -> Bool {
+        displays.contains { display in
+            let overlap = display.intersection(frame)
+            return !overlap.isNull && overlap.width > 0 && overlap.height > 0
+        }
+    }
+
     /// Tolerate tiny capture noise, but not a changed icon, text label, canvas control or target position.
     static func visuallyMatches(_ old: [UInt8], _ current: [UInt8]) -> Bool {
         guard !old.isEmpty, old.count == current.count else { return false }

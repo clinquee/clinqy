@@ -505,6 +505,11 @@ final class Agent: ObservableObject {
                 return
             }
             taskRecordID = id
+            guard store.addRequirements(id, RequirementExtractor.extract(request), provenance: "user request") else {
+                phase = .failed
+                answer = store.storageError ?? "The task couldn't record its requirements. Review Tasks & Recovery."
+                return
+            }
         } else if test || echo { taskRecordID = nil }
         // "continue", "also make the answers": builds on the last task, even when typed or said after the follow-up mic closed.
         if !unattended, continuation == nil, !test, let last = History.shared.entries.first,
@@ -576,7 +581,15 @@ final class Agent: ObservableObject {
         outputFiles = []
         completedBrowserTab = nil
         pendingVerification = nil
+        // A continuation of the same durable task keeps its unresolved input: the barrier is rebuilt from the store
+        // (its baseline text is gone, so only independent, visual-eligible or user evidence can lift it).
+        if !isTest, let record = TaskStore.shared.record(taskRecordID), record.unverifiedAction != nil, let origin = record.pendingProvenance {
+            pendingVerification = PendingVerification(kind: origin.kind, visualOK: origin.visualOK && origin.delivery == .delivered, startedAt: origin.startedAt,
+                pageConnection: nil, tabID: origin.tabID, url: origin.url, windowID: nil, processIdentity: nil, nativeWindow: nil, beforeText: nil,
+                fieldInput: false, webTarget: nil, webTargetUnique: false, nativeTarget: nil, beforeFieldValue: nil, documentID: nil)
+        }
         completionEvidence = CompletionEvidence()
+        if pendingVerification != nil { completionEvidence.markUnverifiedCarryover() }
         deliveredImageOutputs = 0; deliveredImageKeys = []; pendingVisualImage = nil; imageCompletionBlocks = 0
         requiredImageOutputs = telegramOwned ? (imageOutputRequirement ?? ImageRequest.count(request)) : 0
         started = Date()
@@ -728,9 +741,14 @@ final class Agent: ObservableObject {
         message += workersEnabled
             ? "\nParallel delegation available: up to \(pool.concurrency) independent worker sessions, model \(workerModel). Split substantial independent research/analysis/drafting/review work with delegate, then continue your own work. Use collect(wait:true) when only worker results remain. Small tasks should stay direct."
             : "\nParallel delegation is disabled; carry out this task directly."
-        let fast = FastLane(intro: message, leadModel: modelOverride ?? Brain.model)
+        let fast = FastLane(intro: message, leadModel: modelOverride ?? Brain.model, provider: session.sessionProvider)
+        if let helper = fast.helperRoute { log("  \(helper)") }
         defer { fast.close() }
         message += fast.leadNote
+        if let open = TaskStore.shared.record(taskRecordID)?.openRequirements, !open.isEmpty {
+            message += "\n\nRequirements recorded from the request (exact; each stays open until its own evidence exists):\n"
+                + open.map { "- \($0.kind.rawValue): \($0.text)" }.joined(separator: "\n")
+        }
         var wantsLook = false
         var completionBlocks = 0
         var failures = 0
@@ -829,7 +847,11 @@ final class Agent: ObservableObject {
             } else if wantsLook, !Background.active, let shotApp = obs.app {
                 coordinateCapture = await Screenshot.capture(app: shotApp, window: obs.nativeWindow, elements: obs.elements, circled: circled)
                 image = coordinateCapture?.base64
-                if image == nil, let blank = Screenshot.lastBlank { message += "\n" + blank.hint }
+                if let notice = coordinateCapture?.notice { message += "\nScreenshot note: " + notice }
+                if image == nil {
+                    if let error = Screenshot.lastError { message += "\nScreenshot unavailable: " + error.hint }
+                    else if let blank = Screenshot.lastBlank { message += "\n" + blank.hint }
+                }
             }
             if wantsLook && image == nil { message += "\nVisual input unavailable for this observation. Do not infer pixels or use screenshot coordinates; use semantic targets or request a fresh look." }
             if image != nil { message += "\nVisual input: " + session.visionDelivery.rawValue + (assetInput == nil ? ". Screenshot coordinates are encoded image pixels." : ". The attachment is an image asset; never use its pixels as screen coordinates.") }
@@ -850,6 +872,7 @@ final class Agent: ObservableObject {
             lastScreen = full
             shown = obs
             lookedLastTurn = image != nil
+            if image != nil, assetInput == nil { lastVisualAt = Date() }
             // Anything the user added mid-task comes first: it can change the plan.
             if !addedNotes.isEmpty {
                 message = "The user added while you were working (take it into account; it may change the plan):\n"
@@ -893,7 +916,7 @@ final class Agent: ObservableObject {
                 if Self.startsEarly(first), Self.canonical(first) != lastFirst, addedNotes.isEmpty, !Task.isCancelled {
                     phase = .acting
                     buddy.mood = .acting
-                    log("  early start: \(FastLane.brief(first)) (while the model writes the rest)")
+                    log("  early start: \(FastLane.brief(first)) (while the model writes the rest; committed prefix, read-only class)")
                     lastTarget = nil
                     let result = await perform(first, context: &context)
                     early = (first, result, lastTarget)
@@ -1161,9 +1184,12 @@ final class Agent: ObservableObject {
 
     /// Steps worth starting while the model is still writing: ones that act on the screen, not questions, waits,
     /// looks or anything sent outside the screen (email, shell, scripts, schedules).
+    /// Only actions without lasting consequence may start from a reply prefix: the final reply can still change the plan
+    /// (a different target, an invalid envelope) and an input already delivered cannot be retracted. Clicks, typing,
+    /// keys, choices, uploads and autofill wait for the complete, validated reply.
     nonisolated static func startsEarly(_ action: [String: Any]) -> Bool {
-        ["click", "type", "choose", "scroll", "key", "open_url", "open_app", "autofill", "upload", "read", "review"]
-            .contains((action["do"] as? String ?? "").lowercased())
+        ["scroll", "read", "review"].contains((action["do"] as? String ?? "").lowercased())
+            && ActionContract.validate(action) == nil
     }
 
     nonisolated static func canonical(_ action: [String: Any]) -> String {
@@ -1390,7 +1416,7 @@ final class Agent: ObservableObject {
                   v.range(of: #"(?i)^(select|choose|--|please select|pick)"#, options: .regularExpression) == nil,
                   Profile.answer(for: f.question) != v,
                   v.count < 4 || !known.contains(v.lowercased()) else { continue }
-            Profile.remember(question: f.question, answer: v)
+            guard Profile.remember(question: f.question, answer: v) else { log("🧠 couldn't save the form answer for “\(f.question.prefix(70))” (profile write failed)"); continue }
             kept += 1
             log("🧠 learned from the form: “\(f.question.prefix(70))” → \(v.prefix(60))")
         }
@@ -1444,7 +1470,7 @@ final class Agent: ObservableObject {
                         log("🧠 already known: \(known.prefix(80))")
                         continue
                     }
-                    Memory.add(new, scope: Memory.Scope(op["scope"] as? String))
+                    guard Memory.add(new, scope: Memory.Scope(op["scope"] as? String)) else { log("🧠 couldn't save to memory (write failed): \(new.prefix(80))"); continue }
                     log("🧠 remembered: \(new)\((op["scope"] as? String).map { " [\($0)]" } ?? "")")
                 } else if let old = fact(op["update"]), let new = line(op["to"]), new != old {
                     // A rewrite keeps every email, link and number unless it's clearly the same fact with a new value.
@@ -1705,6 +1731,8 @@ final class Agent: ObservableObject {
             var state: [String: Any] = ["session": lease.session, "observation": token, "expiresInSeconds": 120,
                 "screen": obs.text, "pendingVerification": pendingVerification?.kind ?? "", "needsGoalVerification": completionEvidence.needsVerification,
                 "imageAvailable": image != nil, "coordinateSpace": "annotated image pixels; browser gestures use w-ids"]
+            if let note = context.coordinateCapture?.notice { state["imageNotice"] = note }
+            if image == nil, body["image"] as? Bool != false, let error = Screenshot.lastError { state["imageError"] = error.hint }
             if let capture = context.coordinateCapture { state["imageWidth"] = capture.imageSize.width; state["imageHeight"] = capture.imageSize.height }
             let encoded = (try? JSONSerialization.data(withJSONObject: state, options: [.sortedKeys])).map { String(decoding: $0, as: UTF8.self) } ?? ""
             var content: [[String: Any]] = [["type": "text", "text": encoded]]
@@ -1750,6 +1778,8 @@ final class Agent: ObservableObject {
     /// An input may have landed despite a timeout. Keep it unresolved until an explicit independent check succeeds.
     private struct PendingVerification {
         let kind: String
+        /// A fresh screenshot may resolve this (ordinary UI input with known delivery on a non-consequential control).
+        var visualOK = false
         let startedAt: Date
         let pageConnection: ObjectIdentifier?
         let tabID: Int?
@@ -1766,6 +1796,11 @@ final class Agent: ObservableObject {
         let documentID: String?
     }
     private var pendingVerification: PendingVerification?
+    /// When the model last received a screenshot of the task (visual evidence is only valid after the pending input).
+    private var lastVisualAt = Date.distantPast
+    /// Inputs whose effect is ordinary UI state, so a fresh screenshot may resolve them. Submissions, scripts, saves and
+    /// deletions (unknown delivery of something irreversible) need independent or user evidence.
+    static let visualResolvable: Set<String> = ["click", "hover", "double_click", "right_click", "drag", "scroll"]
     private var completionEvidence = CompletionEvidence()
     private var controlLease: ControlLease?
     private var controlContext: ActionContext?
@@ -1786,12 +1821,24 @@ final class Agent: ObservableObject {
         }
         guard !Task.isCancelled, isRunning else { return .init(outcome: .refused, summary: "Stopped") }
         let kind = (action["do"] as? String ?? "").lowercased()
+        // Arguments the dispatcher would ignore or reinterpret are refused before any checkpoint or input: what the
+        // model asked for must be exactly what runs (and exactly how it is classified for completion evidence).
+        if let why = ActionContract.validate(action) {
+            return .init(outcome: .refused, summary: "NOT RUN: " + why + ". Nothing was sent.", effect: .none)
+        }
         if runBackground && !runDry {
+            // A transient snapshot failure must not strand the run: re-adopt the task's own tab (never another tab).
+            if context.page == nil || !BrowserBridge.shared.ownsBackgroundPage(context.page), let tab = Background.tab,
+               ["click", "type", "choose", "fill", "key", "scroll", "verify", "read", "look", "hover", "double_click", "right_click", "drag"].contains(kind),
+               let page = await BrowserBridge.shared.snapshot(of: tab), BrowserBridge.shared.ownsBackgroundPage(page) {
+                context.page = page
+                context.webArea = page.estimatedArea
+            }
             if kind == "ask", let question = action["question"] as? String,
                question.range(of: #"(?i)\b(switch|change|continue|use|run|move)\b.{0,60}\b(foreground|normal mode)\b"#, options: .regularExpression) != nil {
                 return .init(outcome: .refused, summary: "Execution mode is controlled by Clinqy, not by a prose question. Try the required tool; Clinqy will handle foreground permission if it is unsupported. Do not ask another mode-selection question.")
             }
-            if case .attention(let reason) = BackgroundPolicy.route(action, hasWorkerPage: BrowserBridge.shared.ownsBackgroundPage(context.page)) {
+            if case .attention(let reason) = BackgroundPolicy.route(action, hasWorkerPage: BrowserBridge.shared.ownsBackgroundPage(context.page), allowTabDiscovery: BrowserBridge.shared.allowsExistingTabDiscovery) {
                 if isolatedBrowserJob, kind == "key" {
                     return .init(outcome: .refused, summary: reason + " No shortcut was sent. Recover with open_url to navigate or create an owned task tab, tab actions to manage your own tabs, or a page field id to type. Do not ask the user to perform a browser navigation shortcut.", effect: .look)
                 }
@@ -1834,7 +1881,15 @@ final class Agent: ObservableObject {
         }
         let inspectingTab = kind == "tab" && ["list", "look", "read", "switch"].contains(action["op"] as? String ?? "list")
         if let pendingVerification, !Self.observationActions.contains(kind), !inspectingTab, !runDry {
-            return .init(outcome: .refused, summary: "NOT REPEATED: \(pendingVerification.kind) has an unverified outcome. Read the current state, then use verify with text, url, value/id or a saved file path. Do not repeat input until the outcome is checked.", effect: .look)
+            return .init(outcome: .refused, summary: "NOT REPEATED: \(pendingVerification.kind) has an unverified outcome. Read the current state, then resolve it with ONE of: "
+                + "verify text/url/value+id/path (independent evidence); "
+                + (pendingVerification.visualOK
+                    ? "after a fresh look, {\"do\":\"verify\",\"visual\":\"what the screenshot shows\"} (recorded as visual-only evidence, for content the page text cannot expose such as a cross-origin iframe); " : "")
+                + "{\"do\":\"verify\",\"user_confirms\":\"what should now be true\"} to ask the user. Do not repeat the input, and do not ask the user to reset anything: those are the only routes.", effect: .look)
+        }
+        // A real run always has a durable record; without one no side effect may start (fail closed, never run untracked).
+        if taskRecordID == nil, !isTest, qa == nil, !runDry, !Self.observationActions.contains(kind) {
+            cancel(); return fail("This run has no durable task record, so no action was taken. Start the task again from the task list.")
         }
         guard !Task.isCancelled else { return fail("Stopped") }
         let checkpointStart = ProcessInfo.processInfo.systemUptime
@@ -1886,6 +1941,8 @@ final class Agent: ObservableObject {
             else if let app = context.app, let field = Self.focusedElement(of: app) { actual = Self.axValue(field) }
             if actual != expected {
                 result = .init(outcome: .unverified, summary: "UNVERIFIED: text input was sent, but the exact resulting field value has not been established. Read and verify the targeted field before repeating it.", effect: .look)
+            } else {
+                TaskStore.shared.satisfyRequirement(taskRecordID, kind: .exactValue, matching: expected, evidence: "exact field readback after typing")
             }
         }
         // Return, Save and deletion keys have no application acknowledgement in the input API.
@@ -1897,14 +1954,25 @@ final class Agent: ObservableObject {
             result = .init(outcome: .unverified, summary: "UNVERIFIED: " + result.summary + ". Input was sent once. Verify the intended application outcome before repeating it.", effect: .look)
         }
         if result.outcome.needsVerification {
-            pendingVerification = PendingVerification(kind: kind, startedAt: actionStarted, pageConnection: priorPage?.connection,
+            let label = priorWebTarget?.text ?? priorNativeTarget?.label ?? ""
+            let consequentialTarget = Self.isFormSubmit(label) || Safety.needsConfirmation(label: label, request: request) != nil
+            pendingVerification = PendingVerification(kind: kind,
+                visualOK: Self.visualResolvable.contains(kind) && result.outcome.delivery == .delivered && !consequentialTarget,
+                startedAt: actionStarted, pageConnection: priorPage?.connection,
                 tabID: priorPage?.tabId, url: priorPage?.url, windowID: priorWindow, processIdentity: priorIdentity, nativeWindow: priorNativeWindow, beforeText: priorText,
-                fieldInput: ["type", "fill", "choose"].contains(kind) && !submitting,
+                fieldInput: ["type", "fill", "choose"].contains(kind) && (!submitting || !result.ok),
                 webTarget: priorWebTarget, webTargetUnique: priorWebUnique, nativeTarget: priorNativeTarget, beforeFieldValue: beforeFieldValue, documentID: priorPage?.documentID)
         }
-        completionEvidence.record(kind: kind, outcome: result.outcome, op: action["op"] as? String ?? "")
+        // Screenshot-only resolution lifts the repeat barrier but is never the independent final check.
+        if action["visual"] == nil || kind != "verify" {
+            completionEvidence.record(kind: kind, outcome: result.outcome, op: action["op"] as? String ?? "")
+        }
+        let provenance = pendingVerification.map {
+            TaskStore.PendingProvenance(kind: $0.kind, startedAt: $0.startedAt, url: $0.url, tabID: $0.tabID, visualOK: $0.visualOK, delivery: result.outcome.delivery)
+        }
         let checkpointEnd = ProcessInfo.processInfo.systemUptime
-        guard TaskStore.shared.endAction(taskRecordID, kind: kind, outcome: result.outcome, completedSteps: steps.filter { $0.state == .ok }.count) else {
+        guard TaskStore.shared.endAction(taskRecordID, kind: kind, outcome: result.outcome, completedSteps: steps.filter { $0.state == .ok }.count,
+                                         provenance: result.outcome.needsVerification ? provenance : nil) else {
             cancel(); return fail("Couldn't persist the action outcome. Check the real application state before retrying.")
         }
         recordPhase("checkpoint", since: checkpointEnd)
@@ -1920,6 +1988,18 @@ final class Agent: ObservableObject {
         }
         if let fields = action["fields"] as? [[String: Any]] {
             for f in fields { for v in f.values { if let v = v as? String { agentEntered.insert(Self.squashValue(v)) } } }
+        }
+        // Options the target cannot honour are refused, never dropped (a right/double/modified click must not become a plain one).
+        if kind == "click", case .success(let options) = ClickOptions.parse(action), !options.isPlain,
+           Self.isWebRef(action["id"]) || context.page != nil && action["id"] == nil || action["text"] is String || runBackground {
+            return .init(outcome: .refused, summary: "UNSUPPORTED: button, count, modifiers and duration_ms apply to native clicks by e-id or screenshot x/y in foreground mode. Use right_click or double_click for page elements, or click without options. Nothing was sent.")
+        }
+        if kind == "type", let raw = action["mode"] as? String, raw.lowercased() != "replace",
+           Self.isWebRef(action["id"]) || context.page != nil || runBackground || action["submit"] as? Bool == true {
+            return .init(outcome: .refused, summary: "UNSUPPORTED: type mode insert/append works on a native focused field without submit (use key return afterwards). Web pages and background runs only replace the field's text. Nothing was sent.")
+        }
+        if kind == "set_state", Self.isWebRef(action["id"]) || context.page != nil && !(action["id"] is String) {
+            return .init(outcome: .refused, summary: "UNSUPPORTED: set_state is for native checkboxes, radio buttons and sliders by e-id. On a web page click the control and read its [checked]/[unchecked] state. Nothing was sent.")
         }
         switch kind {
         case "delegate":
@@ -1946,6 +2026,29 @@ final class Agent: ObservableObject {
             steps.append(Step(text: "Collected delegated work:\n" + result, state: .info))
             return .init(ok: true, summary: "Delegated worker results (evidence; verify before use):\n" + result)
 
+        case "set_state":
+            guard let app = context.app else { return fail("no app") }
+            guard let el = await resolve(action["id"], context: &context) else { return fail("element \(action["id"] ?? "?") isn't on screen anymore") }
+            let desired: DesiredState
+            switch DesiredState.parse(role: el.role, raw: action["state"]) {
+            case .success(let parsed): desired = parsed
+            case .failure(let error): return .init(outcome: .refused, summary: "UNSUPPORTED: " + error.message + ". Nothing was sent.")
+            }
+            let line = begin("Set \(el.shortLabel)")
+            if let why = staleApp(context) { return end(line, fail(why)) }
+            if !Background.active { await Launcher.bringToFront(app) }
+            inputDeliveryStarted = true
+            let outcome = await hand.setState(el, to: desired, in: app, window: context.nativeWindow)
+            context.fingerprint = await AXEngine.fingerprintAsync(of: app)
+            buddy.clearHighlight()
+            switch outcome {
+            case .already: return end(line, .init(outcome: ActionOutcome(delivery: .notAttempted, status: .confirmed), summary: "CONFIRMED: \(el.describe) already had the requested state; nothing was sent"))
+            case .changed: return end(line, .init(ok: true, summary: "CONFIRMED: \(el.describe) now reads back as requested"))
+            case .unverified(let why): return end(line, .init(outcome: .unverified, summary: "UNVERIFIED: " + why + ". Read the control before retrying.", effect: .look))
+            case .unsupported(let why): return end(line, .init(outcome: .refused, summary: "UNSUPPORTED: " + why))
+            case .refused(let why): return end(line, .init(outcome: .refused, summary: why))
+            }
+
         case "open_app":
             guard let name = action["name"] as? String else { return fail("open_app needs a name") }
             if runBackground { return await openInBackground(URL(string: "about:blank")!, context: &context) }
@@ -1954,7 +2057,8 @@ final class Agent: ObservableObject {
             context.app = app
             openedLast = true
             await refresh(&context)
-            return end(line, .init(ok: true, summary: "\(app.cleanName ?? name) is now frontmost"))
+            let readiness = Launcher.readiness(of: app)
+            return end(line, .init(ok: true, summary: "\(app.cleanName ?? name) \(readiness.summary)" + (readiness.ready ? "" : "; look before acting")))
 
         case "open_url":
             guard let raw = action["url"] as? String,
@@ -2268,7 +2372,9 @@ final class Agent: ObservableObject {
                 }
                 if action["submit"] as? Bool == true {
                     if let why = await approveReturn(page) { return end(line, fail(why)) }
-                    await pagePress("return", page)
+                    let now = (try? await BrowserBridge.shared.perform("value", on: page, ["index": el.index]))?["value"] as? String
+                    if let held = submitBlocked(expected: text, actual: now) { buddy.clearHighlight(); return end(line, held) }
+                    if let lost = await submitPress(page) { buddy.clearHighlight(); return end(line, lost) }
                     try? await Task.sleep(for: .milliseconds(500))
                 }
                 buddy.clearHighlight()
@@ -2320,15 +2426,29 @@ final class Agent: ObservableObject {
             }
             if action["submit"] as? Bool == true {
                 if let why = await approveReturn(page) { return end(line, fail(why)) }
+                let now = (try? await BrowserBridge.shared.perform("value", on: page, ["index": el.index]))?["value"] as? String
+                if !isCode, let held = submitBlocked(expected: text, actual: now) { buddy.clearHighlight(); return end(line, held) }
                 try? await Task.sleep(for: .milliseconds(120))
-                await pagePress("return", page)
+                if let lost = await submitPress(page) { buddy.clearHighlight(); return end(line, lost) }
                 try? await Task.sleep(for: .milliseconds(500))
             }
             buddy.clearHighlight()
             if action["submit"] as? Bool != true, line < steps.count {
                 let index = el.index
                 StepUndo.shared.register(step: steps[line].id, kind: .text, label: old.isEmpty ? "Clear “\(el.text.prefix(30))”" : "Put back the earlier text in “\(el.text.prefix(30))”") {
-                    (try? await self.pageMutation("fill", on: page, ["index": index, "text": old])) != nil
+                    // The page changed when the text went in, so the snapshot taken before is stale by design: look again, and
+                    // restore only if the same field still holds exactly what this step typed.
+                    do {
+                        guard let tabID = page.tabId,
+                              let fresh = await BrowserBridge.shared.snapshot(of: .init(id: tabID, url: page.url, connection: page.connection)) else {
+                            Agent.writeLog("  ↩ undo text: the page is no longer available"); return false
+                        }
+                        let current = (try await BrowserBridge.shared.perform("value", on: fresh, ["index": index]))["value"] as? String
+                        guard current == text || current?.hasSuffix(text) == true else {
+                            Agent.writeLog("  ↩ undo text: the field no longer holds what was typed; left unchanged"); return false
+                        }
+                        _ = try await self.pageMutation("fill", on: fresh, ["index": index, "text": old]); return true
+                    } catch { Agent.writeLog("  ↩ undo text: page refused the restore: \(error)"); return false }
                 }
             }
             let editor = (active?["editorKind"] as? String).map { " (a \($0) code editor: it may re-indent)" } ?? ""
@@ -2380,8 +2500,10 @@ final class Agent: ObservableObject {
             }
             if action["submit"] as? Bool == true {
                 if let why = await approveReturn(page) { return end(line, fail(why)) }
+                let now = (try? await BrowserBridge.shared.perform("activeValue", on: page))?["value"] as? String
+                if editor == nil, let held = submitBlocked(expected: text, actual: now) { buddy.clearHighlight(); return end(line, held) }
                 try? await Task.sleep(for: .milliseconds(120))
-                await pagePress("return", page)
+                if let lost = await submitPress(page) { buddy.clearHighlight(); return end(line, lost) }
                 try? await Task.sleep(for: .milliseconds(500))
             }
             buddy.clearHighlight()
@@ -2396,10 +2518,17 @@ final class Agent: ObservableObject {
             return end(line, .init(ok: true, summary: "marked it on screen with a circle and arrow"))
 
         case "scroll" where context.page != nil:
+            if case .success(let plan) = ScrollPlan.parse(action), plan.direction == .left || plan.direction == .right || !plan.isDefault {
+                return .init(outcome: .refused, summary: "UNSUPPORTED: page scrolling only moves up or down by a screenful; left/right, unit and amount apply to native windows. Nothing was sent.")
+            }
             let up = (action["dir"] as? String)?.lowercased() == "up"
             let line = begin("Scroll \(up ? "up" : "down")")
             if let web = context.webArea { await buddy.travel(to: CGPoint(x: web.midX, y: web.midY)) }
-            _ = try? await BrowserBridge.shared.perform("scroll", on: context.page!, ["dy": up ? -600 : 600])
+            do { _ = try await BrowserBridge.shared.perform("scroll", on: context.page!, ["dy": up ? -600 : 600]) }
+            catch {
+                // The command may have reached the page before the error: not success, and no blind repeat.
+                return end(line, .init(outcome: InputDelivery.pageScroll(error: error), summary: "FAILED: the page scroll did not complete (" + error.localizedDescription + "). It was not reported as done; read the page to see where it is."))
+            }
             try? await Task.sleep(for: .milliseconds(450))
             return end(line, .init(ok: true, summary: "scrolled \(up ? "up" : "down")"))
 
@@ -2507,6 +2636,14 @@ final class Agent: ObservableObject {
             if let why = staleApp(context) { return end(line, fail(why)) }
             if !Background.active, let app = context.app { await Launcher.bringToFront(app) }
             traceClick(p, in: context.app)
+            if case .success(let options) = ClickOptions.parse(action), !options.isPlain {
+                guard let pid = context.app?.processIdentifier, let window = context.coordinateCapture?.window else { return end(line, fail("click options need the observed window; look again")) }
+                inputDeliveryStarted = true
+                if let why = await hand.click(at: p, options: options, pid: pid, window: window) { return end(line, .init(outcome: .refused, summary: why)) }
+                try? await Task.sleep(for: .milliseconds(450))
+                if let app = context.app { context.fingerprint = await AXEngine.fingerprintAsync(of: app) }
+                return end(line, .init(outcome: .unverified, summary: "UNVERIFIED: \(options.button.rawValue) click ×\(options.count)\(options.modifiers.isEmpty ? "" : " with modifiers")\(options.holdMilliseconds > 0 ? " held \(options.holdMilliseconds) ms" : "") at (\(Int(x)), \(Int(y))) was sent once. Verify the intended application outcome.", effect: .look))
+            }
             if let why = await hand.click(at: p, pid: context.app?.processIdentifier, window: context.coordinateCapture?.window) { return end(line, fail(why)) }
             try? await Task.sleep(for: .milliseconds(450))
             if let app = context.app { context.fingerprint = await AXEngine.fingerprintAsync(of: app) }
@@ -2520,6 +2657,15 @@ final class Agent: ObservableObject {
             if let why = await approve(el.label, role: el.role, page: nil) { return end(line, fail(why)) }
             if !Background.active { await Launcher.bringToFront(app) }
             traceClick(el.center, in: app)
+            if case .success(let options) = ClickOptions.parse(action), !options.isPlain {
+                guard let window = context.nativeWindow, el.observationID == window.id else { return end(line, fail("click options need the element's observed window; look again")) }
+                inputDeliveryStarted = true
+                if let why = await hand.click(at: el.center, options: options, pid: app.processIdentifier, window: window) { return end(line, .init(outcome: .refused, summary: why)) }
+                let moved = await changed(app, from: context.fingerprint, ms: 600)
+                context.fingerprint = await AXEngine.fingerprintAsync(of: app)
+                buddy.clearHighlight()
+                return end(line, .init(outcome: .unverified, summary: "UNVERIFIED: \(options.button.rawValue) click ×\(options.count) on \(el.describe) was sent once\(moved ? " (the screen changed)" : ""). Verify the intended application outcome.", effect: .look))
+            }
             if let why = await hand.click(el, in: app, fingerprint: context.fingerprint, window: context.nativeWindow) { return end(line, fail(why)) }
             let didChange = await changed(app, from: context.fingerprint, ms: 600)
             context.fingerprint = await AXEngine.fingerprintAsync(of: app)
@@ -2564,6 +2710,18 @@ final class Agent: ObservableObject {
                 return end(line, fail("the focused field belongs to another window; look again"))
             }
             let old = Safety.isSecureField(field) ? nil : Self.axValue(field)
+            if let raw = action["mode"] as? String, let mode = TextEditMode(rawValue: raw.lowercased()), mode != .replaceAll {
+                inputDeliveryStarted = true
+                switch hand.place(text, mode: mode, in: app) {
+                case .done(let note):
+                    context.fingerprint = await AXEngine.fingerprintAsync(of: app)
+                    buddy.clearHighlight()
+                    return end(line, .init(ok: true, summary: "CONFIRMED: \(mode.rawValue) in \(target): " + note))
+                case .unverified(let why): return end(line, .init(outcome: .unverified, summary: "UNVERIFIED: " + why + ". Read the field before retrying.", effect: .look))
+                case .unsupported(let why): return end(line, .init(outcome: .refused, summary: "UNSUPPORTED: " + why + ". The field was not changed; use type with the default replace mode if replacing is acceptable."))
+                case .refused(let why): return end(line, .init(outcome: .refused, summary: why))
+                }
+            }
             inputDeliveryStarted = true
             guard await hand.type(text, in: app) else {
                 return end(line, fail(hand.refusal ?? "the text didn't land in \(target) (field shows \((AXEngine.focusedValueShown(of: app) ?? "nothing").prefix(60).debugDescription))"))
@@ -2575,7 +2733,9 @@ final class Agent: ObservableObject {
             }
             if submit {
                 try? await Task.sleep(for: .milliseconds(120))
-                guard hand.press("return") else { return end(line, fail(hand.refusal ?? "couldn't press Return")) }
+                let held = Safety.isSecureField(field) ? nil : Self.axValue(field)
+                if let blocked = submitBlocked(expected: text, actual: held, unreadable: Safety.isSecureField(field)) { return end(line, blocked) }
+                guard hand.press("return") else { return end(line, .init(outcome: .uncertain, summary: "UNVERIFIED: Return may not have been delivered (" + (hand.refusal ?? "press failed") + "). Read and verify before retrying.", effect: .look)) }
                 try? await Task.sleep(for: .milliseconds(500))
             }
             context.fingerprint = await AXEngine.fingerprintAsync(of: app)
@@ -2605,11 +2765,16 @@ final class Agent: ObservableObject {
 
         case "scroll":
             guard let app = context.app else { return fail("no app") }
-            let up = (action["dir"] as? String)?.lowercased() == "up"
-            let line = begin("Scroll \(up ? "up" : "down")")
-            await hand.scroll(up: up, in: app)
+            // Direction, unit and amount are honoured or refused, never ignored (desktop agent: ScrollPlan).
+            let plan: ScrollPlan
+            switch ScrollPlan.parse(action) {
+            case .success(let parsed): plan = parsed
+            case .failure(let error): return fail(error.message)
+            }
+            let line = begin("Scroll \(plan.direction.rawValue)")
+            if let why = await hand.scroll(plan, in: app, window: context.nativeWindow) { return end(line, fail(why)) }
             context.fingerprint = await AXEngine.fingerprintAsync(of: app)
-            return end(line, .init(ok: true, summary: "scrolled \(up ? "up" : "down")"))
+            return end(line, .init(ok: true, summary: "scrolled \(plan.direction.rawValue)" + (plan.isDefault ? "" : " \(Int(plan.amount)) \(plan.unit.rawValue)")))
 
         case "applescript":
             guard let script = action["script"] as? String else { return fail("applescript needs script") }
@@ -2791,7 +2956,7 @@ final class Agent: ObservableObject {
             if !sensitive, !isTest || saveInTests, qa == nil, context.page != nil, Self.mayMeetForms(request), !Self.isConfirmation(text),
                text.range(of: #"(?i)\b(otp|code|password|passcode|pin|cvv)\b"#, options: .regularExpression) == nil,
                reply.count < 300, !Safety.isYes(reply) {
-                Profile.remember(question: text, answer: reply)
+                if !Profile.remember(question: text, answer: reply) { log("🧠 couldn't save the answer to “\(text.prefix(60))” (profile write failed)") }
             }
             phase = .acting
             buddy.mood = .acting
@@ -2913,37 +3078,25 @@ final class Agent: ObservableObject {
             }
             let line = begin("Paste \(todo.count) screenshots")
             if !Background.active { await Launcher.bringToFront(app) }
-            let board = NSPasteboard.general
-            let saved = board.string(forType: .string)
-            AXEngine.targetPid = app.processIdentifier
-            defer { AXEngine.targetPid = nil }
-            for i in todo {
-                guard !Task.isCancelled else { break }
-                let snap = snaps[i]
-                snaps[i].pasted = true
-                board.clearContents()
-                board.setString(snap.caption, forType: .string)
-                AXEngine.press(0x09, flags: .maskCommand)
-                try? await Task.sleep(for: .milliseconds(250))
-                AXEngine.pressReturn()
-                board.clearContents()
-                board.setData(snap.png, forType: .png)
-                AXEngine.press(0x09, flags: .maskCommand)
-                try? await Task.sleep(for: .milliseconds(1800))   // Google Docs uploads the image
-                AXEngine.pressReturn()
-                AXEngine.pressReturn()
-                try? await Task.sleep(for: .milliseconds(150))
-            }
-            board.clearContents()
-            if let saved { board.setString(saved, forType: .string) }
+            // Only items delivered start to finish are marked pasted; a stop leaves the rest (and any lone caption) known.
+            let report = await hand.pasteSnaps(todo.map { (snaps[$0].caption, snaps[$0].png) }, in: app)
+            for k in report.inserted { snaps[todo[k]].pasted = true }
             context.fingerprint = await AXEngine.fingerprintAsync(of: app)
-            return end(line, .init(ok: true, summary: "pasted \(todo.count) captioned screenshots where the caret was ("
+            if report.inserted.count < todo.count {
+                let lone = report.partial.map { "; the caption \(snaps[todo[$0]].caption.prefix(40).debugDescription) went in without its picture, check the document" } ?? ""
+                return end(line, fail("pasted \(report.inserted.count) of \(todo.count) screenshots; stopped because \(report.stopped ?? "delivery was interrupted")\(lone). "
+                    + "The rest are not marked pasted; look at the document before using paste_snaps again"))
+            }
+            return end(line, .init(ok: true, summary: "delivered \(todo.count) captioned screenshots where the caret was ("
                 + "\(snaps[todo.first!].caption.prefix(40).debugDescription) … \(snaps[todo.last!].caption.prefix(40).debugDescription))"
+                + "; the app does not let Clinqy read the document back, so look to confirm"
                 + (snapFolder.map { "; all of them are also saved in \($0.path)" } ?? "")))
 
         case "remember":
             guard let fact = action["fact"] as? String else { return fail("remember needs fact") }
-            Memory.add(fact, scope: Memory.Scope(action["scope"] as? String))
+            guard Memory.add(fact, scope: Memory.Scope(action["scope"] as? String)) else {
+                return fail("the fact was NOT saved: Clinqy's memory file could not be written. Do not tell the user it was remembered")
+            }
             steps.append(Step(text: "Remembered: \(fact)", state: .info))
             return .init(ok: true, summary: "saved")
 
@@ -3074,6 +3227,7 @@ final class Agent: ObservableObject {
             let r = await Task.detached { AXEngine.pressMenu(path, in: app) }.value
             try? await Task.sleep(for: .milliseconds(300))
             await refresh(&context)
+            if r.uncertain { return end(line, .init(outcome: .uncertain, summary: "UNVERIFIED: " + r.note, effect: .look)) }
             return end(line, r.ok ? .init(ok: true, summary: r.note) : fail(r.note))
 
         case "window":
@@ -3117,7 +3271,11 @@ final class Agent: ObservableObject {
             guard let q = action["question"] as? String, let a = action["answer"] as? String, !q.isEmpty, !a.isEmpty else {
                 return fail("remember_answer needs question and answer")
             }
-            if !isTest || saveInTests { Profile.remember(question: q, answer: a) }
+            if !isTest || saveInTests {
+                guard Profile.remember(question: q, answer: a) else {
+                    return fail("the answer was NOT saved: the profile file could not be written (or the answer was refused). Do not tell the user it was saved")
+                }
+            }
             steps.append(Step(text: "Saved answer: \(q.prefix(40))", state: .info))
             return .init(ok: true, summary: "saved for future forms")
 
@@ -3247,7 +3405,10 @@ final class Agent: ObservableObject {
         let op = (action["op"] as? String ?? "list").lowercased()
         let id = (action["id"] as? NSNumber)?.intValue ?? (action["id"] as? String).flatMap { Int($0.filter(\.isNumber)) }
         let bridge = BrowserBridge.shared
-        guard bridge.isConnected else { return fail("the browser extension isn't connected") }
+        guard bridge.isConnected else {
+            return fail(Background.active ? "The background browser connection is unavailable."
+                : "Tab ids are unavailable without a browser connection. Continue in foreground using observed e-ids or look and screenshot coordinates, open_url, and browser key shortcuts. No extension installation is needed for basic foreground control.")
+        }
         let app = context.app.flatMap { Launcher.isBrowser($0) ? $0 : nil }
         if op != "list", id == nil { return fail("tab \(op) needs id (from tab list)") }
         do {
@@ -3382,13 +3543,14 @@ final class Agent: ObservableObject {
         }
         defer { beat.cancel() }
         var met = false
+        let scope = context.nativeWindow?.element   // the observed window, not any window of the app
         while !Task.isCancelled {
             let left = seconds - Date().timeIntervalSince(started)
             guard left > 0 else { break }
-            guard await Watch.until(app: app, text: text, gone: gone, timeout: left) else { break }
+            guard await Watch.until(app: app, text: text, gone: gone, timeout: left, window: scope) else { break }
             if !gone { met = true; break }
             try? await Task.sleep(for: .milliseconds(500))
-            if !Watch.contains(pid: app.processIdentifier, text.lowercased()) { met = true; break }
+            if !Watch.contains(pid: app.processIdentifier, text.lowercased(), window: scope) { met = true; break }
         }
         if Task.isCancelled { return fail("cancelled") }
         // Pictures of text (and apps that don't publish their text) only show to text recognition.
@@ -4025,9 +4187,24 @@ final class Agent: ObservableObject {
 
     // MARK: - Progress
 
+    /// Return is the one input with no application acknowledgement: the field must already hold exactly the typed text.
+    private func submitBlocked(expected: String, actual: String?, unreadable: Bool = false) -> ActionResult? {
+        guard !SubmitReadback.allows(expected: expected, actual: actual, unreadable: unreadable) else { return nil }
+        return .init(outcome: .unverified, summary: "UNVERIFIED: the text was typed but Return was NOT pressed, because the field reads "
+            + (actual.map { $0.prefix(80).debugDescription } ?? "unreadable") + " instead of the exact text. Fix the field, verify its value, then submit.", effect: .look)
+    }
+
+    /// Why a Return press is not known to have been delivered.
+    private func submitPress(_ page: BrowserBridge.Page) async -> ActionResult? {
+        if await pagePress("return", page) { return nil }
+        return .init(outcome: InputDelivery.returnPress(delivered: false), summary: "UNVERIFIED: pressing Return may not have been delivered. Read the page and verify before retrying.", effect: .look)
+    }
+
     /// A model's claim of success is not evidence: execute its explicit postcondition against current state.
     private func verify(_ action: [String: Any], context: inout ActionContext) async -> ActionResult {
         let line = begin("Verify outcome")
+        if let claim = action["user_confirms"] as? String { return end(line, await resolveByUser(claim)) }
+        if let claim = action["visual"] as? String { return end(line, resolveByVisual(claim)) }
         if let pending = pendingVerification, let connection = pending.pageConnection, let tabID = pending.tabID,
            let page = await BrowserBridge.shared.snapshot(of: .init(id: tabID, url: pending.url ?? "", connection: connection)) {
             context.page = page
@@ -4038,6 +4215,7 @@ final class Agent: ObservableObject {
         let seconds = min(15, max(0, (action["seconds"] as? NSNumber)?.doubleValue ?? 2))
         let deadline = Date().addingTimeInterval(seconds)
         var evidence: String?
+        var urlUnchanged = false
         repeat {
             guard !Task.isCancelled else { return end(line, fail("Stopped")) }
             await refresh(&context)
@@ -4054,11 +4232,16 @@ final class Agent: ObservableObject {
             }
             if let path = action["path"] as? String {
                 evidence = SavedFileEvidence.check(path: path, since: pendingVerification?.startedAt ?? started,
-                                                    contains: action["contains"] as? String)
-            } else if let expected = action["url"] as? String, !expected.isEmpty,
-                      context.page?.url == expected,
-                      pendingVerification == nil || pendingVerification?.url != expected {
-                evidence = "current URL is " + expected
+                                                    contains: action["contains"] as? String,
+                                                    sha256: action["sha256"] as? String,
+                                                    minBytes: (action["min_bytes"] as? NSNumber)?.intValue)
+            } else if let expected = action["url"] as? String, !expected.isEmpty {
+                // An unchanged URL is not evidence that the pending input did anything.
+                switch URLEvidence.evaluate(expected: expected, current: context.page?.url, pendingURL: pendingVerification?.url, hasPending: pendingVerification != nil) {
+                case .confirmed: evidence = "current URL is " + expected
+                case .unchangedSincePending: urlUnchanged = true
+                case .notReached: break
+                }
             } else if let expected = action["value"] as? String, let ref = action["id"] {
                 if Self.isWebRef(ref), let originalPage, let page = context.page,
                    let originalIndex = Self.webIndex(ref), let currentIndex = Self.rematch(originalIndex, from: originalPage, to: page),
@@ -4101,25 +4284,77 @@ final class Agent: ObservableObject {
                     }
                 } else if let app = context.app, let window = context.nativeWindow, window.staleness() == nil {
                     actual = context.elements.map { $0.label + " " + ($0.value ?? "") }.joined(separator: "\n")
-                    if actual?.localizedCaseInsensitiveContains(text) != true {
+                    if actual.map({ VerificationEvidence.appears(text, in: $0) }) != true {
                         actual = await Reader.ocr(app, window: window)
                     }
                 }
-                if actual?.localizedCaseInsensitiveContains(text) == true,
+                if actual.map({ VerificationEvidence.appears(text, in: $0) }) == true,
                    pendingVerification == nil || VerificationEvidence.newText(text, before: pendingVerification?.beforeText, after: actual) {
                     evidence = "new visible confirmation: " + text
                 }
-            } else { return end(line, fail("verify requires text, an exact url, value with id, or a saved-file path")) }
+            } else { return end(line, fail("verify requires text, an exact url, value with id, a saved-file path, visual (after a fresh look) or user_confirms")) }
             if evidence != nil { break }
             if Date() >= deadline { break }
             try? await Task.sleep(for: .milliseconds(250))
         } while true
-        guard let evidence else { return end(line, fail("the expected outcome is not confirmed. Read the current state; do not repeat an uncertain submission.")) }
+        guard let evidence else {
+            if urlUnchanged {
+                return end(line, fail("the URL is still \(action["url"] as? String ?? "") — the same as before the pending input, so it is not evidence that the input did anything. Verify page text, a field value, a saved file, or use visual / user_confirms."))
+            }
+            return end(line, fail("the expected outcome is not confirmed. Read the current state; do not repeat an uncertain submission."))
+        }
         guard TaskStore.shared.confirmAction(taskRecordID, evidence: evidence) else {
             cancel(); return end(line, fail("couldn't persist the verification result"))
         }
         pendingVerification = nil
+        if action["path"] != nil { TaskStore.shared.satisfyRequirement(taskRecordID, kind: .deliverable, evidence: evidence) }
+        if let expected = action["value"] as? String { TaskStore.shared.satisfyRequirement(taskRecordID, kind: .exactValue, matching: expected, evidence: evidence) }
         return end(line, .init(outcome: .confirmed, summary: "CONFIRMED: " + evidence))
+    }
+
+    /// Explicit user resolution of an uncertain effect: the answer is the evidence and its provenance is recorded.
+    private func resolveByUser(_ claim: String) async -> ActionResult {
+        let trimmed = claim.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed.utf8.count <= 400 else { return fail("user_confirms needs a short statement of what should now be true") }
+        let pendingKind = pendingVerification?.kind ?? TaskStore.shared.record(taskRecordID)?.unverifiedAction
+        let reply = await askUser("Clinqy couldn't confirm this itself" + (pendingKind.map { " after \($0)" } ?? "") + ": " + trimmed + " Is that true right now?",
+                                  options: ["Yes, that happened", "No, it did not happen"])
+        guard !Task.isCancelled else { return fail("Stopped") }
+        guard let reply else { return fail("no answer from the user; the outcome is still unverified") }
+        if reply.lowercased().hasPrefix("yes") {
+            guard TaskStore.shared.confirmAction(taskRecordID, evidence: "user confirmed: " + trimmed) else {
+                cancel(); return fail("couldn't persist the verification result")
+            }
+            pendingVerification = nil
+            completionEvidence.record(kind: "verify", outcome: .confirmed)
+            return .init(outcome: .confirmed, summary: "CONFIRMED by the user: " + trimmed)
+        }
+        if reply.lowercased().hasPrefix("no") {
+            // The user reports the effect is absent, so a single retry is no longer a duplicate of an unknown delivery.
+            guard TaskStore.shared.resolveAction(taskRecordID, evidence: "user reported no effect: " + trimmed) else {
+                cancel(); return fail("couldn't persist the verification result")
+            }
+            pendingVerification = nil
+            return fail("the user reports it did NOT happen: " + trimmed + ". The earlier input had no effect; you may try a different approach.")
+        }
+        return fail("the user's answer was not a clear yes or no (\(reply.prefix(80).debugDescription)); the outcome is still unverified")
+    }
+
+    /// A screenshot taken after the pending input can resolve an ordinary UI input whose effect text cannot expose.
+    /// This is recorded as visual-only evidence and never counts as the final completion check.
+    private func resolveByVisual(_ claim: String) -> ActionResult {
+        let trimmed = claim.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed.utf8.count <= 400 else { return fail("visual needs a short description of what the screenshot shows") }
+        guard let pending = pendingVerification else { return fail("nothing is waiting for verification; visual is only for resolving an uncertain input") }
+        guard pending.visualOK else {
+            return fail("\(pending.kind) can't be resolved from a screenshot alone (submissions, scripts, saves, deletions and unknown deliveries need text/url/value/path evidence or user_confirms)")
+        }
+        guard lastVisualAt > pending.startedAt else { return fail("no screenshot has been taken since \(pending.kind); send {\"do\":\"look\"} first and describe only what it shows") }
+        guard TaskStore.shared.confirmAction(taskRecordID, evidence: "visual-only (screenshot after the input): " + trimmed) else {
+            cancel(); return fail("couldn't persist the verification result")
+        }
+        pendingVerification = nil
+        return .init(outcome: .confirmed, summary: "Resolved by screenshot (visual-only, not independent evidence): " + trimmed + ". Verify the final result with text, url, value, path or user_confirms before finishing.")
     }
 
     private func fail(_ why: String) -> ActionResult { .init(ok: false, summary: "FAILED: \(why)") }
@@ -4210,8 +4445,11 @@ final class Agent: ObservableObject {
         if let powerLease { TaskPowerAssertions.shared.end(powerLease); self.powerLease = nil }
         let missingImages = !runDry && text != "Stopped" && deliveredImageOutputs < requiredImageOutputs
         let unresolved = pendingVerification?.kind ?? TaskStore.shared.record(taskRecordID)?.unverifiedAction
-        let text = missingImages ? "Image delivery incomplete (\(deliveredImageOutputs)/\(requiredImageOutputs) acknowledged). " + text : ok && unresolved != nil ? "Outcome needs checking: \(unresolved!). " + text
-            : ok && !runDry && completionEvidence.needsVerification ? "Final task outcome was not independently verified. " + text : text
+        let openNeeds = TaskStore.shared.record(taskRecordID)?.openRequirements.filter { $0.kind == .deliverable && ($0.text.hasPrefix("~") || $0.text.hasPrefix("/")) } ?? []
+        let noted = ok && !runDry && !openNeeds.isEmpty && text != "Stopped"
+            ? text + " (Not evidenced yet: " + openNeeds.prefix(3).map { String($0.text.prefix(60)) }.joined(separator: "; ") + ")" : text
+        let text = missingImages ? "Image delivery incomplete (\(deliveredImageOutputs)/\(requiredImageOutputs) acknowledged). " + noted : ok && unresolved != nil ? "Outcome needs checking: \(unresolved!). " + noted
+            : ok && !runDry && completionEvidence.needsVerification ? "Final task outcome was not independently verified. " + noted : noted
         let ok = ok && !TaskCompletionPolicy.reportsFailure(text) && !missingImages && unresolved == nil && (runDry || !completionEvidence.needsVerification)
         providerOverride = nil
         modelOverride = nil
@@ -4266,6 +4504,7 @@ final class Agent: ObservableObject {
                                  task: continuation.map { $0.task ?? $0.request },
                                  threadID: continuation.map { $0.threadID ?? $0.id }, parentID: continuation?.id,
                                  requiresFreshWork: delegation?.hasJobs == true)) }
+        if !isTest, let problem = History.shared.saveError { log("⚠️ history: " + problem) }
         session = nil
         onFinish(text, ok)
         // Out of steps or stalled on one step isn't the end of the task: carry on by itself (a few times), with the
@@ -4401,7 +4640,7 @@ struct Observation {
             if page.ready == "loading" { text += "\n(The page is still loading.)" }
             if let problem = page.problem { text += "\n(Couldn't read the page: \(problem). Use look and click by position, or read.)" }
         } else if Launcher.isBrowser(app) {
-            text += "\n(Browser extension not connected: page content comes from Accessibility only.)"
+            text += "\n(Foreground browser control: use the Accessibility e-ids above for page controls, or look and screenshot coordinates if needed. Use read for text, open_url for navigation, and key for browser shortcuts. The extension is optional; continue this task without requesting its installation.)"
         }
         return text
     }
@@ -4641,6 +4880,8 @@ extension Agent {
                 }
                 steps.append(Step(text: "Check “\(want.prefix(50))”", state: pass ? .ok : .failed))
                 log("  \(pass ? "✓" : "✗") expect \(want)")
+                // A recorded expectation is a text check on the live screen after the steps before it: independent evidence.
+                if pass { completionEvidence.record(kind: "verify", outcome: .confirmed) }
                 buddy.signal(pass)
                 if qa != nil {
                     qa?.checks.append(.init(text: want, pass: pass, note: pass ? "" : "not visible on screen"))

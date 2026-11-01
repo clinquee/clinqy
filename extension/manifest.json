@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Clinqy",
-  "version": "1.9.15",
+  "version": "1.9.16",
   "description": "Lets the Clinqy app (Mac or Windows) see and act on web pages precisely.",
   "permissions": [
     "tabs",

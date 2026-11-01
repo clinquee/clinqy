@@ -11,6 +11,7 @@ actor CodexAppServer {
     private let prefix: [String]
     private let system: String
     private let model: String
+    private let effort: String?
     private let timeout: TimeInterval
     private let directory: URL
     private var process: Process?
@@ -43,8 +44,8 @@ actor CodexAppServer {
         "in_app_local_automation", "multi_agent", "hooks", "plugin_hooks", "codex_hooks",
         "image_generation", "imagegenext", "memory_tool", "apply_patch_freeform"]
 
-    init(executable: String, arguments: [String] = [], system: String, model: String = "", timeout: TimeInterval = 120) {
-        self.executable = executable; self.prefix = arguments; self.system = system; self.model = model
+    init(executable: String, arguments: [String] = [], system: String, model: String = "", effort: String? = nil, timeout: TimeInterval = 120) {
+        self.executable = executable; self.prefix = arguments; self.system = system; self.model = model; self.effort = effort
         self.timeout = timeout
         directory = FileManager.default.temporaryDirectory.appendingPathComponent("clinqy-codex-session-" + UUID().uuidString)
     }
@@ -75,9 +76,11 @@ actor CodexAppServer {
                     items.append(["type": "image", "url": "data:image/jpeg;base64," + image])
                 }
                 // Empty environments disables shell/filesystem/computer execution, independent of sandbox mode.
-                let reply = try await request("turn/start", ["threadId": threadID, "input": items,
+                var turn: [String: Any] = ["threadId": threadID, "input": items,
                     "environments": [], "approvalPolicy": "untrusted",
-                    "sandboxPolicy": ["type": "readOnly", "networkAccess": false]])
+                    "sandboxPolicy": ["type": "readOnly", "networkAccess": false]]
+                if let effort { turn["effort"] = effort }
+                let reply = try await request("turn/start", turn)
                 guard let turn = reply.value["turn"] as? [String: Any], let id = turn["id"] as? String,
                       turnID == nil || turnID == id else { throw failure("invalid turn identity") }
                 turnID = id

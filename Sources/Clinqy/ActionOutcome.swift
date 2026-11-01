@@ -47,7 +47,29 @@ enum VerificationEvidence {
 
     static func newText(_ expected: String, before: String?, after: String?) -> Bool {
         guard !expected.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, let before, let after else { return false }
-        return !before.localizedCaseInsensitiveContains(expected) && after.localizedCaseInsensitiveContains(expected)
+        return !appears(expected, in: before) && appears(expected, in: after)
+    }
+
+    /// Case-insensitive match that does not count a word fragment: "Paid" is not on a page that only says "unpaid",
+    /// and "Order" is not "Orders". Punctuation and symbols at the edges of `expected` still match as written.
+    static func appears(_ expected: String, in haystack: String) -> Bool {
+        // Code editors and rich pages use non-breaking spaces and uneven runs of whitespace for ordinary spaces.
+        func normalized(_ text: String) -> String {
+            text.replacingOccurrences(of: "\u{00A0}", with: " ").split(whereSeparator: { $0 == " " || $0 == "\t" }).joined(separator: " ")
+        }
+        let needle = normalized(expected.trimmingCharacters(in: .whitespacesAndNewlines))
+        let haystack = normalized(haystack)
+        guard !needle.isEmpty else { return false }
+        func isWord(_ c: Character) -> Bool { c.isLetter || c.isNumber }
+        let wantsLeading = needle.first.map(isWord) ?? false, wantsTrailing = needle.last.map(isWord) ?? false
+        var from = haystack.startIndex
+        while let range = haystack.range(of: needle, options: [.caseInsensitive, .diacriticInsensitive], range: from..<haystack.endIndex) {
+            let leftOK = !wantsLeading || range.lowerBound == haystack.startIndex || !isWord(haystack[haystack.index(before: range.lowerBound)])
+            let rightOK = !wantsTrailing || range.upperBound == haystack.endIndex || !isWord(haystack[range.upperBound])
+            if leftOK && rightOK { return true }
+            from = haystack.index(after: range.lowerBound)
+        }
+        return false
     }
 }
 
@@ -74,4 +96,11 @@ enum TaskCompletionPolicy {
         if text.range(of: #"(?is)\b(no|not|don't|do not|without)\b.{0,40}\b(doc|document|write[ -]?up|report)\b"#, options: .regularExpression) != nil { return false }
         return text.range(of: #"(?is)\b(create|make|write|prepare|document|paste|put|add|insert)\b.{0,100}\b(doc|document|report|guide|write[ -]?up)\b"#, options: .regularExpression) != nil
     }
+}
+
+/// How a returned or thrown low-level input maps to an outcome. A failure to report is never success, and a Return
+/// whose delivery is unknown is never replayed blindly (it is `.uncertain`, which holds the repeat barrier).
+enum InputDelivery {
+    static func pageScroll(error: Error?) -> ActionOutcome { error == nil ? .confirmed : .failed }
+    static func returnPress(delivered: Bool) -> ActionOutcome { delivered ? .unverified : .uncertain }
 }

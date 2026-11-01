@@ -57,10 +57,22 @@ final class FastLane {
     /// Who answered the last turn, for the log: "fast · ", "lead ← fast (why) · ", or "".
     private(set) var tag = ""
 
-    init(intro: String, leadModel: String) {
+    /// The lead's provider: the helper runs on it too (a per-task provider override must not be silently dropped).
+    private let provider: Provider
+
+    /// `provider` is the lead session's. Names are compared as the provider resolves them, so a helper that would
+    /// land on the very same model as the lead (Codex picks its own default for both) is not a helper at all.
+    init(intro: String, leadModel: String, provider: Provider = Provider.current) {
         self.intro = intro
+        self.provider = provider
         let fast = Self.model
-        model = fast == leadModel ? nil : fast
+        if let fast, fast == leadModel || provider.model(fast) == provider.model(leadModel) { model = nil } else { model = fast }
+    }
+
+    /// The helper's identity, for the log: nil when the helper is off.
+    var helperRoute: String? {
+        guard let model else { return nil }
+        return "fast helper: provider=\(provider.rawValue) requested=\(model) model=\(provider.model(model).isEmpty ? "(cli default)" : provider.model(model)) role=helper"
     }
 
     /// Appended to the lead's first message: how to hand routine steps off (empty when off).
@@ -127,7 +139,7 @@ final class FastLane {
         guard let model, let plan else { return nil }
         await briefing?.value
         briefing = nil
-        if session?.isAlive != true { session = try? AgySession(system: Self.system, model: model); briefed = false }
+        if session?.isAlive != true { session = try? AgySession(system: Self.system, model: model, provider: provider); briefed = false }
         var text = ""
         if !briefed {
             text += "The lead's context for this task:\n\(intro)\n\n"
@@ -141,7 +153,7 @@ final class FastLane {
         text += turnText + Self.jsonOnly
         let reply: String
         do {
-            if session?.isAlive != true { session = try AgySession(system: Self.system, model: model) }
+            if session?.isAlive != true { session = try AgySession(system: Self.system, model: model, provider: provider) }
             guard let s = session else { return nil }
             reply = try await withTaskCancellationHandler { try await s.send(text, image: image) } onCancel: { s.close() }
         } catch {
@@ -246,7 +258,7 @@ final class FastLane {
     /// message: read cold, the briefing made that turn ~3 s slower than the rest.
     private func warm() {
         guard let model else { return }
-        if session?.isAlive != true { session = try? AgySession(system: Self.system, model: model); briefed = false }
+        if session?.isAlive != true { session = try? AgySession(system: Self.system, model: model, provider: provider); briefed = false }
         guard !briefed, briefing == nil, let s = session else { return }
         briefed = true
         let text = "The lead's context for this task:\n\(intro)\n\nNo steps for you yet; reply {\"say\":\"ready\",\"actions\":[]}."

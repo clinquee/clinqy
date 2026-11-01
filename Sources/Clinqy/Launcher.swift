@@ -3,7 +3,7 @@ import AppKit
 /// Opening and focusing apps and URLs.
 @MainActor
 enum Launcher {
-    static let browserIDs: Set<String> = [
+    nonisolated static let browserIDs: Set<String> = [
         "company.thebrowser.Browser", "com.google.Chrome", "com.apple.Safari", "org.mozilla.firefox",
         "com.brave.Browser", "com.microsoft.edgemac", "company.thebrowser.dia",
     ]
@@ -19,7 +19,7 @@ enum Launcher {
         return AXEngine.focusSummary(of: app).window
     }
 
-    static func isBrowser(_ app: NSRunningApplication) -> Bool { browserIDs.contains(app.bundleIdentifier ?? "") }
+    nonisolated static func isBrowser(_ app: NSRunningApplication) -> Bool { browserIDs.contains(app.bundleIdentifier ?? "") }
 
     /// A copy of a browser another tool drives (Playwright, Puppeteer, a test runner): a throwaway profile with no
     /// extensions, under a debugging pipe or port. Not the user's browser, so Clinqy neither works in it nor moves it.
@@ -78,6 +78,33 @@ enum Launcher {
             try? await Task.sleep(for: .milliseconds(100))
         }
         return app
+    }
+
+    /// What is actually true of an app right now. "Launched" and "ready to be driven" are different claims, so callers
+    /// report each one rather than assuming the app is frontmost with a usable window.
+    struct Readiness: Equatable {
+        var running: Bool
+        var frontmost: Bool
+        var windows: Int
+        var accessible: Bool
+        /// Frontmost with a window and an accessibility tree: input can be aimed at it.
+        var ready: Bool { running && frontmost && windows > 0 && accessible }
+        var summary: String {
+            if !running { return "is not running" }
+            var gaps: [String] = []
+            if !frontmost { gaps.append("not frontmost") }
+            if windows == 0 { gaps.append("no window yet") }
+            if !accessible { gaps.append("accessibility tree not readable yet") }
+            return gaps.isEmpty ? "is frontmost with a window" : "was opened but is " + gaps.joined(separator: ", ")
+        }
+    }
+
+    static func readiness(of app: NSRunningApplication) -> Readiness {
+        let running = !app.isTerminated
+        let frontmost = NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier
+        let windows = running ? AXEngine.windows(of: app).count : 0
+        let accessible = running && AXEngine.elements(of: app, limit: 5, menuBar: true).count > 1
+        return Readiness(running: running, frontmost: frontmost, windows: windows, accessible: accessible)
     }
 
     static func bringToFront(_ app: NSRunningApplication) async {

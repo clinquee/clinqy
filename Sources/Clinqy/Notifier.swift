@@ -11,16 +11,13 @@ enum Notifier {
     static var onOpen: (_ question: Bool) -> Void = { _ in }
 
     private static let delegate = Delegate()
-    nonisolated fileprivate static let questionID = "clinqy.question"
-    /// The options of the question on show, by action id.
-    private static var options: [String: String] = [:]
+    /// Which question is on show and the options it was issued with; responses resolve through it by notification id.
+    private static var ledger = NotificationLedger()
 
     static func start() {
         UNUserNotificationCenter.current().delegate = delegate
     }
 
-    /// The link of the last "Done" notification's result, for its Open button.
-    private static var link: URL?
     /// Every category in use: setting them replaces the whole set, so a question's never drops "Done"'s.
     private static var categories: [String: UNNotificationCategory] = [:]
 
@@ -34,7 +31,9 @@ enum Notifier {
         content.body = ([String(answer.prefix(items.isEmpty ? 240 : 140))] + items).joined(separator: "\n")
         content.sound = .default
         content.threadIdentifier = "clinqy.done"
-        link = result?.items.lazy.compactMap { $0.link.flatMap(URL.init(string:)) }.first
+        // The link rides with its own notification, so a later "Done" can't redirect this one's Open button.
+        let link = result?.items.lazy.compactMap { $0.link.flatMap(URL.init(string:)) }.first
+        if let link { content.userInfo = ["link": link.absoluteString] }
         var actions = [UNNotificationAction(identifier: "show", title: "Show me", options: [.foreground]),
                        UNNotificationAction(identifier: "bring", title: "Bring it here", options: [.foreground])]
         if link != nil { actions.append(UNNotificationAction(identifier: "link", title: "Open link", options: [.foreground])) }
@@ -59,14 +58,10 @@ enum Notifier {
         content.title = "Clinqy needs you"
         content.body = String(text.prefix(240))
         content.sound = .default
-        self.options = [:]
-        var actions: [UNNotificationAction] = []
+        let previous = ledger.liveID
+        let issued = ledger.issue(options: options, sensitive: sensitive)
+        var actions = issued.actions.map { UNNotificationAction(identifier: $0.id, title: $0.title, options: []) as UNNotificationAction }
         if !sensitive {
-            for (i, option) in options.prefix(4).enumerated() {
-                let id = "option.\(i)"
-                self.options[id] = option
-                actions.append(UNNotificationAction(identifier: id, title: String(option.prefix(40)), options: []))
-            }
             actions.append(UNTextInputNotificationAction(identifier: "reply", title: options.isEmpty ? "Reply" : "Something else…",
                                                          options: [], textInputButtonTitle: "Send", textInputPlaceholder: "Your answer"))
         }
@@ -74,15 +69,18 @@ enum Notifier {
         let category = UNNotificationCategory(identifier: "clinqy.q.\(UUID().uuidString)", actions: actions, intentIdentifiers: [], options: [])
         register(category)
         content.categoryIdentifier = category.identifier
-        post(questionID, content)
+        UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: previous.map { [$0] } ?? [])
+        post(issued.id, content)
     }
 
     /// The question was answered (here or in Clinqy): its notification goes.
     static func clearQuestion() {
-        options = [:]
+        let live = ledger.liveID
+        ledger.clear()
+        guard let live else { return }
         let center = UNUserNotificationCenter.current()
-        center.removeDeliveredNotifications(withIdentifiers: [questionID])
-        center.removePendingNotificationRequests(withIdentifiers: [questionID])
+        center.removeDeliveredNotifications(withIdentifiers: [live])
+        center.removePendingNotificationRequests(withIdentifiers: [live])
     }
 
     private static func post(_ id: String, _ content: UNMutableNotificationContent) {
@@ -97,19 +95,19 @@ enum Notifier {
         }
     }
 
-    fileprivate static func respond(action: String, typed: String?, question: Bool) {
+    fileprivate static func respond(notificationID: String, action: String, typed: String?, link: String?) {
         switch action {
-        case "reply":
-            if let typed, !typed.trimmingCharacters(in: .whitespaces).isEmpty { onAnswer(typed) } else { onOpen(true) }
-        case let id where options[id] != nil:
-            onAnswer(options[id]!)
         case "bring":
             AgentScreen.bringHere()
             Task { await Background.showLast() }
         case "link":
-            if let link { NSWorkspace.shared.open(link) }
+            if let link, let url = URL(string: link) { NSWorkspace.shared.open(url) }
         default:
-            onOpen(question)
+            switch ledger.resolve(notificationID: notificationID, action: action, typed: typed) {
+            case .answer(let text): onAnswer(text)
+            case .open(let question): onOpen(question)
+            case .stale: Agent.writeLog("notification response ignored: its question is no longer open")
+            }
         }
     }
 
@@ -124,9 +122,10 @@ enum Notifier {
                                     withCompletionHandler done: @escaping () -> Void) {
             let action = response.actionIdentifier
             let typed = (response as? UNTextInputNotificationResponse)?.userText
-            let question = response.notification.request.identifier == Notifier.questionID
+            let id = response.notification.request.identifier
+            let link = response.notification.request.content.userInfo["link"] as? String
             DispatchQueue.main.async {
-                Notifier.respond(action: action, typed: typed, question: question)
+                Notifier.respond(notificationID: id, action: action, typed: typed, link: link)
                 done()
             }
         }

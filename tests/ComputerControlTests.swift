@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 @main struct ComputerControlTests {
     static func main() throws {
@@ -114,6 +115,107 @@ import Foundation
         check(!TaskCompletionPolicy.requestsWriteUp("Send it on WhatsApp\n\nPrevious Telegram task: Create a doc and paste screenshots"), "follow-up context cannot force a new write-up")
         check(TaskCompletionPolicy.requestsWriteUp("Create a guide with the screenshots in a Google Doc"), "actual write-up still requires screenshot insertion")
         check(!TaskCompletionPolicy.requestsWriteUp("Do not create a document; send the screenshot"), "explicit no-document request respected")
+        // --- Action contract: arguments the dispatcher would ignore must never change classification ---
+        func classified(_ action: [String: Any]) -> Bool {
+            var evidence = CompletionEvidence()
+            evidence.record(kind: action["do"] as! String, outcome: .confirmed, op: action["op"] as? String ?? "")
+            return evidence.needsVerification
+        }
+        check(classified(["do": "type", "id": "w1", "text": "x"]), "ordinary type dirties completion evidence")
+        check(classified(["do": "type", "id": "w1", "text": "x", "op": "list"]), "type with unrelated op still dirties evidence")
+        check(classified(["do": "shell", "cmd": "touch a", "op": "info"]), "shell with op:info still dirties evidence")
+        check(classified(["do": "click", "id": "w1", "op": "check"]), "click with op:check still dirties evidence")
+        check(!classified(["do": "pdf", "op": "info", "files": ["a.pdf"]]), "pdf info really is read only")
+        check(classified(["do": "pdf", "op": "compress", "files": ["a.pdf"]]), "pdf compress is a mutation")
+        check(ActionContract.validate(["do": "type", "id": "w1", "text": "x", "op": "list"]) != nil, "type rejects unused op")
+        check(ActionContract.validate(["do": "shell", "cmd": "ls", "op": "info"]) != nil, "shell rejects unused op")
+        check(ActionContract.validate(["do": "type", "id": "w1", "text": "x"]) == nil, "valid type accepted")
+        check(ActionContract.validate(["do": "click", "id": "w1", "x": 1, "y": 2]) != nil, "click with two target modes rejected")
+        check(ActionContract.validate(["do": "click", "id": "w1", "label": "hi"]) != nil, "click rejects unknown argument")
+        check(ActionContract.validate(["do": "application", "op": "delete", "company": "X"]) != nil, "unknown application op rejected")
+        check(ActionContract.validate(["do": "application", "op": "record", "company": "X", "role": "Y"]) == nil, "application record accepted")
+        check(ActionContract.validate(["do": "scroll", "dir": "sideways"]) != nil, "unknown scroll direction rejected")
+        check(ActionContract.validate(["do": "scroll"]) != nil, "missing scroll direction rejected")
+        check(ActionContract.validate(["do": "scroll", "dir": "UP"]) == nil, "scroll direction is case-insensitive")
+        check(ActionContract.validate(["do": "window", "op": "fullscreen", "on": "no"]) != nil, "malformed fullscreen on rejected")
+        check(ActionContract.validate(["do": "window", "op": "fullscreen", "on": false]) == nil, "boolean fullscreen on accepted")
+        check(ActionContract.validate(["do": "window", "op": "resize", "w": 1, "h": 2, "on": true]) != nil, "on only applies to fullscreen")
+        check(ActionContract.validate(["do": "verify", "text": "Done", "path": "/tmp/a.txt"]) != nil, "verify with two predicates rejected")
+        check(ActionContract.validate(["do": "verify", "url": "https://a", "text": "x"]) != nil, "verify url+text rejected")
+        check(ActionContract.validate(["do": "verify", "id": "w1", "value": "v", "text": "x"]) != nil, "verify value+text rejected")
+        check(ActionContract.validate(["do": "verify", "path": "/tmp/a", "contains": "x"]) == nil, "verify path+contains is one predicate")
+        check(ActionContract.validate(["do": "verify", "id": "w1", "value": "v"]) == nil, "verify field value accepted")
+        check(ActionContract.validate(["do": "verify", "value": "v"]) != nil, "verify value needs an id")
+        check(ActionContract.validate(["do": "verify", "user_confirms": "uploaded"]) == nil, "verify user_confirms is a single predicate")
+        check(ActionContract.validate(["do": "verify"]) != nil, "verify needs a predicate")
+        // --- Exact value before submit ---
+        check(SubmitReadback.allows(expected: "hello", actual: "hello"), "exact value may submit")
+        check(!SubmitReadback.allows(expected: "hello", actual: "hello!"), "changed value must not submit")
+        check(!SubmitReadback.allows(expected: "hello", actual: nil), "unreadable value must not submit")
+        check(SubmitReadback.allows(expected: "secret", actual: nil, unreadable: true), "secure field cannot be read back and is not blocked on that alone")
+        // --- Typed artifact verification ---
+        let artifacts = FileManager.default.temporaryDirectory.appendingPathComponent("clinqy-artifacts-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: artifacts, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: artifacts) }
+        let since = Date().addingTimeInterval(-5)
+        let goodJSON = artifacts.appendingPathComponent("a.json"), badJSON = artifacts.appendingPathComponent("b.json")
+        try "{\"a\": 1}".write(to: goodJSON, atomically: true, encoding: .utf8)
+        try "{\"a\": ".write(to: badJSON, atomically: true, encoding: .utf8)
+        check(SavedFileEvidence.check(path: goodJSON.path, since: since) != nil, "valid JSON artifact verified")
+        check(SavedFileEvidence.check(path: badJSON.path, since: since) == nil, "truncated JSON artifact refused")
+        let goodCSV = artifacts.appendingPathComponent("a.csv"), mergedCSV = artifacts.appendingPathComponent("b.csv"), quotedCSV = artifacts.appendingPathComponent("c.csv")
+        try "a,b\n1,2\n".write(to: goodCSV, atomically: true, encoding: .utf8)
+        try "a,b\n1,2 3,4,5\n".write(to: mergedCSV, atomically: true, encoding: .utf8)
+        try "a,b\n\"x,y\",\"line\nbreak\"\n".write(to: quotedCSV, atomically: true, encoding: .utf8)
+        check(SavedFileEvidence.check(path: goodCSV.path, since: since) != nil, "rectangular CSV verified")
+        check(SavedFileEvidence.check(path: mergedCSV.path, since: since) == nil, "ragged CSV (merged records) refused")
+        check(SavedFileEvidence.check(path: quotedCSV.path, since: since) != nil, "quoted CSV fields with delimiters and newlines stay rectangular")
+        let pdf = artifacts.appendingPathComponent("a.pdf"), cutPDF = artifacts.appendingPathComponent("b.pdf")
+        try "%PDF-1.4\n1 0 obj\n<<>>\nendobj\ntrailer\n%%EOF\n".write(to: pdf, atomically: true, encoding: .utf8)
+        try "%PDF-1.4\n1 0 obj\n<<>>\n".write(to: cutPDF, atomically: true, encoding: .utf8)
+        check(SavedFileEvidence.check(path: pdf.path, since: since) != nil, "complete PDF verified")
+        check(SavedFileEvidence.check(path: cutPDF.path, since: since) == nil, "truncated PDF refused")
+        let report = SavedFileEvidence.check(path: goodJSON.path, since: since) ?? ""
+        check(report.contains("bytes") && report.contains("sha256") == false, "report includes size")
+        let digest = SHA256.hash(data: Data("{\"a\": 1}".utf8)).map { String(format: "%02x", $0) }.joined()
+        check(SavedFileEvidence.check(path: goodJSON.path, since: since, sha256: digest) != nil, "matching sha256 verified")
+        check(SavedFileEvidence.check(path: goodJSON.path, since: since, sha256: String(repeating: "0", count: 64)) == nil, "wrong sha256 refused")
+        check(SavedFileEvidence.check(path: goodJSON.path, since: since, minBytes: 1000) == nil, "too-small artifact refused")
+        // --- A: unresolved input is carried; visual route is limited ---
+        var carried = CompletionEvidence()
+        carried.markUnverifiedCarryover()
+        check(carried.needsVerification, "an unresolved input from an earlier segment keeps the goal unverified")
+        carried.record(kind: "verify", outcome: .confirmed)
+        check(!carried.needsVerification, "an explicit confirmed verify clears it")
+        // --- B: valid url verify shape is not reported as malformed ---
+        check(ActionContract.validate(["do": "verify", "url": "https://example.com/lab"]) == nil, "url-only verify is a well-formed request")
+        check(URLEvidence.evaluate(expected: "https://a/b", current: "https://a/b", pendingURL: "https://a/b", hasPending: true) == .unchangedSincePending,
+              "unchanged URL is reported as unchanged, not as a malformed verify")
+        check(URLEvidence.evaluate(expected: "https://a/b", current: "https://a/b", pendingURL: "https://a/", hasPending: true) == .confirmed, "navigated URL confirms")
+        check(URLEvidence.evaluate(expected: "https://a/b", current: "https://a/b", pendingURL: nil, hasPending: false) == .confirmed, "no pending input: current URL confirms")
+        check(URLEvidence.evaluate(expected: "https://a/b", current: "https://c", pendingURL: "https://a/", hasPending: true) == .notReached, "different URL is not reached")
+        struct BridgeDown: Error {}
+        check(InputDelivery.pageScroll(error: BridgeDown()).status == .failed && !InputDelivery.pageScroll(error: BridgeDown()).isConfirmed, "a thrown page scroll never reports success")
+        check(InputDelivery.pageScroll(error: nil).isConfirmed, "a completed page scroll is confirmed")
+        check(InputDelivery.returnPress(delivered: false) == .uncertain && InputDelivery.returnPress(delivered: false).needsVerification, "an undelivered Return is uncertain and blocks replay")
+        check(InputDelivery.returnPress(delivered: true) == .unverified, "a delivered Return still needs an application outcome")
+        // --- Desktop options are validated, never ignored ---
+        check(ActionContract.validate(["do": "click", "x": 1, "y": 2, "button": "right", "count": 2, "modifiers": ["cmd"], "duration_ms": 200]) == nil, "click options accepted")
+        check(ActionContract.validate(["do": "click", "id": "e1", "button": "side"]) != nil, "unknown button refused")
+        check(ActionContract.validate(["do": "click", "id": "e1", "count": 9]) != nil, "bad count refused")
+        check(ActionContract.validate(["do": "hover", "id": "e1", "button": "right"]) != nil, "click options on another action refused")
+        check(ActionContract.validate(["do": "scroll", "dir": "left", "unit": "pixels", "amount": 300]) == nil, "native scroll options accepted")
+        check(ActionContract.validate(["do": "scroll", "dir": "down", "unit": "pages"]) != nil, "unit without amount refused")
+        check(ActionContract.validate(["do": "scroll", "dir": "up", "direction": "down"]) != nil, "dir and direction together refused")
+        check(ActionContract.validate(["do": "type", "id": "e1", "text": "x", "mode": "insert"]) == nil, "type insert accepted")
+        check(ActionContract.validate(["do": "type", "id": "e1", "text": "x", "mode": "insert", "submit": true]) != nil, "insert cannot submit")
+        check(ActionContract.validate(["do": "type", "id": "e1", "text": "x", "mode": "splice"]) != nil, "unknown mode refused")
+        check(ActionContract.validate(["do": "set_state", "id": "e4", "state": "on"]) == nil, "set_state accepted")
+        check(ActionContract.validate(["do": "set_state", "state": "on"]) != nil, "set_state needs id")
+        check(classified(["do": "set_state", "id": "e4", "state": "on"]), "set_state dirties completion evidence")
+        check(ControlProtocol.validate(["do": "click", "x": 1, "y": 2, "button": "right"]) == nil, "direct click options accepted")
+        check(ControlProtocol.validate(["do": "scroll", "dir": "up", "button": "right"]) != nil, "direct click options only on click")
+        check(ControlProtocol.validate(["do": "scroll", "direction": "right", "unit": "lines", "amount": 5]) == nil, "direct scroll options accepted")
         print("PASS \(checks) gesture, ownership, replay refusal, vision and final artifact checks")
     }
 }

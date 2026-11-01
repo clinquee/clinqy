@@ -3,18 +3,40 @@
 const URL_ = "ws://127.0.0.1:47823";
 // This script's own version, kept equal to manifest.json's. Chrome can keep running an older copy of the worker after
 // a reload (the manifest is re-read, the script isn't), so the app checks this one, not the manifest's.
-const SCRIPT_VERSION = "1.9.15";
+const SCRIPT_VERSION = "1.9.16";
 let socket = null;
 let retry = 1000;
 // A snapshot must not overwrite index maps while an earlier action is resolving its target.
 const commandQueues = new Map();
-function serializedHandle(msg) {
+// Every connection to the app gets an epoch. Work received on one is answered on that same socket only, and work
+// still queued when it closes never dispatches: a replacement socket must not carry a retired request's result.
+let connectionEpoch = 0;
+// Requests the app gave up on (timeout/cancel) before they started running. Bounded; entries are tiny.
+const cancelledIDs = new Set();
+const runningIDs = new Set();
+const NOT_DISPATCHED = "cancelled before dispatch";
+function markCancelled(id) {
+  if (typeof id !== "string" || runningIDs.has(id)) return false;   // already running: its outcome is reported, never undone
+  cancelledIDs.add(id);
+  if (cancelledIDs.size > 500) cancelledIDs.delete(cancelledIDs.values().next().value);
+  return true;
+}
+function serializedHandle(msg, origin = {}) {
   // Snapshot/index mutations serialize within a tab. Different tabs can wait/read/act concurrently.
   // Creation and shared extension lifecycle/storage operations retain their own management lane.
   const tabScoped = msg.tabId != null && !["clinqyDone", "clinqyClear", "newTab", "clinqyTab", "reload"].includes(msg.cmd);
   const key = tabScoped ? `tab:${msg.tabId}` : "management";
   const previous = commandQueues.get(key) || Promise.resolve();
-  const next = previous.then(() => handle(msg));
+  const receivedAt = Date.now();
+  const ttl = Number(msg.ttlMs) > 0 ? Number(msg.ttlMs) : null;
+  const next = previous.then(() => {
+    // The decision to run happens here, at dispatch, not at receipt: time spent behind earlier commands counts.
+    if (msg.id != null && cancelledIDs.delete(msg.id)) throw new Error(NOT_DISPATCHED + ": the app stopped waiting for it");
+    if (origin.epoch != null && origin.epoch !== connectionEpoch) throw new Error(NOT_DISPATCHED + ": its connection was replaced");
+    if (ttl != null && Date.now() - receivedAt > ttl) throw new Error(NOT_DISPATCHED + ": it expired while queued");
+    if (msg.id != null) runningIDs.add(msg.id);
+    return handle(msg).finally(() => { if (msg.id != null) runningIDs.delete(msg.id); });
+  });
   const tail = next.catch(() => {});
   commandQueues.set(key, tail);
   void tail.then(() => { if (commandQueues.get(key) === tail) commandQueues.delete(key); });
@@ -23,24 +45,32 @@ function serializedHandle(msg) {
 
 function connect() {
   if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) return;
-  try { socket = new WebSocket(URL_); } catch { return; }
-  socket.onopen = () => {
+  let ws;
+  try { ws = new WebSocket(URL_); } catch { return; }
+  socket = ws;
+  const epoch = ++connectionEpoch;
+  // Replies go out on the socket the request arrived on, and only while it is still the current connection.
+  const reply = (obj) => { if (ws === socket && epoch === connectionEpoch && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj)); };
+  ws.onopen = () => {
     retry = 1000;
-    send({ type: "hello", agent: navigator.userAgent, version: SCRIPT_VERSION, manifest: chrome.runtime.getManifest().version });
+    reply({ type: "hello", agent: navigator.userAgent, version: SCRIPT_VERSION, manifest: chrome.runtime.getManifest().version });
   };
-  socket.onmessage = async (event) => {
+  ws.onmessage = async (event) => {
     let msg;
     try { msg = JSON.parse(event.data); } catch { return; }
+    if (msg.type === "cancel") { markCancelled(msg.id); return; }
     if (!msg.id) return;
     try {
-      send({ id: msg.id, ok: true, result: await serializedHandle(msg) });
+      reply({ id: msg.id, ok: true, result: await serializedHandle(msg, { epoch }) });
     } catch (err) {
-      send({ id: msg.id, ok: false, error: String(err && err.message || err) });
+      reply({ id: msg.id, ok: false, error: String(err && err.message || err) });
     }
   };
   // Back quickly when the app restarts or Chrome wakes the worker (1 s, doubling to 10 s).
-  socket.onclose = () => { queueActivity(() => clinqyDone()); socket = null; setTimeout(connect, retry); retry = Math.min(retry * 2, 10000); };
-  socket.onerror = () => {};
+  ws.onclose = () => {
+    if (ws === socket) { socket = null; queueActivity(() => clinqyDone()); setTimeout(connect, retry); retry = Math.min(retry * 2, 10000); }
+  };
+  ws.onerror = () => {};
 }
 
 function send(obj) {
@@ -189,54 +219,110 @@ const samePage = (a, b) => {
   try { const x = new URL(a), y = new URL(b); return x.origin === y.origin && x.pathname === y.pathname; } catch { return false; }
 };
 
+// Local coordinates of a frame → the top page's, through the frame's accumulated placement (offset and CSS scale).
+const toTop = (o, x, y) => ({ x: o.x + x * (o.sx || 1), y: o.y + y * (o.sy || 1) });
+
+// Which frame is behind each visible <iframe> box. Deterministic when the browser names it (runtime.getFrameId, the
+// box's frameId); URL/size matching is only the fallback for boxes without one, and only when it is unambiguous.
+function associateFrames(boxes, subs, claimed) {
+  const matches = [];
+  const free = [];
+  for (const box of boxes) {
+    const sub = box.frameId != null ? subs.get(box.frameId) : null;
+    if (sub && !claimed.has(box.frameId)) { claimed.add(box.frameId); matches.push({ box, frameId: box.frameId, sub }); }
+    else free.push(box);
+  }
+  const unplaced = free.filter((b) => b.frameId == null);
+  for (const [frameId, sub] of subs) {
+    if (claimed.has(frameId) || !unplaced.length) continue;
+    const addressed = unplaced.filter((f) => f.src && samePage(f.src, sub.url));
+    let box = addressed.length === 1 ? addressed[0] : null;
+    if (!box) {
+      const sized = unplaced.filter((f) => Math.abs(f.w - sub.viewport.w) <= 2 && Math.abs(f.h - sub.viewport.h) <= 2);
+      if (sized.length === 1) box = sized[0];
+    }
+    if (!box) continue;
+    unplaced.splice(unplaced.indexOf(box), 1);
+    free.splice(free.indexOf(box), 1);
+    claimed.add(frameId);
+    matches.push({ box, frameId, sub });
+  }
+  return { matches, unmatched: free };
+}
+
 async function snapshot(tab) {
   const top = await call(tab.id, 0, "snapshot");
   const list = top.elements.map((e) => ({ key: e.key, frameId: 0, local: e.i, e }));
   if (!top.documentID || !top.snapshotID) throw new Error("update browser page helpers before acting");
   const frameBoxes = {};
   const frameTokens = { 0: { documentID: top.documentID, snapshotID: top.snapshotID } };
-  const offsets = { 0: { x: 0, y: 0 } };
+  const offsets = { 0: { x: 0, y: 0, sx: 1, sy: 1 } };
+  const coverage = [];   // frames that exist on the page but are not part of this observation, and why
   const elements = top.elements;
   const extraText = [];
   if (top.frames && top.frames.length) {
-    const subs = (await callAll(tab.id, "snapshot", [{ excludeTop: true }])).filter((s) => s.frameId !== 0 && /^https?:/.test(s.result.url || ""));
-    const free = [...top.frames];
-    for (const { frameId, result: sub } of subs) {
-      // Which visible frame box is this page? Same address, or (failing that) the only one of exactly its size.
-      const addressed = free.map((f, j) => [f, j]).filter(([f]) => f.src && samePage(f.src, sub.url));
-      let k = addressed.length === 1 ? addressed[0][1] : -1;
-      if (k < 0) {
-        const sized = free.map((f, j) => [f, j]).filter(([f]) => Math.abs(f.w - sub.viewport.w) <= 2 && Math.abs(f.h - sub.viewport.h) <= 2);
-        if (sized.length === 1) k = sized[0][1];
+    const subs = new Map((await callAll(tab.id, "snapshot", [{ excludeTop: true }]))
+      .filter((s) => s.frameId !== 0 && /^https?:/.test(s.result.url || "")).map((s) => [s.frameId, s.result]));
+    const claimed = new Set();
+    const queue = [{ parent: 0, boxes: top.frames, origin: offsets[0], depth: 1 }];
+    while (queue.length) {
+      const { parent, boxes, origin, depth } = queue.shift();
+      const { matches, unmatched } = associateFrames(boxes, subs, claimed);
+      for (const box of unmatched) {
+        let host = "frame"; try { host = new URL(box.src).hostname || host; } catch {}
+        coverage.push({ frame: host, src: box.src || "", status: "unreadable",
+                        reason: box.src && !/^https?:/.test(box.src) ? "not an http(s) page" : "the extension could not run in it or could not tell which page it shows" });
       }
-      if (k < 0) continue;
-      const f = free.splice(k, 1)[0];
-      if (!sub.documentID || !sub.snapshotID) continue;
-      frameTokens[frameId] = { documentID: sub.documentID, snapshotID: sub.snapshotID };
-      frameBoxes[frameId] = f;
-      offsets[frameId] = { x: f.x, y: f.y };
-      let host = "frame";
-      try { host = new URL(sub.url).hostname; } catch {}
-      for (const e of sub.elements) {
-        const x = e.x + f.x, y = e.y + f.y;
-        if (y + e.h < 0 || y > top.viewport.h || x + e.w < 0 || x > top.viewport.w) continue;
-        const moved = { ...e, x, y, frame: host };
-        elements.push(moved);
-        list.push({ key: e.key != null ? frameId + "|" + sub.documentID + "|" + e.key : null, frameId, local: e.i, e: moved });
+      for (const { box, frameId, sub } of matches) {
+        let host = "frame";
+        try { host = new URL(sub.url).hostname; } catch {}
+        if (!sub.documentID || !sub.snapshotID) { coverage.push({ frame: host, src: sub.url, status: "unreadable", reason: "its page helper is out of date" }); continue; }
+        if (box.rotated) { coverage.push({ frame: host, src: sub.url, status: "unreadable", reason: "the frame is rotated or skewed by CSS, so its coordinates cannot be placed" }); continue; }
+        if (depth > 4) { coverage.push({ frame: host, src: sub.url, status: "unreadable", reason: "nested too deeply" }); continue; }
+        const sx = origin.sx * (box.sx || 1), sy = origin.sy * (box.sy || 1);
+        const placed = toTop(origin, box.x, box.y);
+        const here = { x: placed.x, y: placed.y, sx, sy };
+        frameTokens[frameId] = { documentID: sub.documentID, snapshotID: sub.snapshotID };
+        frameBoxes[frameId] = { ...box, parent };   // raw, in the parent's own coordinates: re-checked live before input
+        offsets[frameId] = here;
+        for (const e of sub.elements) {
+          const p = toTop(here, e.x, e.y), w = e.w * sx, h = e.h * sy;
+          if (p.y + h < 0 || p.y > top.viewport.h || p.x + w < 0 || p.x > top.viewport.w) continue;
+          const moved = { ...e, x: p.x, y: p.y, w, h, frame: host };
+          elements.push(moved);
+          list.push({ key: e.key != null ? frameId + "|" + sub.documentID + "|" + e.key : null, frameId, local: e.i, e: moved });
+        }
+        top.messages = (top.messages || []).concat(sub.messages || []);
+        if (sub.text) extraText.push(`[${host}] ${sub.text}`);
+        top.below = (top.below || 0) + (sub.below || 0);
+        top.above = (top.above || 0) + (sub.above || 0);
+        if (sub.panes && sub.panes.length) top.panes = (top.panes || []).concat(sub.panes.map((p) => ({ ...p, frame: host })));
+        if (sub.frames && sub.frames.length) queue.push({ parent: frameId, boxes: sub.frames, origin: here, depth: depth + 1 });
       }
-      top.messages = (top.messages || []).concat(sub.messages || []);
-      if (sub.text) extraText.push(`[${host}] ${sub.text}`);
-      top.below = (top.below || 0) + (sub.below || 0);
-      top.above = (top.above || 0) + (sub.above || 0);
-      if (sub.panes && sub.panes.length) top.panes = (top.panes || []).concat(sub.panes.map((p) => ({ ...p, frame: host })));
     }
   }
   const previous = await mapFor(tab.id);
   const snapshotID = crypto.randomUUID();
   await saveMap(tab.id, { ...assignIds(previous.documentID === top.documentID ? previous : null, top.url, list),
-    documentID: top.documentID, snapshotID, frameTokens, frameBoxes, offsets });
-  if (extraText.length) top.text = [top.text, ...extraText].filter(Boolean).join(" · ").slice(0, 2200);
-  return { ...top, snapshotID, elements, tabId: tab.id, active: !!tab.active };
+    documentID: top.documentID, snapshotID, frameTokens, frameBoxes, offsets, coverage });
+  if (coverage.length) extraText.push("[frames not read: " + coverage.map((c) => `${c.frame} (${c.reason})`).join("; ") + "]");
+  if (extraText.length) top.text = [top.text, ...extraText].filter(Boolean).join(" · ").slice(0, 2400);
+  return { ...top, snapshotID, elements, tabId: tab.id, active: !!tab.active, frameCoverage: coverage };
+}
+
+// A frame's box, and every ancestor's, must still be where the observation saw it: same node, same geometry.
+async function frameChainStable(tabId, map, frameId) {
+  for (let f = frameId, guard = 0; f !== 0 && guard < 8; guard++) {
+    const observed = map.frameBoxes && map.frameBoxes[f];
+    if (!observed) return false;
+    const live = (await call(tabId, observed.parent ?? 0, "frameBoxes")).frames || [];
+    const current = live.find((box) => box.nodeToken === observed.nodeToken);
+    if (!current || ["x", "y", "w", "h"].some((key) => Math.abs(current[key] - observed[key]) > 0.5)
+        || Math.abs((current.sx || 1) - (observed.sx || 1)) > 0.01 || Math.abs((current.sy || 1) - (observed.sy || 1)) > 0.01 || current.rotated) return false;
+    f = observed.parent ?? 0;
+    if (f === 0) return true;
+  }
+  return frameId === 0;
 }
 
 // The frame that has the caret: the top page, or a frame inside it when the top page's focus is on an <iframe>
@@ -413,6 +499,7 @@ async function prepareWorkTab(tabId) {
   await chrome.debugger.sendCommand(target, "Page.enable");
   // A hidden task must never open a native file picker over the user’s work. Uploads use page fields directly.
   await chrome.debugger.sendCommand(target, "Page.setInterceptFileChooserDialog", { enabled: true });
+  try { await chrome.debugger.sendCommand(target, "Page.setDownloadBehavior", { behavior: "default" }); } catch {}   // lifecycle events; best effort
   await chrome.debugger.sendCommand(target, "Emulation.setFocusEmulationEnabled", { enabled: true });
   await chrome.debugger.sendCommand(target, "Emulation.setDeviceMetricsOverride", { ...(workSize || { width: 1280, height: 900 }), deviceScaleFactor: 1, mobile: false });
 }
@@ -452,13 +539,65 @@ const attached = new Set();
 
 // Chrome can run this script with an older manifest's permissions until the extension is reloaded: without the
 // debugger permission only the debugger-based actions are unavailable, and everything else has to keep working.
+// Per-tab record of things the page did on its own while a command ran: JS dialogs (and what was decided),
+// file-chooser requests and downloads. Drained into the next result for that tab, so the app can see them.
+const tabEvents = new Map();   // tabId → [event]
+const downloads = new Map();   // guid → { tabId, url, filename, state, received, total }
+const dialogPolicy = new Map(); // tabId → { accept, text, persistent }
+function recordEvent(tabId, event) {
+  if (tabId == null) return;
+  const list = tabEvents.get(tabId) || [];
+  list.push({ ...event, at: Date.now() });
+  if (list.length > 50) list.shift();
+  tabEvents.set(tabId, list);
+}
+function drainEvents(tabId) {
+  const list = tabEvents.get(tabId) || [];
+  tabEvents.delete(tabId);
+  return list;
+}
+// Decision for a JS dialog. Nothing is confirmed on the user's behalf by default: an alert has only one answer
+// (accept), leaving a page (beforeunload) is what navigation asked for, and confirm/prompt are dismissed unless the
+// app set an explicit decision for the tab (cmd "dialogPolicy"). Every decision is reported with the dialog's text.
+function dialogDecision(tabId, params) {
+  const explicit = dialogPolicy.get(tabId);
+  if (explicit) {
+    if (!explicit.persistent) dialogPolicy.delete(tabId);
+    return { accept: !!explicit.accept, promptText: explicit.text, basis: "explicit" };
+  }
+  return { accept: params.type === "alert" || params.type === "beforeunload", basis: "default" };
+}
+function onDebuggerEvent(source, method, params = {}) {
+  const tabId = source && source.tabId;
+  if (method === "Page.javascriptDialogOpening") {
+    // A dialog would hold a tab nobody is looking at forever, so it is always answered, and the answer is recorded.
+    const d = dialogDecision(tabId, params);
+    const event = { kind: "dialog", type: params.type, message: String(params.message || "").slice(0, 500), url: params.url,
+                    decision: d.accept ? "accepted" : "dismissed", basis: d.basis };
+    if (params.type === "prompt") event.defaultPrompt = params.defaultPrompt;
+    recordEvent(tabId, event);
+    chrome.debugger.sendCommand(source, "Page.handleJavaScriptDialog", { accept: d.accept, ...(d.promptText != null ? { promptText: String(d.promptText) } : {}) })
+      .catch((e) => recordEvent(tabId, { kind: "dialog", type: params.type, decision: "unanswered", error: String(e && e.message || e) }));
+  } else if (method === "Page.fileChooserOpened") {
+    // The task tab never opens a native picker. The chooser is reported, not silently swallowed: the extension has
+    // no file path to hand the browser, so uploads use uploadVia/upload against the page's own file inputs.
+    recordEvent(tabId, { kind: "fileChooser", mode: params.mode, state: "intercepted; not fulfilled" });
+  } else if (method === "Page.downloadWillBegin" || method === "Browser.downloadWillBegin") {
+    downloads.set(params.guid, { tabId, url: params.url, filename: params.suggestedFilename, state: "started", received: 0, total: null });
+    recordEvent(tabId, { kind: "download", phase: "started", guid: params.guid, url: params.url, filename: params.suggestedFilename });
+  } else if (method === "Page.downloadProgress" || method === "Browser.downloadProgress") {
+    const known = downloads.get(params.guid) || { tabId, state: "started" };
+    known.state = params.state; known.received = params.receivedBytes; known.total = params.totalBytes;
+    downloads.set(params.guid, known);
+    if (params.state !== "inProgress") {
+      recordEvent(known.tabId ?? tabId, { kind: "download", phase: params.state === "completed" ? "completed" : params.state, guid: params.guid,
+                                          url: known.url, filename: known.filename, bytes: params.totalBytes ?? params.receivedBytes });
+    }
+  }
+}
 if (chrome.debugger) {
   chrome.debugger.onDetach.addListener((source) => attached.delete(source.tabId));
-  // A dialog would hold a tab nobody is looking at forever.
-  chrome.debugger.onEvent.addListener((source, method, params) => {
-    if (method !== "Page.javascriptDialogOpening") return;
-    chrome.debugger.sendCommand(source, "Page.handleJavaScriptDialog", { accept: params.type === "beforeunload" }).catch(() => {});
-  });
+  chrome.debugger.onEvent.addListener(onDebuggerEvent);
 }
 
 async function cdp(tabId, method, params = {}) {
@@ -524,17 +663,11 @@ async function cdpGesture(tabId, msg) {
   async function point(index) {
     if (!Number.isInteger(index)) throw Error("gesture needs element ids");
     const { frameId, local } = await route(tabId, index);
-    if (frameId !== 0) {
-      const observed = map.frameBoxes?.[frameId];
-      const live = (await call(tabId, 0, "frameBoxes")).frames || [];
-      const current = observed && live.find(box => box.nodeToken === observed.nodeToken);
-      if (!current || ["x", "y", "w", "h"].some(key => Math.abs(current[key] - observed[key]) > 0.5))
-        throw Error("gesture frame moved; observe again");
-    }
+    if (frameId !== 0 && !(await frameChainStable(tabId, map, frameId))) throw Error("gesture frame moved; observe again");
     const spot = await call(tabId, frameId, "locate", [local, false]);
     const offset = map.offsets[frameId];
     if (!offset || !spot.hit || !spot.still) throw Error("gesture target moved or is covered; observe again");
-    const result = { x: Number(spot.px) + offset.x, y: Number(spot.py) + offset.y };
+    const result = toTop(offset, Number(spot.px), Number(spot.py));
     if (!Number.isFinite(result.x) || !Number.isFinite(result.y)) throw Error("invalid gesture point");
     return result;
   }
@@ -581,6 +714,8 @@ chrome.tabs.onRemoved.addListener((tabId) => queueActivity(async () => {
   attached.delete(tabId);
   maps.delete(tabId);
   focusFrames.delete(tabId);
+  tabEvents.delete(tabId);
+  dialogPolicy.delete(tabId);
   try { await chrome.storage.session.remove("map" + tabId); } catch {}
   const mine = await openedTabs();
   if (mine.delete(tabId)) await setOpened(mine);
@@ -594,7 +729,7 @@ async function tabCommand(msg) {
       const cur = await activeTab();
       const mine = await openedTabs();
       const list = await chrome.tabs.query({ windowId: cur.windowId });
-      return { windowId: cur.windowId, tabs: list.map((t) => ({ id: t.id, title: (t.title || "").slice(0, 100), url: (t.url || t.pendingUrl || "").slice(0, 200),
+      return { windowId: cur.windowId, tabs: list.map((t) => ({ id: t.id, title: (t.title || "").slice(0, 100), url: (t.url || t.pendingUrl || "").slice(0, 4096),
                                                                 active: !!t.active, opened: mine.has(t.id), loading: t.status === "loading" })) };
     }
     case "switchTab": {
@@ -614,7 +749,22 @@ async function tabCommand(msg) {
   return null;
 }
 
+// Tokens and page-initiated events travel with every tab-scoped result, so a caller never has to guess which
+// observation an outcome belongs to or whether a dialog/download happened while it ran.
 async function handle(msg) {
+  const out = await handleCommand(msg);
+  const id = msg.tabId != null && msg.tabId !== "" ? Number(msg.tabId) : null;
+  if (id == null || !Number.isInteger(id) || !out || typeof out !== "object" || Array.isArray(out)) return out;
+  const events = drainEvents(id);
+  if (events.length && out.events === undefined) out.events = events;
+  if (!["snapshot", "tabs", "tabInfo", "newTab", "clinqyTab", "switchTab", "closeTab", "clinqyDone"].includes(msg.cmd) && out.observation === undefined) {
+    const map = maps.get(id);
+    if (map && map.documentID) out.observation = { documentID: map.documentID, snapshotID: map.snapshotID };
+  }
+  return out;
+}
+
+async function handleCommand(msg) {
   if (msg.cmd === "reload") { setTimeout(() => chrome.runtime.reload(), 100); return { reloading: true }; }
   if (msg.cmd === "version") return { version: SCRIPT_VERSION, manifest: chrome.runtime.getManifest().version };
   // Task commands are explicitly scoped: they cannot fall through to the user's active tab.
@@ -668,7 +818,7 @@ async function handle(msg) {
         const { frameId, local } = await route(tab.id, msg.index);
         const point = await call(tab.id, frameId, "activityPoint", [local]);
         const offset = (await mapFor(tab.id)).offsets?.[frameId];
-        if (point && offset) { state.x = point.x + offset.x; state.y = point.y + offset.y; }
+        if (point && offset) { const p = toTop(offset, point.x, point.y); state.x = p.x; state.y = p.y; }
       } catch {}
     }
     await showActivity(tab.id, state);
@@ -685,11 +835,30 @@ async function handle(msg) {
     const captured = await cdp(tab.id, "Page.captureScreenshot", {
       format: msg.format || "png", ...(msg.quality ? { quality: Number(msg.quality) } : {}), fromSurface: true, captureBeyondViewport: false
     });
-    return { image: captured.data, tabId: tab.id };
+    // Freshness/coverage: which observation this picture matches, when it was taken, and what it can show.
+    const meta = { capturedAt: Date.now(), coverage: "viewport", beyondViewport: false };
+    const map = await mapFor(tab.id);
+    if (map.documentID) { meta.documentID = map.documentID; meta.snapshotID = map.snapshotID; }
+    try { await call(tab.id, 0, "check"); meta.matchesObservation = true; } catch { meta.matchesObservation = false; }
+    try {
+      const m = await cdp(tab.id, "Page.getLayoutMetrics");
+      const v = m && m.cssVisualViewport;
+      if (v) meta.viewport = { x: v.pageX, y: v.pageY, w: v.clientWidth, h: v.clientHeight, scale: v.scale };
+    } catch {}
+    return { image: captured.data, tabId: tab.id, ...meta };
   }
   if (msg.cmd === "tabInfo") {
     const win = await chrome.windows.get(tab.windowId);
     return { id: tab.id, url: tab.url || tab.pendingUrl || "", status: tab.status, title: tab.title || "", focused: !!win.focused };
+  }
+  if (msg.cmd === "dialogPolicy") {
+    // The app's explicit decision for the next dialog on this owned tab (or every one, when persistent).
+    if (msg.clear) dialogPolicy.delete(tab.id);
+    else dialogPolicy.set(tab.id, { accept: !!msg.accept, text: msg.text, persistent: !!msg.persistent });
+    return { dialogPolicy: msg.clear ? null : { accept: !!msg.accept, persistent: !!msg.persistent } };
+  }
+  if (msg.cmd === "downloadStatus") {
+    return { downloads: [...downloads.entries()].filter(([, d]) => d.tabId === tab.id).map(([guid, d]) => ({ guid, ...d })) };
   }
   const unguarded = new Set(["snapshot", "goBack", "navigate"]);
   if (!unguarded.has(msg.cmd)) {
@@ -712,16 +881,12 @@ async function handle(msg) {
     }
     if (msg.cmd === "cdpClick" && Number.isInteger(msg.index)) {
       const { frameId, local } = await route(tab.id, msg.index);
-      if (frameId !== 0) {
-        const observedBox = map.frameBoxes?.[frameId];
-        const liveBoxes = (await call(tab.id, 0, "frameBoxes")).frames || [];
-        const currentBox = observedBox && liveBoxes.find((box) => box.nodeToken === observedBox.nodeToken);
-        if (!currentBox || ["x", "y", "w", "h"].some((key) => Math.abs(currentBox[key] - observedBox[key]) > 0.5))
-          throw new Error("the embedded frame moved or was replaced; take a new look");
-      }
+      if (frameId !== 0 && !(await frameChainStable(tab.id, map, frameId)))
+        throw new Error("the embedded frame moved or was replaced; take a new look");
       const spot = await call(tab.id, frameId, "locate", [local]);
       const offset = map.offsets[frameId];
-      if (!offset || !spot.hit || !spot.still || Math.abs(Number(msg.x) - spot.px - offset.x) > 2 || Math.abs(Number(msg.y) - spot.py - offset.y) > 2)
+      const at = offset && toTop(offset, spot.px, spot.py);
+      if (!offset || !spot.hit || !spot.still || Math.abs(Number(msg.x) - at.x) > 2 || Math.abs(Number(msg.y) - at.y) > 2)
         throw new Error("the click target moved or was covered; take a new look");
     }
   }
@@ -796,7 +961,7 @@ async function handle(msg) {
       const r = await call(tab.id, frameId, "locate", [local, msg.reveal !== false]);
       const o = ((await mapFor(tab.id)).offsets || {})[frameId];
       if (!o) return { ...r, hit: frameId === 0 && r.hit };
-      return { ...r, x: r.x + o.x, y: r.y + o.y, px: r.px + o.x, py: r.py + o.y };
+      return { ...r, ...toTop(o, r.x, r.y), px: toTop(o, r.px, r.py).x, py: toTop(o, r.px, r.py).y };
     }
     case "uploadVia": {
       // The site's own upload button: click it in the page's world with file inputs' click()/showPicker() caught,
@@ -836,8 +1001,9 @@ async function handle(msg) {
       for (const { frameId, result } of answers) {
         if (frameId !== 0 && !offsets[frameId]) continue;   // a frame we can't place on screen
         if (result.found) {
-          const o = offsets[frameId] || { x: 0, y: 0 };
-          return { ...result, pointFrame: frameId, x: result.x + o.x, y: result.y + o.y, px: result.px + o.x, py: result.py + o.y };
+          const o = offsets[frameId] || { x: 0, y: 0, sx: 1, sy: 1 };
+          const a = toTop(o, result.x, result.y), b = toTop(o, result.px, result.py);
+          return { ...result, pointFrame: frameId, x: a.x, y: a.y, px: b.x, py: b.y };
         }
         if (!fallback || (result.options || []).length > (fallback.options || []).length) fallback = result;
       }
@@ -861,6 +1027,8 @@ async function handle(msg) {
       for (const { frameId, result } of await callAll(tab.id, "readText")) {
         if (frameId !== 0 && offsets[frameId] && result.text) top.text = (top.text + "\n\n[embedded: " + result.url + "]\n" + result.text).slice(0, 12000);
       }
+      const unread = ((await mapFor(tab.id)).coverage || []);
+      if (unread.length) { top.unreadFrames = unread; top.text = (top.text + "\n\n[frames not read: " + unread.map((c) => `${c.frame} (${c.reason})`).join("; ") + "]").slice(0, 12400); }
       return top;
     }
     case "tables": {

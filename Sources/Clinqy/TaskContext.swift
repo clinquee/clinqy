@@ -29,6 +29,9 @@ enum BrowserTaskRouting {
     static func isBrowserTask(_ text: String) -> Bool {
         text.range(of: #"(?i)https?://|\b(chrome|browser|website|webpage|youtube|spotify|wikipedia|linkedin|gmail)\b|\bwhatsapp\s+web\b|\b(in|on|using)\s+(arc|brave|edge)\b|\b(open|use|search|work).{0,30}\b(tabs?|arc|brave|edge)\b"#, options: .regularExpression) != nil
     }
+    static func requestsExistingTabs(_ text: String) -> Bool {
+        text.range(of: #"(?i)\b(already\s+open|existing|current|active|these|those)\b.{0,100}\btabs?\b|\btabs?\b.{0,80}\b(already\s+open|open\s+already)\b"#, options: .regularExpression) != nil
+    }
     static func requestsParallel(_ text: String) -> Bool {
         text.range(of: #"(?i)\b(parallel|simultaneously|concurrently|separate tasks)\b|\b([2-9]|[1-9][0-9]|two|three|four|five)\s+(browser\s+)?tabs?\b"#, options: .regularExpression) != nil
     }

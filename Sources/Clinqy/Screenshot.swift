@@ -11,6 +11,8 @@ enum Screenshot {
         let rawImage: CGImage
         let data: Data
         let geometry: ObservationGeometry
+        /// Set when the image is valid but flat (one colour): the content is real, but may be a loading or blank window.
+        var notice: String? = nil
         var imageSize: CGSize { geometry.imageSize }
         var base64: String { data.base64EncodedString() }
         var pointScale: CGSize { geometry.pointScale }
@@ -42,6 +44,44 @@ enum Screenshot {
     /// Bounded image budget; Capture geometry always reflects the actual encoded dimensions.
     static var maxSide: CGFloat { CGFloat(min(3840, max(640, Int(Config.value("VISION_MAX_SIDE") ?? "1920") ?? 1920))) }
     static var maxBytes: Int { min(2_000_000, max(100_000, Int(Config.value("VISION_MAX_BYTES") ?? "800000") ?? 800_000)) }
+
+    /// Why a capture produced no image, so a caller can tell a missing permission from a stale window.
+    enum CaptureError: Error, Equatable {
+        case noObservation, staleWindow, provenanceMismatch, permissionMissing, windowUnavailable, geometryMismatch
+        case captureFailed, allBlack, encodingFailed
+
+        var hint: String {
+            switch self {
+            case .noObservation: return "No observed native window to capture; look again."
+            case .staleWindow: return "The window changed since it was observed; look again."
+            case .provenanceMismatch: return "The element list belongs to a different observation than the window; look again."
+            case .permissionMissing: return "Screen Recording permission is missing, so no screenshot can be taken."
+            case .windowUnavailable: return "The window is not available to the screen recorder (minimized, on another Space or closed)."
+            case .geometryMismatch: return "The window's frame and the screen recorder disagree; look again."
+            case .captureFailed: return "The screen recorder returned no image."
+            case .allBlack: return Blankness.allBlack.hint
+            case .encodingFailed: return "The image could not be encoded within the size budget."
+            }
+        }
+    }
+    /// The reason the last `capture` returned nil.
+    nonisolated(unsafe) static var lastError: CaptureError?
+
+    /// How much detail a capture keeps. Standard never exceeds one pixel per point; high allows up to the display's
+    /// backing scale (still within the longest-side and byte budgets).
+    enum Detail { case standard, high }
+    static var defaultDetail: Detail { Config.value("VISION_DETAIL")?.lowercased() == "high" ? .high : .standard }
+
+    /// Backing scale of the display that holds most of `frame` (global top-left points).
+    static func backingScale(for frame: CGRect) -> CGFloat {
+        var best: (area: CGFloat, scale: CGFloat) = (0, NSScreen.main?.backingScaleFactor ?? 2)
+        for screen in NSScreen.screens {
+            let overlap = AXEngine.flipped(screen.frame).intersection(frame)
+            let area = overlap.isNull ? 0 : overlap.width * overlap.height
+            if area > best.area { best = (area, screen.backingScaleFactor) }
+        }
+        return best.scale
+    }
 
     /// A capture with no visual detail. All black almost always means Screen Recording permission is
     /// missing (macOS hands back empty frames instead of failing) or the window is covered/minimized.
@@ -121,35 +161,52 @@ enum Screenshot {
         return NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:])
     }
 
-    static func capture(app: NSRunningApplication, window snapshot: NativeWindowObservation?, elements: [UIElementInfo], circled: Annotation? = nil) async -> Capture? {
+    static func capture(app: NSRunningApplication, window snapshot: NativeWindowObservation?, elements: [UIElementInfo],
+                        circled: Annotation? = nil, detail: Detail? = nil) async -> Capture? {
+        switch await captureResult(app: app, window: snapshot, elements: elements, circled: circled, detail: detail ?? defaultDetail) {
+        case .success(let capture): lastError = nil; return capture
+        case .failure(let error): lastError = error; return nil
+        }
+    }
+
+    static func captureResult(app: NSRunningApplication, window snapshot: NativeWindowObservation?, elements: [UIElementInfo],
+                              circled: Annotation? = nil, detail: Detail = .standard) async -> Result<Capture, CaptureError> {
         lastBlank = nil
-        guard let snapshot, snapshot.pid == app.processIdentifier, snapshot.staleness(includeContent: true) == nil,
-              elements.allSatisfy({ $0.observationID == snapshot.id && $0.windowID == snapshot.windowID }),
-              CGPreflightScreenCaptureAccess(),
-              let content = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true),
-              let window = content.windows.first(where: { $0.owningApplication?.processID == snapshot.pid && $0.windowID == snapshot.windowID }),
-              ObservationGeometry(frame: snapshot.frame, imageSize: CGSize(width: 1, height: 1)).matches(window.frame)
-        else { return nil }
+        guard let snapshot, snapshot.pid == app.processIdentifier else { return .failure(.noObservation) }
+        guard snapshot.staleness(includeContent: true) == nil else { return .failure(.staleWindow) }
+        guard elements.allSatisfy({ $0.observationID == snapshot.id && $0.windowID == snapshot.windowID }) else { return .failure(.provenanceMismatch) }
+        guard CGPreflightScreenCaptureAccess() else { return .failure(.permissionMissing) }
+        guard let content = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true),
+              let window = content.windows.first(where: { $0.owningApplication?.processID == snapshot.pid && $0.windowID == snapshot.windowID })
+        else { return .failure(.windowUnavailable) }
+        guard ObservationGeometry(frame: snapshot.frame, imageSize: CGSize(width: 1, height: 1)).matches(window.frame) else { return .failure(.geometryMismatch) }
 
         let config = SCStreamConfiguration()
         // Long side, not width: a tall narrow window would otherwise blow past the budget.
-        let scale = min(1, maxSide / max(window.frame.width, window.frame.height))
-        config.width = Int(window.frame.width * scale)
-        config.height = Int(window.frame.height * scale)
+        let ceiling = detail == .high ? backingScale(for: window.frame) : 1
+        let scale = min(ceiling, maxSide / max(window.frame.width, window.frame.height))
+        config.width = max(1, Int(window.frame.width * scale))
+        config.height = max(1, Int(window.frame.height * scale))
         config.showsCursor = false
         let filter = SCContentFilter(desktopIndependentWindow: window)
-        guard let image = try? await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config),
-              snapshot.staleness(includeContent: true) == nil else { return nil }
+        guard let image = try? await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config) else { return .failure(.captureFailed) }
+        guard snapshot.staleness(includeContent: true) == nil else { return .failure(.staleWindow) }
+        // A flat image whose provenance is valid is still the window's real content (a blank page, a loading
+        // screen), so it is kept with a notice. Only all-black, the signature of withheld frames, is refused.
+        var notice: String?
         if let blank = blankness(image) {
-            lastBlank = blank
-            lastImage = nil
-            return nil
+            if blank == .allBlack {
+                lastBlank = blank
+                lastImage = nil
+                return .failure(.allBlack)
+            }
+            notice = blank.hint
         }
 
         let width = image.width, height = image.height
         guard let ctx = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
                                   space: CGColorSpaceCreateDeviceRGB(),
-                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return .failure(.encodingFailed) }
         ctx.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
 
         // Element frames are global top-left points; the window frame is in the same space.
@@ -188,12 +245,13 @@ enum Screenshot {
         }
         NSGraphicsContext.restoreGraphicsState()
 
-        guard let annotated = ctx.makeImage(), let encoded = budgeted(annotated), snapshot.staleness(includeContent: true) == nil else { return nil }
+        guard let annotated = ctx.makeImage(), let encoded = budgeted(annotated) else { return .failure(.encodingFailed) }
+        guard snapshot.staleness(includeContent: true) == nil else { return .failure(.staleWindow) }
         lastImage = annotated
         lastPID = snapshot.pid
         lastWindowFrame = snapshot.frame
-        return Capture(window: snapshot, image: annotated, rawImage: image, data: encoded.data,
-                       geometry: ObservationGeometry(frame: snapshot.frame, imageSize: encoded.size))
+        return .success(Capture(window: snapshot, image: annotated, rawImage: image, data: encoded.data,
+                                geometry: ObservationGeometry(frame: snapshot.frame, imageSize: encoded.size), notice: notice))
     }
 
     /// JPEG within `maxBytes`, returning the dimensions of the encoded image alongside its bytes.

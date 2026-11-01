@@ -413,23 +413,189 @@ final class Hand {
     func press(_ keys: String) -> Bool {
         refusal = nil
         if let why = Safety.blockedChord(keys, request: request) { _ = refuse(why); return false }
+        if let why = AXEngine.chordProblem(keys) { _ = refuse(why); return false }
         buddy.click()
         return AXEngine.press(combo: keys)
     }
 
     func scroll(up: Bool, in app: NSRunningApplication) async {
-        if let frame = AXEngine.windowFrame(of: app) {
-            await buddy.travel(to: CGPoint(x: frame.midX, y: frame.midY))
-        }
-        for _ in 0..<4 {
-            AXEngine.scroll(up ? 3 : -3, in: app)
-            try? await Task.sleep(for: .milliseconds(70))
-        }
-        // Scrolling moves the real pointer to the window's middle; the run's end puts it back if the user doesn't.
-        if !Background.active { cursorLeftAt = Buddy.mouse() }
-        try? await Task.sleep(for: .milliseconds(200))
+        await scroll(ScrollPlan(direction: up ? .up : .down, unit: .lines, amount: 12, isDefault: true), in: app, window: nil)
     }
 
+    /// Scrolls as asked: direction, unit and amount are all honoured. With `anchor` the wheel is aimed at that point
+    /// (which must lie inside the observed `window`); otherwise at the window's middle.
+    /// Returns why it did not scroll, or nil.
+    @discardableResult
+    func scroll(_ plan: ScrollPlan, in app: NSRunningApplication, window: WindowSnapshot?, anchor: CGPoint? = nil) async -> String? {
+        refusal = nil
+        if let window {
+            guard window.pid == app.processIdentifier else { return refuse("the scroll target belongs to another application; look again") }
+            if let why = window.staleness() { return refuse(why) }
+            if let anchor, !window.frame.contains(anchor) { return refuse("the scroll anchor is outside the observed window; look again") }
+        }
+        let frame = window?.frame ?? AXEngine.windowFrame(of: app)
+        if let anchor, window == nil, let frame, !frame.contains(anchor) { return refuse("the scroll anchor is outside the window") }
+        let target = anchor ?? frame.map { CGPoint(x: $0.midX, y: $0.midY) }
+        if let target { await buddy.travel(to: target) }
+        let (pixels, steps) = plan.chunks(viewport: frame?.size ?? CGSize(width: 800, height: 600))
+        for step in steps {
+            if Task.isCancelled { return refuse("scroll interrupted; inspect the result before repeating input") }
+            AXEngine.scroll(dy: step.dy, dx: step.dx, pixels: pixels, at: target, in: app)
+            try? await Task.sleep(for: .milliseconds(70))
+        }
+        // Scrolling moves the real pointer to the aimed point; the run's end puts it back if the user doesn't.
+        if !Background.active { cursorLeftAt = Buddy.mouse() }
+        try? await Task.sleep(for: .milliseconds(200))
+        return nil
+    }
+
+    // MARK: - Click options
+
+    /// A pixel click with the requested button, count, modifiers and hold, after the same window and hit checks as
+    /// every other click. AXPress cannot express any of these, so it is never used here.
+    @discardableResult
+    func click(at point: CGPoint, options: ClickOptions, pid: pid_t, window: WindowSnapshot) async -> String? {
+        guard !Background.active else { return refuse("button, count, modifier and hold options need foreground mode") }
+        guard pid == window.pid, window.frame.contains(point) else { return refuse("the point is outside the observed target window; look again") }
+        if let why = window.staleness(includeContent: true) { return refuse(why) }
+        if let why = hitCheck(point, pid: pid, window: window.element) { return refuse(why) }
+        await buddy.travel(to: point)
+        try? await Task.sleep(for: .milliseconds(80))
+        if let why = window.staleness(includeContent: true) { return refuse(why) }
+        if let why = hitCheck(point, pid: pid, window: window.element) { return refuse(why) }
+        buddy.click()
+        let saved = Buddy.mouse()
+        let source = CGEventSource(stateID: .hidSystemState)
+        var flags: CGEventFlags = []
+        if options.modifiers.contains(.command) { flags.insert(.maskCommand) }
+        if options.modifiers.contains(.shift) { flags.insert(.maskShift) }
+        if options.modifiers.contains(.option) { flags.insert(.maskAlternate) }
+        if options.modifiers.contains(.control) { flags.insert(.maskControl) }
+        let (downType, upType, button): (CGEventType, CGEventType, CGMouseButton) = {
+            switch options.button {
+            case .left: return (.leftMouseDown, .leftMouseUp, .left)
+            case .right: return (.rightMouseDown, .rightMouseUp, .right)
+            case .middle: return (.otherMouseDown, .otherMouseUp, .center)
+            }
+        }()
+        func post(_ type: CGEventType, state: Int) {
+            guard let e = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: point, mouseButton: button) else { return }
+            e.flags = flags
+            e.setIntegerValueField(.mouseEventClickState, value: Int64(state))
+            e.post(tap: .cghidEventTap)
+        }
+        CGEvent(mouseEventSource: source, mouseType: .mouseMoved, mouseCursorPosition: point, mouseButton: .left)?.post(tap: .cghidEventTap)
+        var held = false
+        defer {
+            if held { post(upType, state: 1) }
+            // Make sure no modifier stays latched, then give the pointer back.
+            CGWarpMouseCursorPosition(saved)
+            CGAssociateMouseAndMouseCursorPosition(1)
+            cursorLeftAt = nil
+        }
+        for step in options.steps {
+            if step.down {
+                held = true
+                post(downType, state: step.clickState)
+                if options.holdMilliseconds > 0 {
+                    try? await Task.sleep(for: .milliseconds(options.holdMilliseconds))
+                    if Task.isCancelled { return refuse("click interrupted; inspect the result before repeating input") }
+                } else { usleep(15_000) }
+            } else {
+                post(upType, state: step.clickState)
+                held = false
+                usleep(30_000)
+            }
+        }
+        lastMethod = "options"
+        return nil
+    }
+
+    // MARK: - Screenshot insertion
+
+    struct SnapPasteReport {
+        /// Indices (into the items given) whose caption and picture were both delivered without interruption.
+        var inserted: [Int] = []
+        /// An item whose caption went in but whose picture did not (so the document holds a lone caption).
+        var partial: Int?
+        var stopped: String?
+    }
+
+    /// Pastes each caption and then its picture at the caret, counting only items delivered start to finish. Delivery is
+    /// keystrokes plus the clipboard: apps like Google Docs do not let Clinqy read the result back, so "inserted"
+    /// means delivered while the target stayed frontmost and the clipboard stayed ours, not independently seen.
+    func pasteSnaps(_ items: [(caption: String, png: Data)], in app: NSRunningApplication) async -> SnapPasteReport {
+        var report = SnapPasteReport()
+        let board = NSPasteboard.general
+        let saved = PasteboardSnapshot(board)
+        var owned = board.changeCount
+        AXEngine.targetPid = app.processIdentifier
+        defer {
+            AXEngine.targetPid = nil
+            saved.restore(to: board, ifUnchangedSince: owned)
+        }
+        func ready() -> String? {
+            if Task.isCancelled { return "the run was cancelled" }
+            if !Background.active, NSWorkspace.shared.frontmostApplication?.processIdentifier != app.processIdentifier {
+                return "\(app.cleanName ?? "the target app") is no longer in front"
+            }
+            if board.changeCount != owned { return "the clipboard changed while pasting (the user may have copied something)" }
+            return nil
+        }
+        func load(_ write: (NSPasteboard) -> Void) {
+            board.clearContents()
+            write(board)
+            owned = board.changeCount
+        }
+        for (i, item) in items.enumerated() {
+            if let why = ready() { report.stopped = why; return report }
+            load { $0.setString(item.caption, forType: .string) }
+            AXEngine.pressPaste()
+            try? await Task.sleep(for: .milliseconds(250))
+            AXEngine.pressReturn()
+            if let why = ready() { report.partial = i; report.stopped = why; return report }
+            load { $0.setData(item.png, forType: .png) }
+            AXEngine.pressPaste()
+            try? await Task.sleep(for: .milliseconds(1800))   // Google Docs uploads the image
+            AXEngine.pressReturn()
+            AXEngine.pressReturn()
+            try? await Task.sleep(for: .milliseconds(150))
+            report.inserted.append(i)
+        }
+        return report
+    }
+
+    // MARK: - Control state
+
+    /// Sets a checkbox, radio button or range control to the requested state, confirming it by reading it back.
+    func setState(_ el: UIElementInfo, to desired: DesiredState, in app: NSRunningApplication, window requested: WindowSnapshot? = nil) async -> AXEngine.StateOutcome {
+        guard let window = requested ?? WindowSnapshot.capture(app), window.pid == app.processIdentifier,
+              el.windowID == nil || el.windowID == window.windowID,
+              requested.map({ el.observationID == $0.id }) ?? true else { return .refused("the control belongs to another observation; look again") }
+        if let why = window.staleness(includeContent: true) { return .refused(why) }
+        await buddy.travel(to: el.center, framing: el.frame)
+        if let why = window.staleness(includeContent: true) { return .refused(why) }
+        buddy.click()
+        let element = el.element
+        return await Task.detached { AXEngine.setState(element, to: desired) }.value
+    }
+
+    // MARK: - Text placement
+
+    /// Inserts or appends text at the real caret instead of replacing the field. Where the field gives Accessibility
+    /// no caret or settable text, says so rather than falling back to select-all-and-replace.
+    func place(_ text: String, mode: TextEditMode, in app: NSRunningApplication) -> AXEngine.EditOutcome {
+        refusal = nil
+        guard mode != .replaceAll else { return .unsupported("replace is what type already does") }
+        let root = AXUIElementCreateApplication(app.processIdentifier)
+        var focused: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(root, kAXFocusedUIElementAttribute as CFString, &focused) == .success,
+              let field = focused, CFGetTypeID(field) == AXUIElementGetTypeID() else { return .refused("no focused field") }
+        if let why = Safety.secureInputBlock() { _ = refuse(why); return .refused(why) }
+        let outcome = AXEngine.edit(text, mode: mode, field: field as! AXUIElement)
+        if case .refused(let why) = outcome { _ = refuse(why) }
+        return outcome
+    }
 
     // MARK: - Keyboard
 

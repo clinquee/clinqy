@@ -45,8 +45,12 @@ enum ControlProtocol {
     static func validate(_ action: [String: Any]) -> String? {
         guard let kind = action["do"] as? String, actions.contains(kind) else { return "Unsupported direct action" }
         let allowed: Set<String> = ["do", "id", "to_id", "x", "y", "to_x", "to_y", "seconds", "text", "keys",
-            "name", "url", "path", "contains", "value", "for", "submit", "gone", "dir"]
+            "name", "url", "path", "contains", "value", "for", "submit", "gone", "dir",
+            "button", "count", "modifiers", "duration_ms", "unit", "amount", "direction"]
         guard Set(action.keys).isSubset(of: allowed) else { return "Unknown action argument" }
+        if kind != "click", !Set(action.keys).isDisjoint(with: ["button", "count", "modifiers", "duration_ms"]) { return "Click options apply only to click" }
+        if kind != "scroll", !Set(action.keys).isDisjoint(with: ["unit", "amount", "direction"]) { return "Scroll options apply only to scroll" }
+        if kind == "click", case .failure(let error) = ClickOptions.parse(action) { return error.message }
         for key in ["submit", "gone"] where action[key] != nil {
             guard let value = action[key] as? NSNumber, CFGetTypeID(value) == CFBooleanGetTypeID() else { return "Invalid boolean argument: " + key }
         }
@@ -70,7 +74,10 @@ enum ControlProtocol {
         if kind == "verify", !["text", "url", "path", "value"].contains(where: { action[$0] is String }) { return "A verification postcondition is required" }
         if kind == "verify", action["value"] != nil, action["id"] == nil { return "Field verification needs an id" }
         if kind == "verify", action["contains"] != nil, action["path"] == nil { return "File content verification needs a path" }
-        if kind == "scroll", !["up", "down"].contains(action["dir"] as? String ?? "") { return "Scroll direction must be up or down" }
+        if kind == "scroll" {
+            if action["dir"] == nil && action["direction"] == nil { return "Scroll direction must be up, down, left or right" }
+            if case .failure(let error) = ScrollPlan.parse(action) { return error.message }
+        }
         if kind == "wait", action["for"] as? String == nil { return "Direct waits require a text predicate" }
         return nil
     }

@@ -17,16 +17,33 @@ jobs:
         run: |
           bash tests/task-power.sh
           bash tests/computer-control.sh
+          bash tests/desktop-input.sh
+          bash tests/observations.sh
           bash tests/background-tasks.sh
           bash tests/task-context.sh
+          bash tests/task-memory.sh
+          bash tests/route-memory.sh
+          bash tests/delegation.sh
+          bash tests/delegation-worker.sh
+          bash tests/efficiency.sh
+          bash tests/browser-navigation.sh
+          bash tests/action-contract.sh
+          bash tests/browser-correlation.sh
           bash tests/image-assets.sh
           bash tests/telegram.sh
+          bash tests/notifier.sh
+          bash tests/codex-session.sh
+          bash tests/scheduler.sh
+          bash tests/router.sh
+          bash tests/data-stores.sh
       - name: Extension and download routing
         run: |
           node tests/extension-version.mjs
           node tests/extension-background.mjs
           node tests/extension-gestures.mjs
           node tests/extension-images.mjs
+          node tests/extension-frames.mjs
+          node tests/extension-transport.mjs
           node tests/telegram-screenshot.mjs
           node tests/mac-download.mjs
       - name: Website build
