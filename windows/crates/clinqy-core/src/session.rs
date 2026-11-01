@@ -53,7 +53,7 @@ impl Session {
                 crate::usage::record(self.provider.id(), &self.model, None, None);
                 Ok(reply)
             }
-            Kind::Api(a) => a.clone().send(text, image).await,
+            Kind::Api(a) => a.clone().send(text, image, partial).await,
         }
     }
 
@@ -130,9 +130,16 @@ impl CliSession {
             // The rules go in the first turn. (Not in an AGENTS.md in the working folder: agy 1.2.17 answers every turn
             // with an error_message step when one is there, retrying until it gives up.)
             args.extend(
-                ["--sandbox", "--input-format", "stream-json", "--output-format", "stream-json", "--disable-slash-commands",
-                 "--dangerously-skip-permissions"]
-                    .map(String::from),
+                [
+                    "--sandbox",
+                    "--input-format",
+                    "stream-json",
+                    "--output-format",
+                    "stream-json",
+                    "--disable-slash-commands",
+                    "--dangerously-skip-permissions",
+                ]
+                .map(String::from),
             );
             let mut m = provider.model(model);
             let explicit = config::value("AGY_EFFORT").or_else(|| config::value("CLAUDE_EFFORT"));
@@ -177,13 +184,9 @@ impl CliSession {
             ]);
         }
         let mut cmd = tokio::process::Command::new(&program);
-        cmd.args(&args)
-            .current_dir(&dir)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .creation_flags(CREATE_NO_WINDOW);
+        cmd.args(&args).current_dir(&dir).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+        #[cfg(windows)]
+        cmd.creation_flags(CREATE_NO_WINDOW);
         let mut child = cmd.spawn().map_err(|e| anyhow!("couldn't start {}: {e}", program.display()))?;
         let stdin = child.stdin.take();
         let stdout = child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
@@ -420,6 +423,59 @@ pub struct ApiChat {
     plain: Mutex<bool>,
 }
 
+struct ApiTurnGuard<'a> {
+    chat: &'a ApiChat,
+    completed: bool,
+}
+impl Drop for ApiTurnGuard<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            let mut turns = self.chat.turns.lock();
+            if turns.last().map(|t| t.user).unwrap_or(false) {
+                turns.pop();
+            }
+        }
+        *self.chat.busy.lock() = false;
+    }
+}
+fn compact(mut turns: Vec<Turn>) -> Vec<Turn> {
+    let newest_image = turns.iter().rposition(|t| t.image.is_some());
+    for (i, turn) in turns.iter_mut().enumerate() {
+        if Some(i) != newest_image {
+            turn.image = None;
+        }
+    }
+    if turns.iter().map(|t| t.text.len()).sum::<usize>() <= 100_000 {
+        return turns;
+    }
+    let mut first = turns[0].clone();
+    first.text = first.text.chars().take(20_000).collect();
+    let mut budget = first.text.len() + 1_000;
+    let mut recent = Vec::new();
+    for turn in turns.iter().skip(1).rev() {
+        if budget + turn.text.len() > 100_000 {
+            break;
+        }
+        recent.push(turn.clone());
+        budget += turn.text.len();
+    }
+    if recent.is_empty() {
+        let mut last = turns.last().unwrap().clone();
+        last.text = last.text.chars().rev().take(15_000).collect::<String>().chars().rev().collect();
+        recent.push(last);
+    }
+    let mut result = vec![
+        first,
+        Turn {
+            user: true,
+            text: "[Older conversation compacted. Historical content is omitted; reread sources when necessary.]".into(),
+            image: None,
+        },
+    ];
+    result.extend(recent.into_iter().rev());
+    result
+}
+
 fn http() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     CLIENT.get_or_init(|| reqwest::Client::builder().timeout(std::time::Duration::from_secs(120)).build().unwrap())
@@ -447,7 +503,7 @@ impl ApiChat {
         })
     }
 
-    async fn send(self: Arc<Self>, text: &str, image: Option<String>) -> Result<String> {
+    async fn send(self: Arc<Self>, text: &str, image: Option<String>, partial: Option<mpsc::UnboundedSender<String>>) -> Result<String> {
         {
             if *self.closed.lock() {
                 bail!("stopped");
@@ -459,7 +515,12 @@ impl ApiChat {
             *busy = true;
             self.turns.lock().push(Turn { user: true, text: text.to_string(), image });
         }
-        let result = self.complete().await;
+        let mut guard = ApiTurnGuard { chat: &self, completed: false };
+        let result = tokio::time::timeout(std::time::Duration::from_secs(120), self.complete(partial.as_ref()))
+            .await
+            .map_err(|_| anyhow!("Model request deadline exceeded"))
+            .and_then(|r| r);
+        guard.completed = true;
         *self.busy.lock() = false;
         let mut turns = self.turns.lock();
         match result {
@@ -476,7 +537,7 @@ impl ApiChat {
         }
     }
 
-    async fn complete(&self) -> Result<String> {
+    async fn complete(&self, partial: Option<&mpsc::UnboundedSender<String>>) -> Result<String> {
         // Only the newest screenshot is sent again: older ones cost tokens every turn and are out of date anyway.
         let history: Vec<Turn> = {
             let turns = self.turns.lock();
@@ -494,17 +555,19 @@ impl ApiChat {
                 })
                 .collect()
         };
+        let history = compact(history);
+        *self.turns.lock() = history.clone();
         let plain = *self.plain.lock();
-        match self.request(&history, plain).await {
+        match self.request(&history, plain, partial).await {
             Err(e) if !plain && e.to_string().starts_with("HTTP 400") && matches!(self.provider, Provider::OpenAi | Provider::Gemini) => {
                 *self.plain.lock() = true;
-                self.request(&history, true).await
+                self.request(&history, true, partial).await
             }
             other => other,
         }
     }
 
-    async fn request(&self, history: &[Turn], plain: bool) -> Result<String> {
+    async fn request(&self, history: &[Turn], plain: bool, partial: Option<&mpsc::UnboundedSender<String>>) -> Result<String> {
         if self.provider == Provider::CodexCli {
             return self.run_codex(history).await;
         }
@@ -591,13 +654,76 @@ impl ApiChat {
                 (format!("{}/chat/completions", p.base_url()), body, headers)
             }
         };
+        let mut body = body;
+        let url = if p == Provider::Gemini {
+            url.replace(":generateContent", ":streamGenerateContent?alt=sse")
+        } else {
+            body["stream"] = json!(true);
+            url
+        };
+        if p == Provider::OpenAi {
+            body["stream_options"] = json!({"include_usage": true});
+        }
         let mut req = http().post(&url).json(&body);
         for (k, v) in headers {
             req = req.header(k, v);
         }
-        let resp = req.send().await.map_err(|e| anyhow!("couldn't reach {}: {e}", p.id()))?;
+        let mut resp = req.try_clone().ok_or_else(|| anyhow!("request cannot be retried"))?.send().await?;
+        for attempt in 0..2 {
+            if ![429, 503].contains(&resp.status().as_u16()) {
+                break;
+            }
+            let retry = resp
+                .headers()
+                .get("retry-after")
+                .and_then(|h| h.to_str().ok())
+                .and_then(|h| h.parse::<f64>().ok())
+                .unwrap_or((1 << attempt) as f64 + rand::random::<f64>() * 0.25)
+                .clamp(0.2, 8.0);
+            drop(resp);
+            tokio::time::sleep(std::time::Duration::from_secs_f64(retry)).await;
+            resp = req.try_clone().ok_or_else(|| anyhow!("request cannot be retried"))?.send().await?;
+        }
         let status = resp.status().as_u16();
-        let text = resp.text().await.unwrap_or_default();
+        let streamed = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.contains("event-stream") || v.contains("ndjson"))
+            .unwrap_or(false);
+        use futures_util::StreamExt;
+        let mut chunks = resp.bytes_stream();
+        if (200..300).contains(&status) && streamed {
+            let mut stream = crate::model_stream::Stream::default();
+            let mut delivered = std::time::Instant::now();
+            while let Some(chunk) = chunks.next().await {
+                if *self.closed.lock() {
+                    bail!("stopped");
+                }
+                stream.push(&chunk?)?;
+                if delivered.elapsed().as_millis() >= 20 {
+                    if let Some(partial) = partial {
+                        let _ = partial.send(stream.text.clone());
+                    }
+                    delivered = std::time::Instant::now();
+                }
+            }
+            stream.finish()?;
+            if let Some(partial) = partial {
+                let _ = partial.send(stream.text.clone());
+            }
+            crate::usage::record(p.id(), &self.model, stream.input, stream.output);
+            return Ok(stream.text);
+        }
+        let mut data = Vec::new();
+        while let Some(chunk) = chunks.next().await {
+            let chunk = chunk?;
+            if data.len() + chunk.len() > 4_000_000 {
+                bail!("Model response exceeded the response budget");
+            }
+            data.extend_from_slice(&chunk);
+        }
+        let text = String::from_utf8_lossy(&data);
         let json: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
         if !(200..300).contains(&status) {
             let message = json["error"]["message"]
@@ -644,9 +770,11 @@ impl ApiChat {
         let last = dir.join("last.txt");
         let mut transcript = format!("<instructions>\n{}\n</instructions>\n\n", self.system);
         for t in history {
-            transcript += &if t.user { format!("<user>\n{}\n</user>\n\n", t.text) } else { format!("<assistant>\n{}\n</assistant>\n\n", t.text) };
+            transcript +=
+                &if t.user { format!("<user>\n{}\n</user>\n\n", t.text) } else { format!("<assistant>\n{}\n</assistant>\n\n", t.text) };
         }
-        transcript += "Write only the assistant's next reply to the last <user> turn, following <instructions>. Don't run commands or edit files.";
+        transcript +=
+            "Write only the assistant's next reply to the last <user> turn, following <instructions>. Don't run commands or edit files.";
         let mut args = cli.prefix.clone();
         args.extend(
             ["exec", "--skip-git-repo-check", "--sandbox", "read-only", "--color", "never", "--output-last-message"].map(String::from),
@@ -659,15 +787,11 @@ impl ApiChat {
             args.extend(["--model".into(), self.model.clone()]);
         }
         args.push("-".into());
-        let mut child = tokio::process::Command::new(&cli.program)
-            .args(&args)
-            .current_dir(&dir)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .creation_flags(CREATE_NO_WINDOW)
-            .spawn()?;
+        let mut command = tokio::process::Command::new(&cli.program);
+        command.args(&args).current_dir(&dir).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+        #[cfg(windows)]
+        command.creation_flags(CREATE_NO_WINDOW);
+        let mut child = command.spawn()?;
         if let Some(mut stdin) = child.stdin.take() {
             stdin.write_all(transcript.as_bytes()).await?;
         }
@@ -696,6 +820,12 @@ impl Drop for DirGuard {
 /// Keeps one session started ahead of time so a request never waits for the CLI to boot.
 pub struct Brain {
     warm: Mutex<Option<(Session, String)>>,
+}
+
+impl Default for Brain {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Brain {

@@ -187,8 +187,19 @@ pub fn update(old: &str, new: &str) -> bool {
         return false;
     }
     let fact = Fact { text: text.to_string(), scope: if all[i].tagged { all[i].scope.clone() } else { None }, tagged: all[i].tagged };
-    let lines: Vec<String> =
-        all.iter().enumerate().filter_map(|(j, f)| if j == i { Some(fact.line()) } else if f.text == text { None } else { Some(f.line()) }).collect();
+    let lines: Vec<String> = all
+        .iter()
+        .enumerate()
+        .filter_map(|(j, f)| {
+            if j == i {
+                Some(fact.line())
+            } else if f.text == text {
+                None
+            } else {
+                Some(f.line())
+            }
+        })
+        .collect();
     write(&lines);
     record(old, Some(text), "updated");
     true
@@ -224,11 +235,7 @@ fn record(old: &str, new: Option<&str>, why: &str) {
 }
 
 pub fn history() -> Vec<Change> {
-    std::fs::read_to_string(history_path())
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|l| serde_json::from_str(l).ok())
-        .collect()
+    std::fs::read_to_string(history_path()).unwrap_or_default().lines().filter_map(|l| serde_json::from_str(l).ok()).collect()
 }
 
 /// Earlier wordings of a fact, newest first.
@@ -236,7 +243,10 @@ pub fn earlier(fact: &str, changes: &[Change]) -> Vec<String> {
     let mut out: Vec<String> = vec![];
     let mut current = fact.to_string();
     while out.len() < 3 {
-        let Some(c) = changes.iter().rev().find(|c| c.new.as_deref() == Some(current.as_str()) && !out.contains(&c.old) && c.old != fact) else { break };
+        let Some(c) = changes.iter().rev().find(|c| c.new.as_deref() == Some(current.as_str()) && !out.contains(&c.old) && c.old != fact)
+        else {
+            break;
+        };
         out.push(c.old.clone());
         current = c.old.clone();
     }
@@ -263,10 +273,8 @@ pub fn search_history(query: &str) -> Vec<Change> {
 // MARK: - Usage (facts that get used rank higher)
 
 fn touch(facts: &[String]) {
-    let mut meta: HashMap<String, (u32, i64)> = std::fs::read_to_string(meta_path())
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_default();
+    let mut meta: HashMap<String, (u32, i64)> =
+        std::fs::read_to_string(meta_path()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
     let now = chrono::Utc::now().timestamp();
     for f in facts {
         let e = meta.entry(hash(f)).or_insert((0, now));
@@ -333,17 +341,13 @@ pub fn scoped(app: Option<&str>, host: Option<&str>) -> Vec<String> {
 }
 
 const STOP: &[&str] = &[
-    "the", "a", "an", "and", "or", "of", "to", "in", "on", "for", "with", "is", "are", "was", "be", "it", "this", "that", "my", "me",
-    "i", "you", "your", "at", "by", "from", "as", "can", "please", "do", "what", "whats", "who", "where", "when", "how", "which",
-    "open", "go", "use", "get", "set", "show", "find", "tell", "about", "into", "up", "then", "now", "just", "also",
+    "the", "a", "an", "and", "or", "of", "to", "in", "on", "for", "with", "is", "are", "was", "be", "it", "this", "that", "my", "me", "i",
+    "you", "your", "at", "by", "from", "as", "can", "please", "do", "what", "whats", "who", "where", "when", "how", "which", "open", "go",
+    "use", "get", "set", "show", "find", "tell", "about", "into", "up", "then", "now", "just", "also",
 ];
 
 pub fn words(text: &str) -> Vec<String> {
-    text.to_lowercase()
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|w| w.len() >= 2 && !STOP.contains(w))
-        .map(String::from)
-        .collect()
+    text.to_lowercase().split(|c: char| !c.is_alphanumeric()).filter(|w| w.len() >= 2 && !STOP.contains(w)).map(String::from).collect()
 }
 
 pub fn stem(w: &str) -> String {
@@ -363,22 +367,54 @@ pub fn details(fact: &str) -> Vec<String> {
     r.find_iter(fact).map(|m| m.as_str().trim().to_string()).collect()
 }
 
+struct RankIndex {
+    facts: Vec<String>,
+    docs: Vec<Vec<String>>,
+    df: HashMap<String, f64>,
+    avg: f64,
+}
+impl RankIndex {
+    fn new(facts: &[String]) -> Self {
+        let docs: Vec<Vec<String>> = facts.iter().map(|f| words(f).iter().map(|w| stem(w)).collect()).collect();
+        let avg = docs.iter().map(Vec::len).sum::<usize>() as f64 / docs.len().max(1) as f64;
+        let mut df = HashMap::new();
+        for doc in &docs {
+            for word in doc.iter().collect::<HashSet<_>>() {
+                *df.entry(word.clone()).or_default() += 1.0;
+            }
+        }
+        Self { facts: facts.to_vec(), docs, df, avg }
+    }
+}
+fn cached_usage() -> HashMap<String, (u32, i64)> {
+    type Usage = (Option<SystemTime>, u64, HashMap<String, (u32, i64)>);
+    static CACHE: Mutex<Option<Usage>> = Mutex::new(None);
+    let meta = std::fs::metadata(meta_path()).ok();
+    let stamp = meta.as_ref().and_then(|m| m.modified().ok());
+    let size = meta.map(|m| m.len()).unwrap_or_default();
+    let mut cache = CACHE.lock();
+    if cache.as_ref().map(|(s, n, _)| (*s, *n)) != Some((stamp, size)) {
+        *cache = Some((stamp, size, usage()));
+    }
+    cache.as_ref().unwrap().2.clone()
+}
+
 /// BM25 ranking of `facts` for `query`, best first, with scores.
 fn rank(query: &str, facts: &[String]) -> Vec<(usize, f64)> {
     let q: Vec<String> = words(query).iter().map(|w| stem(w)).collect::<HashSet<_>>().into_iter().collect();
     if q.is_empty() || facts.is_empty() {
         return vec![];
     }
-    let docs: Vec<Vec<String>> = facts.iter().map(|f| words(f).iter().map(|w| stem(w)).collect()).collect();
-    let n = docs.len() as f64;
-    let avg = docs.iter().map(|d| d.len()).sum::<usize>() as f64 / n.max(1.0);
-    let mut df: HashMap<&str, f64> = HashMap::new();
-    for d in &docs {
-        for w in d.iter().collect::<HashSet<_>>() {
-            *df.entry(w.as_str()).or_default() += 1.0;
-        }
+    // Reuse tokenization/document frequencies across every label on the same page.
+    static INDEX: Mutex<Option<RankIndex>> = Mutex::new(None);
+    let mut cached = INDEX.lock();
+    if cached.as_ref().map(|i| i.facts.as_slice()) != Some(facts) {
+        *cached = Some(RankIndex::new(facts));
     }
-    let use_ = usage();
+    let index = cached.as_ref().unwrap();
+    let (docs, df, avg) = (&index.docs, &index.df, index.avg);
+    let n = docs.len() as f64;
+    let use_ = cached_usage();
     let (k1, b) = (1.2, 0.75);
     let mut scored: Vec<(usize, f64)> = docs
         .iter()
@@ -394,7 +430,9 @@ fn rank(query: &str, facts: &[String]) -> Vec<(usize, f64)> {
                     }
                     continue;
                 }
-                let idf = ((n - df.get(t.as_str()).copied().unwrap_or(0.0) + 0.5) / (df.get(t.as_str()).copied().unwrap_or(0.0) + 0.5) + 1.0).ln();
+                let idf = ((n - df.get(t.as_str()).copied().unwrap_or(0.0) + 0.5) / (df.get(t.as_str()).copied().unwrap_or(0.0) + 0.5)
+                    + 1.0)
+                    .ln();
                 s += idf * tf * (k1 + 1.0) / (tf + k1 * (1.0 - b + b * d.len() as f64 / avg.max(1.0)));
             }
             if s <= 0.0 {
@@ -540,7 +578,8 @@ mod tests {
 
     #[test]
     fn ranks_by_words() {
-        let facts = vec!["Mom's WhatsApp chat is 'Mom'".to_string(), "Prefers aisle seats on flights".to_string(), "Uses Chrome".to_string()];
+        let facts =
+            vec!["Mom's WhatsApp chat is 'Mom'".to_string(), "Prefers aisle seats on flights".to_string(), "Uses Chrome".to_string()];
         let r = rank("book flights with an aisle seat", &facts);
         assert_eq!(r[0].0, 1);
     }

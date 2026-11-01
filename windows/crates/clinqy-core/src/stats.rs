@@ -34,8 +34,14 @@ pub fn report(days: f64, last: bool) -> String {
         let run = &lines[start..];
         let mut out = vec![format!("Last run: {}", run.first().map(|l| l.trim_start_matches("=== ")).unwrap_or("(none)"))];
         for l in run.iter().skip(1) {
-            let body = l.splitn(2, "] ").nth(1).unwrap_or(l);
-            if body.starts_with("turn ") || body.starts_with("  → ") || body.starts_with("    ✗") || body.starts_with('✓') || body.starts_with('✗') || body.contains("observe:") {
+            let body = l.split_once("] ").map(|x| x.1).unwrap_or(l);
+            if body.starts_with("turn ")
+                || body.starts_with("  → ")
+                || body.starts_with("    ✗")
+                || body.starts_with('✓')
+                || body.starts_with('✗')
+                || body.contains("observe:")
+            {
                 out.push(format!("  {}", body.chars().take(160).collect::<String>()));
             }
         }
@@ -45,7 +51,12 @@ pub fn report(days: f64, last: bool) -> String {
     let mut out = vec![];
     let ok = rs.iter().filter(|r| r["ok"] == true).count();
     let stopped = rs.iter().filter(|r| r["stopped"] == true).count();
-    out.push(format!("Runs in the last {days} days: {} · {} succeeded ({}) · {stopped} stopped by you", rs.len(), ok, pct(ok, rs.len().saturating_sub(stopped))));
+    out.push(format!(
+        "Runs in the last {days} days: {} · {} succeeded ({}) · {stopped} stopped by you",
+        rs.len(),
+        ok,
+        pct(ok, rs.len().saturating_sub(stopped))
+    ));
     if !rs.is_empty() {
         let secs: Vec<f64> = rs.iter().filter_map(|r| r["seconds"].as_f64()).collect();
         let mean = secs.iter().sum::<f64>() / secs.len().max(1) as f64;
@@ -60,7 +71,7 @@ pub fn report(days: f64, last: bool) -> String {
             }
         }
         let mut apps: Vec<_> = by_app.into_iter().collect();
-        apps.sort_by(|a, b| b.1 .1.cmp(&a.1 .1));
+        apps.sort_by_key(|a| std::cmp::Reverse(a.1 .1));
         out.push("By app: ".to_string() + &apps.iter().take(8).map(|(a, (o, n))| format!("{a} {o}/{n}")).collect::<Vec<_>>().join(" · "));
         let mut slow: Vec<&serde_json::Value> = rs.iter().collect();
         slow.sort_by(|a, b| b["seconds"].as_f64().partial_cmp(&a["seconds"].as_f64()).unwrap_or(std::cmp::Ordering::Equal));
@@ -70,19 +81,32 @@ pub fn report(days: f64, last: bool) -> String {
         }
     }
     // Model time per turn, from agent.log ("turn N · 1234 ms · …").
-    let turn_ms: Vec<f64> = lines.iter().filter_map(|l| {
-        let i = l.find("] turn ")?;
-        let rest = &l[i..];
-        let ms = rest.split(" · ").nth(1)?.trim_end_matches(" ms").parse::<f64>().ok()?;
-        Some(ms)
-    }).collect();
+    let turn_ms: Vec<f64> = lines
+        .iter()
+        .filter_map(|l| {
+            let i = l.find("] turn ")?;
+            let rest = &l[i..];
+            let ms = rest.split(" · ").nth(1)?.trim_end_matches(" ms").parse::<f64>().ok()?;
+            Some(ms)
+        })
+        .collect();
     if !turn_ms.is_empty() {
         let mut s = turn_ms.clone();
         s.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        out.push(format!("Model reply: median {:.1} s, slowest 10% over {:.1} s ({} turns)", s[s.len() / 2] / 1000.0, s[s.len() * 9 / 10] / 1000.0, s.len()));
+        out.push(format!(
+            "Model reply: median {:.1} s, slowest 10% over {:.1} s ({} turns)",
+            s[s.len() / 2] / 1000.0,
+            s[s.len() * 9 / 10] / 1000.0,
+            s.len()
+        ));
     }
     // Clicks.
-    let clicks: Vec<Vec<&str>> = lines.iter().filter_map(|l| l.split("click: ").nth(1)).map(|c| c.split_whitespace().collect::<Vec<_>>()).filter(|p| p.len() >= 5).collect();
+    let clicks: Vec<Vec<&str>> = lines
+        .iter()
+        .filter_map(|l| l.split("click: ").nth(1))
+        .map(|c| c.split_whitespace().collect::<Vec<_>>())
+        .filter(|p| p.len() >= 5)
+        .collect();
     if !clicks.is_empty() {
         let first = clicks.iter().filter(|c| c[3] == "ok" && c[4] == "1").count();
         let rescued: HashMap<&str, usize> = clicks.iter().filter(|c| c[3] == "ok" && c[4] != "1").fold(HashMap::new(), |mut m, c| {
@@ -94,13 +118,17 @@ pub fn report(days: f64, last: bool) -> String {
             *hard.entry(c[1]).or_default() += 1;
         }
         let mut hard: Vec<_> = hard.into_iter().collect();
-        hard.sort_by(|a, b| b.1.cmp(&a.1));
+        hard.sort_by_key(|a| std::cmp::Reverse(a.1));
         out.push(format!(
             "Clicks: {} · first try worked {} · rescued by {} · hardest: {}",
             clicks.len(),
             pct(first, clicks.len()),
             if rescued.is_empty() { "-".into() } else { rescued.iter().map(|(k, v)| format!("{k} {v}")).collect::<Vec<_>>().join(", ") },
-            if hard.is_empty() { "-".into() } else { hard.iter().take(4).map(|(k, v)| format!("{k} ({v})")).collect::<Vec<_>>().join(", ") }
+            if hard.is_empty() {
+                "-".into()
+            } else {
+                hard.iter().take(4).map(|(k, v)| format!("{k} ({v})")).collect::<Vec<_>>().join(", ")
+            }
         ));
     }
     // Failure reasons.
@@ -113,7 +141,7 @@ pub fn report(days: f64, last: bool) -> String {
     }
     if !reasons.is_empty() {
         let mut r: Vec<_> = reasons.into_iter().collect();
-        r.sort_by(|a, b| b.1.cmp(&a.1));
+        r.sort_by_key(|a| std::cmp::Reverse(a.1));
         out.push("Most common failed steps:".into());
         for (why, n) in r.iter().take(5) {
             out.push(format!("  {n}× {why}"));

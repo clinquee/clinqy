@@ -250,11 +250,9 @@ impl Provider {
             Provider::AgyCli => cli("Antigravity CLI (agy)"),
             Provider::CodexCli => cli("Codex CLI"),
             Provider::Ollama => format!("Ollama ({})", self.base_url()),
-            Provider::Compatible => format!(
-                "OpenAI-compatible API ({}{})",
-                self.base_url(),
-                if self.key().is_none() { ", no key" } else { "" }
-            ),
+            Provider::Compatible => {
+                format!("OpenAI-compatible API ({}{})", self.base_url(), if self.key().is_none() { ", no key" } else { "" })
+            }
             _ => format!("{} API ({})", self.id(), if self.key().is_none() { "no key" } else { "key set" }),
         }
     }
@@ -367,11 +365,7 @@ fn npm_shim(shim: &Path, script: &str) -> Option<CliCommand> {
     let node = [dir.join("node.exe")]
         .into_iter()
         .find(|p| p.is_file())
-        .or_else(|| {
-            std::env::var_os("PATH")
-                .map(|p| std::env::split_paths(&p).map(|d| d.join("node.exe")).find(|p| p.is_file()))
-                .flatten()
-        })?;
+        .or_else(|| std::env::var_os("PATH").and_then(|p| std::env::split_paths(&p).map(|d| d.join("node.exe")).find(|p| p.is_file())))?;
     Some(CliCommand { program: node, prefix: vec![js.display().to_string()] })
 }
 
