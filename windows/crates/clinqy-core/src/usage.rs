@@ -62,7 +62,9 @@ pub fn record(provider: &str, model: &str, input_tokens: Option<u64>, output_tok
     let _guard = LOCK.get_or_init(|| std::sync::Mutex::new(())).lock().ok();
     let path = crate::paths::local_dir().join("usage.jsonl");
     if let Some(parent) = path.parent() {
-        if std::fs::create_dir_all(parent).is_err() { return; }
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
     }
     if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
         let _ = writeln!(file, "{line}");
@@ -87,7 +89,9 @@ pub fn summary(range: &str) -> UsageSummary {
     for entry in text.lines().filter_map(|line| serde_json::from_str::<UsageEntry>(line).ok()) {
         let parsed = DateTime::parse_from_rfc3339(&entry.at).ok();
         let timestamp = parsed.map(|d| d.timestamp());
-        if start.map(|s| timestamp.map(|t| t < s).unwrap_or(true)).unwrap_or(false) { continue; }
+        if start.map(|s| timestamp.map(|t| t < s).unwrap_or(true)).unwrap_or(false) {
+            continue;
+        }
         let row = grouped.entry(entry.provider.clone()).or_insert_with(|| ProviderUsage {
             provider: entry.provider,
             requests: 0,
@@ -96,9 +100,15 @@ pub fn summary(range: &str) -> UsageSummary {
             metered_requests: 0,
         });
         row.requests += 1;
-        if let Some(n) = entry.input_tokens { row.input_tokens += n; }
-        if let Some(n) = entry.output_tokens { row.output_tokens += n; }
-        if entry.input_tokens.is_some() || entry.output_tokens.is_some() { row.metered_requests += 1; }
+        if let Some(n) = entry.input_tokens {
+            row.input_tokens += n;
+        }
+        if let Some(n) = entry.output_tokens {
+            row.output_tokens += n;
+        }
+        if entry.input_tokens.is_some() || entry.output_tokens.is_some() {
+            row.metered_requests += 1;
+        }
         if let Some(timestamp) = timestamp {
             let day = DateTime::<Utc>::from_timestamp(timestamp, 0)
                 .map(|date| date.with_timezone(&Local))
@@ -112,7 +122,7 @@ pub fn summary(range: &str) -> UsageSummary {
         }
     }
     let mut providers: Vec<_> = grouped.into_values().collect();
-    providers.sort_by(|a, b| b.requests.cmp(&a.requests));
+    providers.sort_by_key(|a| std::cmp::Reverse(a.requests));
     let mut days: Vec<_> = days.into_values().collect();
     days.sort_by(|a, b| a.day.cmp(&b.day));
     UsageSummary {

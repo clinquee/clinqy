@@ -78,10 +78,36 @@ enum Memory {
         let size: Int
         let entries: [Fact]
         let index: Index
-        let graph: MemoryGraph
+        let graph: MemoryGraph?
     }
     nonisolated(unsafe) private static var loaded: Loaded?
     private static let lock = NSLock()
+    private static let graphQueue = DispatchQueue(label: "clinqy.memory-graph", qos: .utility)
+    private final class Batch {
+        var entries: [Fact]
+        var dirty = false
+        var metaDirty = false
+        var changes: [Change] = []
+        init(_ entries: [Fact]) { self.entries = entries }
+    }
+    private static var batch: Batch? { Thread.current.threadDictionary["clinqy.memory.batch"] as? Batch }
+
+    /// Learning produces a small set of edits. Commit it once, then rebuild indexes/metadata once.
+    static func performBatch(_ body: () -> Void) {
+        if batch != nil { body(); return }
+        let staged = Batch(entries)
+        Thread.current.threadDictionary["clinqy.memory.batch"] = staged
+        body()
+        Thread.current.threadDictionary.removeObject(forKey: "clinqy.memory.batch")
+        if staged.dirty { write(staged.entries.map(\.line)) }
+        if staged.metaDirty { saveMeta() }
+        for change in staged.changes { record(old: change.old, new: change.new, why: change.why) }
+    }
+
+    private static func commit(_ entries: [Fact]) {
+        if let batch { batch.entries = entries; batch.dirty = true }
+        else { write(entries.map(\.line)) }
+    }
 
     private static var current: Loaded {
         let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
@@ -90,18 +116,25 @@ enum Memory {
         defer { lock.unlock() }
         if let l = loaded, l.stamp == stamp, l.size == size { return l }
         let entries = parse((try? String(contentsOf: url, encoding: .utf8)) ?? "")
-        let l = Loaded(stamp: stamp, size: size, entries: entries, index: Index(entries.map(\.text)), graph: MemoryGraph(entries))
+        let l = Loaded(stamp: stamp, size: size, entries: entries, index: Index(entries.map(\.text)), graph: nil)
         loaded = l
+        graphQueue.async {
+            guard lock.withLock({ loaded?.stamp == stamp && loaded?.size == size && loaded?.entries == entries }) else { return }
+            let graph = MemoryGraph(entries)
+            lock.lock(); defer { lock.unlock() }
+            guard let current = loaded, current.stamp == stamp, current.size == size, current.entries == entries else { return }
+            loaded = Loaded(stamp: stamp, size: size, entries: entries, index: current.index, graph: graph)
+        }
         // New or edited facts get their vectors in the background.
         Embedder.shared.warm(entries.map(\.text))
         return l
     }
 
     /// Every fact, in the order learned (scope tags left off).
-    static var facts: [String] { current.entries.map(\.text) }
-    static var entries: [Fact] { current.entries }
+    static var facts: [String] { entries.map(\.text) }
+    static var entries: [Fact] { batch?.entries ?? current.entries }
     /// The file's lines as written, tags included (for tidy-ups that rewrite the file).
-    static var lines: [String] { current.entries.map(\.line) }
+    static var lines: [String] { entries.map(\.line) }
 
     static func parse(_ text: String) -> [Fact] {
         text.split(separator: "\n").compactMap { raw -> Fact? in
@@ -258,20 +291,20 @@ enum Memory {
 
     static func isProfile(_ fact: String) -> Bool { fact.range(of: corePattern, options: .regularExpression) != nil }
 
-    /// Below this size every fact goes along with every request (about 4k tokens); above it the most relevant are picked.
-    private static let sendAllBudget = 16_000
+    /// Only tiny memories go along whole (~500 tokens); growing memory is retrieved instead of taxing every turn.
+    static let sendAllBudget = 2_000
 
     // MARK: Retrieval
 
     /// The facts worth sending for this request: the profile always, know-how for the app or site in use (or named),
     /// and the best matches among the rest. Everything while memory is small.
-    static func relevant(to context: String, app: String? = nil, host: String? = nil, limit: Int = 40) -> (facts: [String], omitted: Int) {
+    static func relevant(to context: String, app: String? = nil, host: String? = nil, limit: Int = 24) -> (facts: [String], omitted: Int) {
         let r = relevantExplained(to: context, app: app, host: host, limit: limit)
         return (r.facts, r.omitted)
     }
 
     /// `relevant`, also naming the facts that came in only through a link to a matching fact (for `clinqy memory`).
-    static func relevantExplained(to context: String, app: String? = nil, host: String? = nil, limit: Int = 40)
+    static func relevantExplained(to context: String, app: String? = nil, host: String? = nil, limit: Int = 24)
         -> (facts: [String], omitted: Int, linked: Set<String>) {
         let l = current
         let all = l.entries
@@ -303,7 +336,7 @@ enum Memory {
         var best = Dictionary(scored, uniquingKeysWith: max)
         var via: Set<Int> = []
         let allowed = Set(among)
-        for (j, a) in l.graph.spread(from: Array(scored.prefix(6)), damping: 0.8) where allowed.contains(j) && a >= strongest * 0.3 {
+        for (j, a) in (l.graph?.spread(from: Array(scored.prefix(6)), damping: 0.8) ?? [:]) where allowed.contains(j) && a >= strongest * 0.3 {
             if best[j] == nil { via.insert(j) }
             best[j] = max(best[j] ?? 0, a)
         }
@@ -502,7 +535,7 @@ enum Memory {
         let kept = scope ?? entries.first { $0.text == text && $0.tagged }?.scope
         all.append(Fact(text: text, scope: kept, tagged: kept != nil))
         // Never drop facts to make room (a cap here once silently deleted the user's email, CGPA and more).
-        write(all.map(\.line))
+        commit(all)
         touch(text, added: true)
     }
 
@@ -514,8 +547,8 @@ enum Memory {
         guard !text.isEmpty, let i = all.firstIndex(where: { $0.text == old }) else { return false }
         let fact = Fact(text: text, scope: all[i].tagged ? all[i].scope : nil, tagged: all[i].tagged)
         // The new wording may already be there as another line: keep just this one.
-        let lines = all.indices.compactMap { j -> String? in j == i ? fact.line : (all[j].text == text ? nil : all[j].line) }
-        write(lines)
+        let revised = all.indices.compactMap { j -> Fact? in j == i ? fact : (all[j].text == text ? nil : all[j]) }
+        commit(revised)
         touch(text, added: true)
         record(old: old, new: text, why: "updated")
         return true
@@ -525,7 +558,7 @@ enum Memory {
     static func remove(_ fact: String, why: String? = nil) -> Bool {
         let all = entries
         guard all.contains(where: { $0.text == fact }) else { return false }
-        write(all.filter { $0.text != fact }.map(\.line))
+        commit(all.filter { $0.text != fact })
         record(old: fact, new: nil, why: why ?? "removed")
         return true
     }
@@ -545,6 +578,7 @@ enum Memory {
     private static let historyURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".config/clinqy/memory.history.jsonl")
 
     static func record(old: String, new: String?, why: String) {
+        if let batch { batch.changes.append(Change(at: Date(), old: old, new: new, why: why)); return }
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         guard let data = try? encoder.encode(Change(at: Date(), old: old, new: new, why: why)) else { return }
@@ -654,6 +688,7 @@ enum Memory {
     }
 
     private static func saveMeta() {
+        if let batch { batch.metaDirty = true; return }
         let data = withMeta { m -> Data? in
             // Only facts still in memory.
             let live = Set(facts.map(Embedder.key))

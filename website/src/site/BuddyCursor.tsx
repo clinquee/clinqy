@@ -25,17 +25,20 @@ export function BuddyCursor({ enabled }: { enabled: boolean }) {
     let lastMove = performance.now()
     let raf = 0
 
+    const wake = () => { if (!raf && !document.hidden) raf = requestAnimationFrame(tick) }
     const onMove = (e: PointerEvent) => {
       mouse.x = e.clientX
       mouse.y = e.clientY
       mouse.seen = true
       lastMove = performance.now()
       target = (e.target as Element | null)?.closest('[data-buddy]') ?? null
+      wake()
     }
-    const onLeave = () => (target = null)
+    const onLeave = () => { target = null; wake() }
 
     const tick = (now: number) => {
-      raf = requestAnimationFrame(tick)
+      raf = 0
+      if (document.hidden) return
       const el = arrow.current
       const fr = frame.current
       if (!el || !fr) return
@@ -52,12 +55,7 @@ export function BuddyCursor({ enabled }: { enabled: boolean }) {
         fr.style.height = `${r.height + 12}px`
       }
       const idle = now - lastMove > 2600
-      if (idle && !framing) {
-        // Drift a little away and bob, like the app does when you stop.
-        const s = (now - lastMove - 2600) / 1000
-        tx += 40 + Math.sin(s * 1.3) * 10
-        ty += -30 + Math.cos(s * 1.7) * 8
-      }
+      if (idle && !framing) { tx += 40; ty -= 30 }
       // Critically-damped-ish spring: a touch of lag reads as "following".
       const k = framing ? 0.09 : 0.14
       vel.x = (vel.x + (tx - pos.x) * k) * 0.72
@@ -68,15 +66,22 @@ export function BuddyCursor({ enabled }: { enabled: boolean }) {
       el.style.transform = `translate(${pos.x}px, ${pos.y}px) rotate(${tilt}deg)`
       el.style.opacity = mouse.seen ? '1' : '0'
       fr.style.opacity = framing ? '1' : '0'
+      if (Math.hypot(tx - pos.x, ty - pos.y) > 0.1 || Math.hypot(vel.x, vel.y) > 0.1) wake()
     }
 
     window.addEventListener('pointermove', onMove, { passive: true })
     document.addEventListener('pointerleave', onLeave)
-    raf = requestAnimationFrame(tick)
+    window.addEventListener('scroll', wake, { passive: true })
+    window.addEventListener('resize', wake)
+    document.addEventListener('visibilitychange', wake)
+    wake()
     return () => {
       cancelAnimationFrame(raf)
       window.removeEventListener('pointermove', onMove)
       document.removeEventListener('pointerleave', onLeave)
+      window.removeEventListener('scroll', wake)
+      window.removeEventListener('resize', wake)
+      document.removeEventListener('visibilitychange', wake)
     }
   }, [enabled, supported])
 

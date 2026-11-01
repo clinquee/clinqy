@@ -40,7 +40,7 @@ import AppKit
         var checks = 0
         func check(_ value: Bool, _ label: String) throws { guard value else { throw WorkerCDP.error(label) }; checks += 1 }
         func page(_ label: String) -> String {
-            let html = "<title>\(label)</title><nav><img src='http://127.0.0.1:1/nav.png' width='90' height='70'></nav><img src='http://127.0.0.1:1/article.png' alt='Article image' width='90' height='70'><img src='http://127.0.0.1:1/icon.png' width='16' height='16'><label>Name<input id='name'></label><label>Resume<input id='upload' type='file' onchange=\"setTimeout(async()=>{document.querySelector('#uploadStatus').textContent=await this.files[0].text()},100)\"></label><button onclick=\"document.querySelector('#upload').click()\">Attach sample</button><p id='uploadStatus'></p><button onclick=\"document.body.dataset.sent='yes';this.textContent='Confirmed'\">Submit sample</button>"
+            let html = "<button onclick=\"const field=document.createElement('input');field.setAttribute('aria-label','Dynamic field');document.body.append(field)\">Add field</button><title>\(label)</title><nav><img src='http://127.0.0.1:1/nav.png' width='90' height='70'></nav><img src='http://127.0.0.1:1/article.png' alt='Article image' width='90' height='70'><img src='http://127.0.0.1:1/icon.png' width='16' height='16'><label>Name<input id='name'></label><label>Resume<input id='upload' type='file' onchange=\"setTimeout(async()=>{document.querySelector('#uploadStatus').textContent=await this.files[0].text()},100)\"></label><button onclick=\"document.querySelector('#upload').click()\">Attach sample</button><p id='uploadStatus'></p><button onclick=\"document.body.dataset.sent='yes';this.textContent='Confirmed'\">Submit sample</button>"
             return "data:text/html;base64," + Data(html.utf8).base64EncodedString()
         }
         do {
@@ -51,6 +51,26 @@ import AppKit
             async let second = other.newTab(secondURL)
             let (id, otherID) = try await (first, second)
             try rememberPID("worker"); try rememberPID("other")
+            let sourceAURL = page("Delegated source A"), sourceBURL = page("Delegated source B")
+            async let sourceA = worker.newTab(sourceAURL, select: false)
+            async let sourceB = worker.newTab(sourceBURL, select: false)
+            let (sourceAID, sourceBID) = try await (sourceA, sourceB)
+            try check(sourceAID != sourceBID && sourceAID != id, "parallel source tabs have distinct owned IDs")
+            let tabList = try await worker.command("tabs", tabID: nil)["tabs"] as? [[String: Any]] ?? []
+            try check(tabList.first(where: { $0["active"] as? Bool == true })?["id"] as? Int == id,
+                      "delegated source tabs don't replace the lead's selected tab")
+            async let sourceASnapshot = command(worker, "snapshot", tabID: sourceAID)
+            async let sourceBSnapshot = command(worker, "snapshot", tabID: sourceBID)
+            _ = try await (sourceASnapshot, sourceBSnapshot)
+            async let sourceAText = command(worker, "read", tabID: sourceAID)
+            async let sourceBText = command(worker, "read", tabID: sourceBID)
+            let (aText, bText) = try await (sourceAText, sourceBText)
+            try check((aText["text"] as? String)?.contains("Name") == true && (bText["text"] as? String)?.contains("Name") == true,
+                      "parallel reads are pinned to their source tabs")
+            _ = try await worker.command("closeTab", tabID: sourceAID)
+            _ = try await worker.command("closeTab", tabID: sourceBID)
+            let leadTab = try await worker.command("tabInfo", tabID: id)
+            try check(leadTab["title"] as? String == "Worker", "source-tab cleanup preserves the lead's task")
             try await Task.sleep(for: .milliseconds(500))
             let snap = try await command(worker, "snapshot", tabID: id)
             let imageList = try await command(worker, "images", tabID: id)["images"] as? [[String: Any]] ?? []
@@ -67,6 +87,17 @@ import AppKit
             _ = try await command(worker, "cdpType", tabID: id, args:["text":"Trusted worker input"])
             let typed = try await command(worker, "value", tabID: id, args:["index":name!])
             try check(typed["value"] as? String == "Trusted worker input", "trusted input stays in worker field")
+            let batch = try await command(worker, "values", tabID: id, args: ["indices": [name!]])
+            try check((batch["values"] as? [String: Any])?[String(name!)] as? String == "Trusted worker input", "batched field checks read current values")
+            let add = elements.first { ($0["text"] as? String ?? "") == "Add field" }!["i"] as! Int
+            _ = try await command(worker, "click", tabID: id, args: ["index": add])
+            let changedDOM = try await command(worker, "snapshot", tabID: id)
+            try check((changedDOM["elements"] as? [[String: Any]])?.contains { $0["text"] as? String == "Dynamic field" } == true, "candidate cache invalidates when the DOM adds a control")
+            let slowRead = Task { try await command(worker, "waitText", tabID: id, args: ["text": "fixture-that-never-appears", "ms": 5_000]) }
+            try await Task.sleep(for: .milliseconds(40))
+            let cancelledAt = Date(); slowRead.cancel()
+            do { _ = try await slowRead.value; preconditionFailure("cancelled CDP read completed") } catch { checks += 1 }
+            try check(Date().timeIntervalSince(cancelledAt) < 1, "cancelled browser commands return promptly")
             let submit = elements.first { ($0["text"] as? String ?? "").contains("Submit sample") }!["i"] as! Int
             _ = try await command(worker, "click", tabID: id, args:["index":submit])
             let sent = try await command(worker, "read", tabID: id)
@@ -115,7 +146,7 @@ import AppKit
             try await Task.sleep(for: .milliseconds(500))
             let nextSnapshot = try await command(worker, "snapshot", tabID: navigated)
             try check(nextSnapshot["title"] as? String == "After navigation", "reinstalls page helpers after navigation")
-            let embeddedHTML = "<title>Embedded form</title><iframe srcdoc=\"<label>Embedded name<input></label>\"></iframe>"
+            let embeddedHTML = "<title>Embedded form</title><iframe srcdoc=\"<label>Embedded name<input></label>\"></iframe><iframe srcdoc=\"<label>Second name<input></label>\"></iframe>"
             let embedded = try await worker.newTab("data:text/html;base64," + Data(embeddedHTML.utf8).base64EncodedString())
             try await Task.sleep(for: .milliseconds(300))
             let embeddedSnapshot = try await command(worker, "snapshot", tabID: embedded)
@@ -125,6 +156,11 @@ import AppKit
             _ = try await command(worker, "fill", tabID: embedded, args: ["index": embeddedField!, "text": "Inside frame"])
             let embeddedValue = try await command(worker, "value", tabID: embedded, args: ["index": embeddedField!])
             try check(embeddedValue["value"] as? String == "Inside frame", "cached frame context routes actions to the right document")
+            let frameFields = embeddedElements.filter { ["textbox", "text"].contains($0["role"] as? String ?? "") }.compactMap { $0["i"] as? Int }
+            try check(frameFields.count == 2, "concurrent snapshots include both embedded frames")
+            let frameBatch = try await command(worker, "values", tabID: embedded, args: ["indices": frameFields])
+            let frameValues = frameBatch["values"] as? [String: Any] ?? [:]
+            try check(frameValues[String(embeddedField!)] as? String == "Inside frame" && frameValues.count == 2, "batch reads stay pinned to the correct iframe")
             // Freshness tokens must bind a command to the exact document/listing, not just a URL or label.
             let fixture = "<title>Freshness</title><button id='target' onclick=\"document.querySelector('#result').textContent+='target;'\">Duplicate</button><button onclick=\"document.querySelector('#result').textContent+='second;'\">Duplicate</button><button onclick=\"const n=document.querySelector('#target');n.replaceWith(n.cloneNode(true))\">Replace target</button><button onclick=\"document.querySelector('#target').style.marginLeft='60px'\">Move target</button><button onclick=\"const ds=[...document.querySelectorAll('button')].filter(b=>b.textContent==='Duplicate');ds[0].before(ds[1])\">Reorder duplicates</button><p id='result'></p><iframe srcdoc=\"<label>Frame field<input></label>\"></iframe><button onclick=\"const f=document.querySelector('iframe');f.srcdoc=f.srcdoc\">Reload frame</button>"
             let fixtureURL = "data:text/html;base64," + Data(fixture.utf8).base64EncodedString()

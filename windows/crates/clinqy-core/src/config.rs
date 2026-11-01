@@ -64,28 +64,6 @@ pub fn on(key: &str, default: bool) -> bool {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn parses_env_lines() {
-        let v = super::parse("# c\nA=1\n B = \"two\" \nexport C='x'\nnoeq\n=bad");
-        assert_eq!(v["A"], "1");
-        assert_eq!(v["B"], "two");
-        assert_eq!(v["C"], "x");
-        assert_eq!(v.len(), 3);
-    }
-
-    #[test]
-    fn sets_settings_in_place() {
-        let t = "# Clinqy\nPROVIDER=claude-cli\n# VOICE_LANGUAGE=en\nHOTKEY=ctrl+alt\n";
-        let out = super::with_setting(t, "VOICE_LANGUAGE", "hinglish");
-        assert_eq!(out, "# Clinqy\nPROVIDER=claude-cli\nVOICE_LANGUAGE=hinglish\nHOTKEY=ctrl+alt\n");
-        assert_eq!(super::parse(&out)["VOICE_LANGUAGE"], "hinglish");
-        assert!(super::with_setting(&out, "NEW", "1").ends_with("NEW=1\n"));
-        assert!(!super::with_setting(&out, "VOICE_LANGUAGE", "").contains("VOICE_LANGUAGE"));
-    }
-}
-
 /// Saves a setting in the env file (see `with_setting`).
 pub fn set(key: &str, value: &str) -> std::io::Result<()> {
     let path = crate::paths::env_file();
@@ -119,4 +97,26 @@ pub fn with_setting(text: &str, key: &str, value: &str) -> String {
         out.push(line);
     }
     out.join("\n") + "\n"
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn parses_env_lines() {
+        let v = super::parse("# c\nA=1\n B = \"two\" \nexport C='x'\nnoeq\n=bad");
+        assert_eq!(v["A"], "1");
+        assert_eq!(v["B"], "two");
+        assert_eq!(v["C"], "x");
+        assert_eq!(v.len(), 3);
+    }
+
+    #[test]
+    fn sets_settings_in_place() {
+        let t = "# Clinqy\nPROVIDER=claude-cli\n# VOICE_LANGUAGE=en\nHOTKEY=ctrl+alt\n";
+        let out = super::with_setting(t, "VOICE_LANGUAGE", "hinglish");
+        assert_eq!(out, "# Clinqy\nPROVIDER=claude-cli\nVOICE_LANGUAGE=hinglish\nHOTKEY=ctrl+alt\n");
+        assert_eq!(super::parse(&out)["VOICE_LANGUAGE"], "hinglish");
+        assert!(super::with_setting(&out, "NEW", "1").ends_with("NEW=1\n"));
+        assert!(!super::with_setting(&out, "VOICE_LANGUAGE", "").contains("VOICE_LANGUAGE"));
+    }
 }

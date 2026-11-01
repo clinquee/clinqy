@@ -1,4 +1,5 @@
 import Foundation
+import Combine
 
 /// Past runs, newest first, kept in Application Support so the user can revisit or continue them.
 @MainActor
@@ -20,41 +21,68 @@ final class History: ObservableObject {
         var readText: String? = nil
         /// The first request of a chain of "continue"s: its instructions stay in force for every follow-up.
         var task: String? = nil
+        /// Stable links survive restarts and let task retrieval include later user corrections.
+        var threadID: UUID? = nil
+        var parentID: UUID? = nil
+        /// UI steps alone can't replay the fresh research/analysis that generated their typed content.
+        var requiresFreshWork: Bool? = nil
+
+        var episode: TaskMemory.Episode? {
+            guard let data = try? JSONEncoder.iso.encode(self), let safe = Secrets.maskJSON(data),
+                  let payload = String(data: safe, encoding: .utf8),
+                  let entry = try? JSONDecoder.iso.decode(Entry.self, from: safe) else { return nil }
+            return TaskMemory.Episode(id: id, date: date, request: entry.request, answer: entry.answer, ok: ok,
+                                      steps: entry.steps, app: entry.app, threadID: threadID ?? id,
+                                      parentID: parentID, payload: payload)
+        }
     }
 
     @Published private(set) var entries: [Entry] = []
 
-    private let url: URL = {
+    private static var defaultURL: URL {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Clinqy", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir.appendingPathComponent("history.json")
-    }()
+    }
+    private let url: URL
+    private let archive: TaskMemory
 
-    private init() {
+    init(file: URL? = nil, archive: TaskMemory = .shared) {
+        self.url = file ?? Self.defaultURL
+        self.archive = archive
         if let data = try? Data(contentsOf: url),
            let saved = try? JSONDecoder.iso.decode([Entry].self, from: data) {
             entries = saved
+            // Import retained history once per ID. Older builds only saved the original request of a thread.
+            var roots: [String: UUID] = [:]
+            for i in entries.indices.reversed() {
+                let root = entries[i].threadID ?? entries[i].task.flatMap { roots[$0] } ?? entries[i].id
+                entries[i].threadID = root
+                roots[entries[i].request] = root
+            }
+            archive.record(entries.compactMap(\.episode))
         }
     }
 
     func add(_ entry: Entry) {
-        var entry = entry
-        // A token a command printed mustn't be kept in History (it's shown, and sent back to the model on "continue").
-        entry = Entry(id: entry.id, date: entry.date, request: entry.request, answer: Secrets.mask(entry.answer), ok: entry.ok,
-                      steps: entry.steps.map(Secrets.mask), app: entry.app, result: entry.result, trace: entry.trace,
-                      readText: entry.readText.map(Secrets.mask), task: entry.task)
-        entries.insert(entry, at: 0)
+        // The archive receives the full redacted record before the UI's recent-history window is trimmed.
+        guard let episode = entry.episode,
+              let safe = try? JSONDecoder.iso.decode(Entry.self, from: Data(episode.payload.utf8)) else { return }
+        archive.record([episode])
+        entries.insert(safe, at: 0)
         if entries.count > 200 { entries.removeLast(entries.count - 200) }
         save()
     }
 
     func remove(_ entry: Entry) {
+        archive.remove(entry.id)
         entries.removeAll { $0.id == entry.id }
         save()
     }
 
     func clear() {
+        archive.clear()
         entries = []
         save()
     }

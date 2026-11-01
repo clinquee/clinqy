@@ -10,6 +10,7 @@ enum StatsCard {
         let stopped: Bool
         let seconds: Double
         let turns: Int
+        var modelSeconds: Double? = nil
         let app: String
     }
 
@@ -23,6 +24,7 @@ enum StatsCard {
             return Run(date: (obj["date"] as? String).flatMap(iso.date(from:)), request: obj["request"] as? String ?? "",
                        ok: obj["ok"] as? Bool ?? false, stopped: obj["stopped"] as? Bool ?? false,
                        seconds: (obj["seconds"] as? NSNumber)?.doubleValue ?? 0, turns: (obj["turns"] as? NSNumber)?.intValue ?? 0,
+                       modelSeconds: (obj["model_seconds"] as? NSNumber)?.doubleValue,
                        app: (obj["app"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "—")
         }
     }
@@ -83,7 +85,8 @@ enum StatsCard {
         func rate(_ runs: [Run]) -> String { runs.isEmpty ? "—" : "\(Int((Double(runs.filter(\.ok).count) / Double(runs.count) * 100).rounded()))%" }
         let times = all.filter(\.ok).map(\.seconds).sorted()
         let turnRuns = all.filter { $0.turns > 0 }
-        let perTurn = turnRuns.isEmpty ? 0 : turnRuns.map(\.seconds).reduce(0, +) / Double(turnRuns.map(\.turns).reduce(0, +))
+        let measured = turnRuns.filter { $0.modelSeconds != nil }
+        let perTurn = measured.isEmpty ? 0 : measured.compactMap(\.modelSeconds).reduce(0, +) / Double(measured.map(\.turns).reduce(0, +))
         let avgTurns = turnRuns.isEmpty ? 0 : Double(turnRuns.map(\.turns).reduce(0, +)) / Double(turnRuns.count)
 
         var items: [ResultCard.Item] = [
@@ -91,8 +94,8 @@ enum StatsCard {
                   detail: rate(all), link: nil),
             .init(title: "Time to finish (successful runs)", subtitle: "median · p90 \(secs(percentile(times, 0.9)))",
                   detail: secs(percentile(times, 0.5)), link: nil),
-            .init(title: "Seconds per model turn", subtitle: String(format: "%.1f turns per run on average", avgTurns),
-                  detail: String(format: "%.1f s", perTurn), link: nil),
+            .init(title: "Seconds per model turn", subtitle: String(format: "%.1f turns per run · %d runs with model timings", avgTurns, measured.count),
+                  detail: measured.isEmpty ? "—" : String(format: "%.1f s", perTurn), link: nil),
         ]
         let (runEnds, stepFails) = failures()
         for (reason, n) in runEnds {

@@ -11,8 +11,7 @@ fn env_dir(var: &str) -> Option<PathBuf> {
 /// The user's home folder (`%USERPROFILE%`).
 pub fn home() -> PathBuf {
     static HOME: OnceLock<PathBuf> = OnceLock::new();
-    HOME.get_or_init(|| env_dir("USERPROFILE").or_else(|| env_dir("HOME")).unwrap_or_else(|| PathBuf::from(".")))
-        .clone()
+    HOME.get_or_init(|| env_dir("USERPROFILE").or_else(|| env_dir("HOME")).unwrap_or_else(|| PathBuf::from("."))).clone()
 }
 
 /// `~/.config/clinqy`: env (settings), memory.md, the CLI token. Shared with the Mac app's layout.
@@ -68,9 +67,7 @@ pub fn expand(path: &str) -> PathBuf {
     }
     // Any other %VAR%.
     let re = regex::Regex::new(r"%([A-Za-z_][A-Za-z0-9_]*)%").unwrap();
-    p = re
-        .replace_all(&p, |c: &regex::Captures| std::env::var(&c[1]).unwrap_or_else(|_| c[0].to_string()))
-        .into_owned();
+    p = re.replace_all(&p, |c: &regex::Captures| std::env::var(&c[1]).unwrap_or_else(|_| c[0].to_string())).into_owned();
     PathBuf::from(p.replace('/', "\\"))
 }
 
@@ -89,7 +86,7 @@ mod tests {
 
     #[test]
     fn expands_home_forms() {
-        let h = home().display().to_string();
+        let h = home().display().to_string().replace('/', "\\");
         assert_eq!(expand("~/Downloads/a.pdf").display().to_string(), format!("{h}\\Downloads\\a.pdf"));
         assert_eq!(expand("$HOME\\x").display().to_string(), format!("{h}\\x"));
         assert_eq!(expand("\"C:/a b/c.txt\"").display().to_string(), "C:\\a b\\c.txt");

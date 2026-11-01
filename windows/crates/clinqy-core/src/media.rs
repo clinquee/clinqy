@@ -30,13 +30,11 @@ fn seconds(v: &serde_json::Value) -> Option<f64> {
 
 async fn duration(ffprobe: Option<&Path>, file: &Path) -> Option<f64> {
     let probe = ffprobe?;
-    let out = tokio::process::Command::new(probe)
-        .args(["-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1"])
-        .arg(file)
-        .creation_flags(crate::session::CREATE_NO_WINDOW)
-        .output()
-        .await
-        .ok()?;
+    let mut command = tokio::process::Command::new(probe);
+    #[cfg(windows)]
+    command.creation_flags(crate::session::CREATE_NO_WINDOW);
+    let out =
+        command.args(["-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1"]).arg(file).output().await.ok()?;
     String::from_utf8_lossy(&out.stdout).trim().parse().ok()
 }
 
@@ -46,8 +44,14 @@ fn beside(p: &Path, suffix: &str, ext: &str) -> PathBuf {
 }
 
 /// Runs one job; `progress` gets 0…1 as ffmpeg reports time.
-pub async fn run(op: &str, files: &[PathBuf], opts: &serde_json::Map<String, serde_json::Value>, progress: impl Fn(f64) + Send + Sync) -> Result<String, String> {
-    let ffmpeg = find("ffmpeg").ok_or("ffmpeg isn't installed. Install it once with `winget install Gyan.FFmpeg` (or set FFMPEG_PATH), then try again")?;
+pub async fn run(
+    op: &str,
+    files: &[PathBuf],
+    opts: &serde_json::Map<String, serde_json::Value>,
+    progress: impl Fn(f64) + Send + Sync,
+) -> Result<String, String> {
+    let ffmpeg = find("ffmpeg")
+        .ok_or("ffmpeg isn't installed. Install it once with `winget install Gyan.FFmpeg` (or set FFMPEG_PATH), then try again")?;
     let ffprobe = find("ffprobe");
     let first = files.first().ok_or("media needs files")?;
     for f in files {
@@ -66,7 +70,10 @@ pub async fn run(op: &str, files: &[PathBuf], opts: &serde_json::Map<String, ser
             let mut lines = vec![];
             for f in files {
                 let size = std::fs::metadata(f).map(|m| m.len()).unwrap_or(0);
-                let d = duration(ffprobe.as_deref(), f).await.map(|d| format!("{}:{:02}", (d / 60.0) as u64, (d % 60.0) as u64)).unwrap_or_else(|| "?".into());
+                let d = duration(ffprobe.as_deref(), f)
+                    .await
+                    .map(|d| format!("{}:{:02}", (d / 60.0) as u64, (d % 60.0) as u64))
+                    .unwrap_or_else(|| "?".into());
                 lines.push(format!("{}: {d} long, {}", crate::paths::display(f), bytes(size)));
             }
             return Ok(lines.join("\n"));
@@ -111,7 +118,10 @@ pub async fn run(op: &str, files: &[PathBuf], opts: &serde_json::Map<String, ser
             };
             target = out.unwrap_or_else(|| beside(first, "compressed", "mp4"));
             args.extend(["-i".into(), first.display().to_string()]);
-            args.extend(["-c:v", "libx264", "-preset", "medium", "-crf", crf, "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart"].map(String::from));
+            args.extend(
+                ["-c:v", "libx264", "-preset", "medium", "-crf", crf, "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart"]
+                    .map(String::from),
+            );
         }
         "to_mp4" | "convert" => {
             target = out.unwrap_or_else(|| beside(first, "converted", "mp4"));
@@ -126,12 +136,14 @@ pub async fn run(op: &str, files: &[PathBuf], opts: &serde_json::Map<String, ser
         other => return Err(format!("media op {other:?}: combine, trim, compress, to_mp4, to_audio or info")),
     }
     args.push(target.display().to_string());
-    let mut child = tokio::process::Command::new(&ffmpeg)
+    let mut command = tokio::process::Command::new(&ffmpeg);
+    #[cfg(windows)]
+    command.creation_flags(crate::session::CREATE_NO_WINDOW);
+    let mut child = command
         .args(&args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
-        .creation_flags(crate::session::CREATE_NO_WINDOW)
         .spawn()
         .map_err(|e| format!("couldn't start ffmpeg: {e}"))?;
     let stdout = child.stdout.take().unwrap();
@@ -169,6 +181,9 @@ pub async fn run(op: &str, files: &[PathBuf], opts: &serde_json::Map<String, ser
         return Err(format!("ffmpeg failed: {}", err.lines().last().unwrap_or("")));
     }
     let size = std::fs::metadata(&target).map(|m| m.len()).unwrap_or(0);
-    let length = duration(ffprobe.as_deref(), &target).await.map(|d| format!(", {}:{:02} long", (d / 60.0) as u64, (d % 60.0) as u64)).unwrap_or_default();
+    let length = duration(ffprobe.as_deref(), &target)
+        .await
+        .map(|d| format!(", {}:{:02} long", (d / 60.0) as u64, (d % 60.0) as u64))
+        .unwrap_or_default();
     Ok(format!("saved {} ({}{length})", crate::paths::display(&target), bytes(size)))
 }

@@ -12,6 +12,15 @@ it shares everything that matters with the Mac app: the browser extension, the s
 workflows, skills, the prompt, the `clinqy` command and the MCP server. A workflow or QA test recorded on a Mac
 replays on Windows.
 
+The core now archives tasks in `%APPDATA%\Clinqy\task-memory.sqlite` beyond the 200-entry History menu, retrieves relevant past work and follow-up corrections, streams API replies, and supports `delegate`/`collect` with independent sessions, dependencies, duplicate reuse, bounded concurrency and cancellation. Configure `DELEGATION`, `DELEGATE_MODEL`, `DELEGATE_CONCURRENCY` (default 3, maximum 6) and `DELEGATE_TIMEOUT`. Workers read public HTTP text and local text files; authenticated isolated browser sources remain Mac-only. Worker-generated tasks are excluded from automatic UI-only replay.
+
+Core regression checks (also runnable on macOS):
+
+```sh
+cargo test -p clinqy-core --lib
+cargo clippy -p clinqy-core --all-targets -- -D warnings
+```
+
 ## Install
 
 **Requirements:** Windows 10 (1903+) or 11, x64. WebView2 (built into Windows 11 and current Windows 10).

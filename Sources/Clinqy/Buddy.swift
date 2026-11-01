@@ -195,6 +195,10 @@ final class Buddy {
         finishFlight()
         mode = .flying
         wake()
+        if !Efficiency.humanMotion {
+            flight = Flight(start: start, control: control, end: end, began: CACurrentMediaTime(), duration: min(0.18, duration), done: nil)
+            return
+        }
         await withCheckedContinuation { continuation in
             flight = Flight(start: start, control: control, end: end, began: CACurrentMediaTime(),
                             duration: duration, done: continuation)
@@ -205,7 +209,7 @@ final class Buddy {
     func click() {
         if quiet { return }
         pressStart = CACurrentMediaTime()
-        ripples.append((pos, pressStart))
+        ripples.append((flight?.end ?? pos, pressStart))
         if ripples.count > 4 { ripples.removeFirst() }
         wake()
     }

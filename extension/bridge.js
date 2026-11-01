@@ -689,7 +689,7 @@ async function handle(msg) {
   }
   if (msg.cmd === "tabInfo") {
     const win = await chrome.windows.get(tab.windowId);
-    return { id: tab.id, url: tab.url || tab.pendingUrl || "", title: tab.title || "", focused: !!win.focused };
+    return { id: tab.id, url: tab.url || tab.pendingUrl || "", status: tab.status, title: tab.title || "", focused: !!win.focused };
   }
   const unguarded = new Set(["snapshot", "goBack", "navigate"]);
   if (!unguarded.has(msg.cmd)) {
@@ -752,6 +752,19 @@ async function handle(msg) {
     return await call(tab.id, frameId, name, [local, ...extra]);
   };
   switch (msg.cmd) {
+    case "values": {
+      const groups = new Map(), result = {};
+      for (const index of (msg.indices || []).slice(0, 200)) {
+        const { frameId, local } = await route(tab.id, index);
+        if (!groups.has(frameId)) groups.set(frameId, []);
+        groups.get(frameId).push([index, local]);
+      }
+      await Promise.all([...groups].map(async ([frameId, items]) => {
+        const reply = await call(tab.id, frameId, "values", [items.map(([, local]) => local)]);
+        for (const [global, local] of items) result[String(global)] = reply.values[String(local)] ?? null;
+      }));
+      return { values: result };
+    }
     case "snapshot": {
       // "Focused" = this browser's window is the focused one (the page itself may not have keyboard focus
       // right after typing in the address bar). A page that can't be read says why instead of looking empty.

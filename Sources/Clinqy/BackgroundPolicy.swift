@@ -51,7 +51,7 @@ enum BackgroundPolicy {
                 return .attention("This conversion opens an iWork application. Use foreground mode for it.")
             }
             return .api
-        case "think", "dictionary", "remember_answer", "calendar", "media", "application", "remember", "recall", "event", "reminder", "ask", "show", "assert", "schedule": return .api
+        case "delegate", "collect", "think", "dictionary", "remember_answer", "calendar", "media", "application", "remember", "recall", "event", "reminder", "ask", "show", "assert", "schedule": return .api
         case "email": return action["draft"] as? Bool == true ? .attention("A draft opens a Mail window. Use foreground mode to review it there.") : .api
         case "shell", "applescript": return .attention("Arbitrary scripts can change your desktop or shared input. Use the files, PDF, media or other supported actions in background mode.")
         default: return .attention("This action requires native desktop access and cannot run safely in background mode.")

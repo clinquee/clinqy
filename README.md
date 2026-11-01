@@ -109,7 +109,7 @@ Normal foreground navigation also uses the extension when connected: one request
 
 Use **Show Background Work** to open the task tab, or the screenshot view in headless mode. Files, PDFs, media and supported services use direct tools. Finder reveal, native app input, clipboard shortcuts, arbitrary shell/AppleScript and conversions that open iWork require an explicit switch to foreground mode. Background browser control is not a separate macOS desktop or sandbox for native apps.
 
-**Tasks & Recovery…** and Telegram **`/tasks`** read the same persisted task state: current stage, completed steps, last confirmed action and results. Requests, attachment paths and checkpoints are saved in owner-only `~/Library/Application Support/Clinqy/tasks.json`. After a restart, active tasks become **Interrupted**, retaining any in-flight action marker. They never resume or repeat sends/submissions automatically. Check the real outcome and send fresh instructions. Restored queued requests require review: start them in the Mac panel or use **`/run <id>`** in the paired Telegram chat. Missing files and unreadable task storage prevent execution. Downloading/staged attachments and unanswered questions are not resumed; resend any message that did not receive an acceptance reply.
+**Tasks & Recovery…** and Telegram **`/tasks`** read the same persisted task state: current stage, completed steps, last confirmed action and results. Requests, attachment paths and checkpoints are saved in owner-only `~/Library/Application Support/Clinqy/tasks.sqlite`. Existing `tasks.json` records are imported once; the original file is preserved. Writes update a single durable SQLite row per checkpoint; the UI holds recent tasks while older records remain searchable by ID. After a restart, active tasks become **Interrupted**, retaining any in-flight action marker. They never resume or repeat sends/submissions automatically. Check the real outcome and send fresh instructions. Restored queued requests require review: start them in the Mac panel or use **`/run <id>`** in the paired Telegram chat. Missing files and unreadable task storage prevent execution. Downloading/staged attachments and unanswered questions are not resumed; resend any message that did not receive an acceptance reply.
 
 Actions distinguish **confirmed**, **unverified**, **failed** and **refused** outcomes. Input sent to an app is not automatically a confirmed checkpoint. Uncertain sends/submissions stay stopped until the requested outcome is checked with fresh evidence; generic visual changes and closed dialogs do not prove success. Native screenshots, accessibility elements and coordinate actions are bound to one observed window; stale or ambiguous targets require another observation.
 
@@ -234,6 +234,10 @@ The bar's footer has **Dry run**, **Background**, **Circle**, **Watch**, **Skill
 - **Result cards.** Options, prices, plans and summaries appear in a card you can copy from.
 - **History.** Every run is saved. You can **Continue** from one or **Run again**.
 - **Memory.** After each task it keeps lasting facts about you (people, preferences, usual apps). It never saves passwords, card numbers or OTPs.
+- **Persistent task memory (Mac).** Runs are also archived in a local SQLite search index, beyond the History window's 200 recent runs. Each new task retrieves a small amount of related experience, including outcomes, steps and linked follow-up corrections. Exact repeats of proven, non-sensitive routes are checked before model-session setup; other matches guide the agent while it checks the current screen. Explicit corrections stop the old route being replayed as proven. A correction to the latest task can attach for up to 24 hours; other automatic follow-ups attach for 20 minutes. Existing retained history is imported automatically; records already discarded by older builds cannot be reconstructed. Clearing History clears the task archive too.
+- **Parallel delegation (Mac).** The lead can assign independent research, analysis, drafting and review jobs to separate model sessions while continuing its own work. Up to three workers run at once by default; dependencies wait for their inputs, and results return automatically or through `collect`. Workers read supplied files/public URLs; `browser:true` reads pages in their own headless Chrome tabs using the worker profile's sign-ins. They return evidence and drafts to the lead, which handles edits, clicks and submissions. Stopping or failing the parent cancels its workers. Worker failures/timeouts stop dependent jobs while independent jobs continue. User corrections cancel outstanding jobs; late results from cancelled jobs are ignored. Worker results and assignments are retained in task memory. Runs that generate content through workers require fresh reasoning and cannot become UI-only replays with stale text. Delegation is chosen for substantial independent work; simple tasks stay direct. Concurrent model requests can use more tokens or encounter provider rate limits.
+- **Windows memory and workers.** The Windows core also keeps a SQLite task archive beyond the recent History menu, retrieves prior outcomes and follow-up corrections, streams API replies, and runs bounded asynchronous workers with dependencies and duplicate reuse. Windows workers currently accept public HTTP text and local text files; browser-authenticated sources use the Mac isolated worker. Worker-generated tasks always require fresh reasoning rather than a UI-only replay.
+- **Runtime efficiency.** HTTP providers stream validated early actions, retain a bounded conversation with explicit historical excerpts, and retry rate limits within a request deadline. Mac actions use direct app/browser navigation and immediate input by default; `HUMAN_MOTION=on` restores decorative waiting. DOM candidate and frame caches invalidate when documents change; geometry and field values remain fresh. Shared source snapshots are scoped to one task. Run logs separate model time from task wall time; Mac logs also record startup, action and checkpoint phases (overlapping phases must not be added as total wall time).
 - **Watch & learn.** Click *Watch & learn*, do a task yourself, and press ⌃⌥ to stop. It becomes a reusable **skill** with fill-in parameters.
 - **Selected text and the clipboard.** Whatever you had highlighted is sent along with your request. With nothing highlighted, something you copied in the last 10 minutes counts as "this" ("translate this", "reply to this", "add this to my tracker"). Clipboard text is only sent when the request points at it, and password-manager copies are never kept.
 - **Saved workflows first.** If a request matches a saved workflow (same words, only the typed values differ: "message mom I'm stuck in traffic" vs. the saved "message mom I'll be late"), it's replayed with no model. The model only steps in to heal a step whose target is gone. Turn it off with `WORKFLOW_FIRST=off`.
@@ -464,6 +468,12 @@ Optional `KEY=value` lines in `~/.config/clinqy/env` (start from [`env.example`]
 | `VOICE_MODEL` | `speech` | Mac: which of Apple's models hears languages both cover, `speech` (SpeechTranscriber) or `dictation` (DictationTranscriber, the system Dictation's). Hindi always uses `dictation` |
 | `WHISPER_MODEL` | `small-q5_1` | Windows only: the whisper.cpp model |
 | `FAST_MODEL` | `haiku` | Faster model for routine steps; `off` to use only the main model |
+| `DELEGATION` | on | `off`: disable independent task workers |
+| `DELEGATE_MODEL` | Mac: `FAST_MODEL` or lead; Windows: sonnet tier | Model for independent workers; follows the lead's provider |
+| `DELEGATE_CONCURRENCY` | 3 | Simultaneous independent workers, clamped to 1–6; at most 24 jobs per task |
+| `DELEGATE_TIMEOUT` | 90 | Seconds per running worker, clamped to 10–300; queued jobs wait for a slot/dependencies |
+| `DELEGATE_EFFORT` | low | Mac worker reasoning effort; the lead checks and combines results |
+| `HUMAN_MOTION` | off | Mac: await decorative cursor motion and human-paced launcher/address typing |
 | `WORKFLOW_FIRST` | on | `off`: always ask the model, even when a saved workflow matches |
 | `UPDATE_CHECK` | on | Mac: `off` stops the daily check for a new version on GitHub |
 | `FOLLOW_UP` | on | `off`: don't keep the mic open after a spoken task |
@@ -478,7 +488,10 @@ Optional `KEY=value` lines in `~/.config/clinqy/env` (start from [`env.example`]
 | `~/Library/Application Support/Clinqy/models/bge-small-en-v1.5/` | The on-device retrieval model memory search uses (~130 MB, downloaded once from Hugging Face; nothing about you is sent). `CLINQY_EMBEDDINGS=system` in `~/.config/clinqy/env` keeps the built-in system vectors instead |
 | `~/.config/clinqy/memory.format` | The memory format version. A newer build upgrades older (or hand-edited) memory once on first launch, app or `clinqy` command: list styles and headings cleaned up, exact duplicates merged, the old file kept as `memory.backup-<date>.md` |
 | `~/.config/clinqy/memory.history.jsonl` | Every memory update and removal (old wording, new wording, why), so recall can say what a fact used to be |
-| `~/Library/Application Support/Clinqy/history.json` | Run history |
+| `~/Library/Application Support/Clinqy/history.json` | Recent run history (200 entries in the UI) |
+| `~/Library/Application Support/Clinqy/task-memory.sqlite` | Persistent task archive and full-text index on Mac; includes linked follow-ups, steps, outcomes and full retained History records. SQLite's `-wal` and `-shm` companion files are managed automatically |
+| `~/Library/Application Support/Clinqy/replays.json.sqlite` | Durable learned procedures; the 150-route in-memory window is only a cache |
+| `~/Library/Application Support/Clinqy/tasks.sqlite` | Durable per-task recovery checkpoints; imports legacy `tasks.json` once |
 | `~/Library/Application Support/Clinqy/skills.json` | Learned skills |
 | `~/Library/Application Support/Clinqy/workflows.json` | Saved workflows (and schedules) |
 | `~/Library/Application Support/Clinqy/applications.json` | Job applications Clinqy filled or sent |
@@ -495,8 +508,25 @@ zsh tests/observations.sh              # immutable capture coordinates and geome
 zsh tests/codex-session.sh             # persistent protocol/isolation tests, no model calls
 .build/debug/Clinqy --selftest     # safety rules, reply parsing, stats parsing, replay fixtures, scripting dictionaries
 .build/debug/Clinqy replay tests/replay   # recorded runs re-checked offline
-tests/run.sh [filter]                 # end-to-end in Chrome against local pages in tests/site
+zsh tests/task-memory.sh              # archive, follow-ups, redaction, retention
+zsh tests/route-memory.sh             # fast reuse, durable procedures, correction invalidation
+zsh tests/delegation.sh               # bounded workers, dependencies, dedup, cancellation
+zsh tests/delegation-worker.sh        # source loading and independent session lifecycle
+zsh tests/efficiency.sh               # 10k checkpoints, network SSE, source sharing, process cancellation
+zsh tests/extraction.sh               # bounded extraction and lossless CSV append
+zsh tests/benchmarks.sh               # synthetic 100–10k tasks and 2k/20k archive benchmark
+zsh tests/background-tasks.sh
+zsh tests/telegram.sh
+zsh tests/chrome-worker.sh            # isolated real Chrome profiles, local dummy pages
+cargo test --manifest-path windows/Cargo.toml -p clinqy-core --lib
+cargo clippy --manifest-path windows/Cargo.toml -p clinqy-core --all-targets -- -D warnings
+(cd website && npm ci && npm run build && npm audit)
+tests/run.sh [filter]                 # live app/model end-to-end tests; requires installed Clinqy
 ```
+
+Website tooling requires Node.js 22.12 or newer.
+
+On the development Mac (optimized synthetic fixtures), 10,000-task checkpoint pairs improved from a 79.3 ms median to 0.17 ms, and a 20,000-task broad memory query from 7,255 ms to 54 ms. Reopening the migrated 10,000-task store took 3.4 ms; the one-time JSON migration took 135 ms. Six simulated 100 ms worker jobs took 625 ms serially and 208 ms with three workers. These measure local overhead and scheduler concurrency, not live-model or website speed. Reproduce with `tests/benchmarks.sh` and `tests/delegation.sh`.
 
 **Replay fixtures** (`tests/replay/*.json`) are recorded runs: the page snapshots the extension sent, plus the model's reply for each turn. Replaying them needs no browser, model or screen. Each turn is checked against pure code:
 - how the reply is parsed into actions

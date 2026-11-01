@@ -43,6 +43,12 @@ enum MemoryTidy {
                 Agent.writeLog("🧠 memory tidy skipped: the result would have lost details")
                 return nil
             }
+            // Learning and hand edits can happen while the model is tidying. Never overwrite those newer facts
+            // with a result based on an older snapshot; a later tidy will use the current list.
+            guard Memory.lines == facts else {
+                Agent.writeLog("🧠 memory tidy skipped: facts changed while it was running")
+                return nil
+            }
             Memory.replaceAll(with: cleaned, backup: true)
             for (fact, why) in removed where !fact.isEmpty && !cleaned.contains(fact) { Memory.record(old: fact, new: nil, why: "tidy: \(why)") }
             UserDefaults.standard.set(cleaned.count, forKey: lastCountKey)

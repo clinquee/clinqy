@@ -99,10 +99,13 @@ final class Hand {
         guard window.frame.contains(el.center) else { return refuse("the element is outside the observed window; look again") }
         lastMethod = "axpress"
         await buddy.travel(to: el.center, framing: el.frame)
-        try? await Task.sleep(for: .milliseconds(80))
+        guard !Task.isCancelled else { return "Stopped" }
+        if Efficiency.humanMotion { try? await Task.sleep(for: .milliseconds(80)) }
+        guard !Task.isCancelled else { return "Stopped" }
         if let why = window.staleness(includeContent: true) { return refuse(why) }
         buddy.click()
         let element = el.element
+        guard !Task.isCancelled else { return "Stopped" }
         switch await Task.detached(operation: { AXEngine.axPressDelivery(element) }).value {
         case .delivered: return nil
         case .uncertain:
@@ -110,6 +113,7 @@ final class Hand {
             return nil // Observe the effect; never issue a second input after an ambiguous AX reply.
         case .unsupported: break
         }
+        guard !Task.isCancelled else { return "Stopped" }
         // An explicitly unsupported AX action permits one checked pixel input.
         if let why = window.staleness(includeContent: true) { return refuse(why) }
         if let why = hitCheck(el.center, pid: app.processIdentifier, window: window.element) { return refuse(why) }
@@ -134,7 +138,9 @@ final class Hand {
         }
         if let pid, let why = hitCheck(point, pid: pid, window: window?.element) { return refuse(why) }
         await buddy.travel(to: point)
-        try? await Task.sleep(for: .milliseconds(80))
+        guard !Task.isCancelled else { return "Stopped" }
+        if Efficiency.humanMotion { try? await Task.sleep(for: .milliseconds(80)) }
+        guard !Task.isCancelled else { return "Stopped" }
         // Cursor animation is asynchronous: verify again immediately before input delivery.
         if let why = window?.staleness(includeContent: true) { return refuse(why) }
         if let pid, let why = hitCheck(point, pid: pid, window: window?.element) { return refuse(why) }
@@ -192,7 +198,9 @@ final class Hand {
               requested.map { el.observationID == $0.id } ?? true else { return refuse("the field belongs to another observation; look again") }
         if let why = window.staleness(includeContent: true) { return refuse(why) }
         await buddy.travel(to: el.center, framing: el.frame)
-        try? await Task.sleep(for: .milliseconds(90))
+        guard !Task.isCancelled else { return "Stopped" }
+        if Efficiency.humanMotion { try? await Task.sleep(for: .milliseconds(90)) }
+        guard !Task.isCancelled else { return "Stopped" }
         if let why = window.staleness(includeContent: true) { return refuse(why) }
         buddy.click()
         var settable = DarwinBoolean(false)
@@ -571,6 +579,7 @@ final class Hand {
         }
         // In a background run the app opens behind the user's (no Dock click, no Spotlight).
         if Background.active { return await Launcher.launch(url) }
+        if !Efficiency.humanMotion { return await Launcher.launch(url) }
 
         trace("openApp \(appName) dock=\(AXEngine.dockItem(named: appName) != nil)")
         if let dock = AXEngine.dockItem(named: appName) {
@@ -644,6 +653,19 @@ final class Hand {
             return NSWorkspace.shared.frontmostApplication
         }
 
+        if !Efficiency.humanMotion {
+            let bridge = BrowserBridge.shared
+            if bridge.isConnected(browser), let tab = await bridge.activeTab(in: browser),
+               await bridge.tabCommand(newTab ? "newTab" : "navigate", on: tab, ["url": url.absoluteString]) != nil {
+                return browser
+            }
+            if newTab, let bundle = browser.bundleURL {
+                let configuration = NSWorkspace.OpenConfiguration()
+                configuration.activates = true
+                if let opened = try? await NSWorkspace.shared.open([url], withApplicationAt: bundle, configuration: configuration) { return opened }
+            }
+        }
+
         trace("browser \(browser.cleanName ?? "?") front=\(NSWorkspace.shared.frontmostApplication?.cleanName ?? "-")")
         // A new tab for a fresh destination; otherwise edit the current tab's address like a person would.
         press(newTab ? "cmd+t" : "cmd+l")
@@ -675,10 +697,13 @@ final class Hand {
         buddy.setTyping(true)
         // Deliver keys straight to the browser so they can't land in some other window.
         AXEngine.targetPid = browser.processIdentifier
-        for ch in address {
-            AXEngine.type(String(ch))
-            try? await Task.sleep(for: .milliseconds(Int.random(in: 22...60)))
-        }
+        if Efficiency.humanMotion {
+            for ch in address {
+                guard !Task.isCancelled else { break }
+                AXEngine.type(String(ch))
+                try? await Task.sleep(for: .milliseconds(Int.random(in: 22...60)))
+            }
+        } else { AXEngine.type(address) }
         AXEngine.targetPid = nil
         buddy.setTyping(false)
         try? await Task.sleep(for: .milliseconds(150))

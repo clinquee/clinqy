@@ -30,7 +30,7 @@ final class WorkerCDP {
                         else { waiter.resume(returning: body["result"] as? [String: Any] ?? [:]) }
                     } else if let method = body["method"] as? String {
                         if method == "Page.fileChooserOpened" { self.lastChooser = body["params"] as? [String: Any] }
-                        if ["Runtime.executionContextsCleared", "Runtime.executionContextDestroyed", "Page.frameNavigated"].contains(method) {
+                        if ["Runtime.executionContextsCleared", "Runtime.executionContextDestroyed", "Page.frameNavigated", "Page.frameAttached", "Page.frameDetached"].contains(method) {
                             self.contextRevision += 1
                         }
                     }
@@ -44,21 +44,30 @@ final class WorkerCDP {
         nextID += 1
         let id = nextID
         let data = try JSONSerialization.data(withJSONObject: ["id": id, "method": method, "params": parameters])
-        return try await withCheckedThrowingContinuation { done in
-            pending[id] = done
-            Task { [weak self] in
-                guard let self else { return }
-                do { try await self.socket.send(.string(String(decoding: data, as: UTF8.self))) }
-                catch {
-                    self.timeouts.removeValue(forKey: id)?.cancel()
-                    self.pending.removeValue(forKey: id)?.resume(throwing: error)
+        let closing = ["Browser.close", "Target.closeTarget"].contains(method)
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { done in
+                guard closing || !Task.isCancelled else { done.resume(throwing: CancellationError()); return }
+                pending[id] = done
+                Task { [weak self] in
+                    guard let self, self.pending[id] != nil else { return }
+                    do { try await self.socket.send(.string(String(decoding: data, as: UTF8.self))) }
+                    catch {
+                        self.timeouts.removeValue(forKey: id)?.cancel()
+                        self.pending.removeValue(forKey: id)?.resume(throwing: error)
+                    }
+                }
+                timeouts[id] = Task { [weak self] in
+                    do { try await Task.sleep(for: .seconds(timeout)) } catch { return }
+                    self?.timeouts.removeValue(forKey: id)
+                    self?.pending.removeValue(forKey: id)?.resume(throwing: Self.error("Chrome worker command timed out: " + method))
                 }
             }
-            timeouts[id] = Task { [weak self] in
-                do { try await Task.sleep(for: .seconds(timeout)) } catch { return }
-                self?.timeouts.removeValue(forKey: id)
-                self?.pending.removeValue(forKey: id)?.resume(throwing: Self.error("Chrome worker command timed out: " + method))
-            }
+        } onCancel: {
+            if !closing { Task { @MainActor [weak self] in
+                self?.timeouts.removeValue(forKey: id)?.cancel()
+                self?.pending.removeValue(forKey: id)?.resume(throwing: CancellationError())
+            } }
         }
     }
     func close() {
@@ -128,6 +137,7 @@ final class ChromeWorker {
         var uploads: [URL] = []
         var helperContexts: [String: Int] = [:]
         var contextRevision = -1
+        var frameRevision = -1
         var finalCapture: String?
         var finalCaptureTask: Task<String?, Never>?
         var freezeGeneration: Int?
@@ -331,27 +341,34 @@ final class ChromeWorker {
         process = nil
     }
 
-    func newTab(_ url: String) async throws -> Int {
+    func newTab(_ url: String, select: Bool = true) async throws -> Int {
         try await start()
         guard let browser else { throw WorkerCDP.error("Chrome worker is not connected") }
         let result = try await browser.call("Target.createTarget", ["url": url, "background": true])
         guard let target = result["targetId"] as? String else { throw WorkerCDP.error("Chrome didn't return a task target") }
-        // Resolve the owned target's WebSocket via this process's loopback endpoint.
-        let portText = try String(contentsOf: root.appendingPathComponent("DevToolsActivePort"), encoding: .utf8)
-        guard let port = portText.split(separator: "\n").first,
-              let address = URL(string: "http://127.0.0.1:\(port)/json/list") else { throw WorkerCDP.error("Missing worker endpoint") }
-        let (data, _) = try await session.data(from: address)
-        let targets = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] ?? []
-        guard let socket = targets.first(where: { $0["id"] as? String == target })?["webSocketDebuggerUrl"] as? String,
-              let url = URL(string: socket), ["127.0.0.1", "localhost"].contains(url.host ?? "") else { throw WorkerCDP.error("The worker's own page endpoint is unavailable") }
-        let connection = WorkerCDP(url: url, session: session)
-        _ = try await connection.call("Page.enable")
-        _ = try await connection.call("Runtime.enable")
-        _ = try await connection.call("Page.setInterceptFileChooserDialog", ["enabled": true])
-        _ = try await connection.call("Emulation.setDeviceMetricsOverride", ["width": 1440, "height": 900, "deviceScaleFactor": 1, "mobile": false])
-        nextTab += 1
-        tabs[nextTab] = Tab(target: target, cdp: connection); selected = nextTab
-        return nextTab
+        do {
+            // Resolve the owned target's WebSocket via this process's loopback endpoint.
+            let portText = try String(contentsOf: root.appendingPathComponent("DevToolsActivePort"), encoding: .utf8)
+            guard let port = portText.split(separator: "\n").first,
+                  let address = URL(string: "http://127.0.0.1:\(port)/json/list") else { throw WorkerCDP.error("Missing worker endpoint") }
+            let (data, _) = try await session.data(from: address)
+            let targets = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] ?? []
+            guard let socket = targets.first(where: { $0["id"] as? String == target })?["webSocketDebuggerUrl"] as? String,
+                  let url = URL(string: socket), ["127.0.0.1", "localhost"].contains(url.host ?? "") else { throw WorkerCDP.error("The worker's own page endpoint is unavailable") }
+            let connection = WorkerCDP(url: url, session: session)
+            _ = try await connection.call("Page.enable")
+            _ = try await connection.call("Runtime.enable")
+            _ = try await connection.call("Page.setInterceptFileChooserDialog", ["enabled": true])
+            _ = try await connection.call("Emulation.setDeviceMetricsOverride", ["width": 1440, "height": 900, "deviceScaleFactor": 1, "mobile": false])
+            nextTab += 1
+            tabs[nextTab] = Tab(target: target, cdp: connection)
+            if select { selected = nextTab }
+            return nextTab
+        } catch {
+            // A cancellation or attachment failure after createTarget mustn't leave an untracked page running.
+            _ = try? await browser.call("Target.closeTarget", ["targetId": target], timeout: 3)
+            throw error
+        }
     }
 
     func command(_ command: String, tabID: Int?, args: [String: Any] = [:]) async throws -> [String: Any] {
@@ -430,7 +447,7 @@ final class ChromeWorker {
             _ = try await browser?.call("Target.closeTarget", ["targetId": tab.target]); tab.cdp.close(); for url in tab.uploads { try? FileManager.default.removeItem(at: url) }; tabs.removeValue(forKey: id)
             return ["closed": id]
         case "tabInfo":
-            let info = try await evaluate(tab, expression: "({url:location.href,title:document.title})")
+            let info = try await evaluate(tab, expression: "({url:location.href,title:document.title,ready:document.readyState})")
             return (info as? [String: Any] ?? [:]).merging(["id": id, "focused": false]) { _, new in new }
         case "navigate": _ = try await tab.cdp.call("Page.navigate", ["url": args["url"] as? String ?? "about:blank"]); return ["ok": true]
         case "goBack":
@@ -564,9 +581,23 @@ final class ChromeWorker {
         guard let quad = model?["content"] as? [Double], quad.count >= 2 else { throw WorkerCDP.error("Can't locate embedded frame") }
         return CGPoint(x: quad[0], y: quad[1])
     }
+    private struct FrameSnapshot: Sendable { let frame: String; let data: Data?; let origin: CGPoint }
+    private func frameSnapshot(_ frame: String, tab: Tab) async -> FrameSnapshot {
+        do {
+            try Task.checkCancellation()
+            let part = try await call(tab, frame: frame, function: "snapshot")
+            let origin = try await offset(frame, tab: tab)
+            return FrameSnapshot(frame: frame, data: try JSONSerialization.data(withJSONObject: part), origin: origin)
+        } catch { return FrameSnapshot(frame: frame, data: nil, origin: .zero) }
+    }
+
     private func snapshot(_ tab: Tab, id: Int) async throws -> [String: Any] {
-        guard let tree = try await tab.cdp.call("Page.getFrameTree")["frameTree"] as? [String: Any] else { throw WorkerCDP.error("Chrome returned no page frame") }
-        tab.frames = frameList(tree); tab.incomplete = false
+        if tab.frames.isEmpty || tab.frameRevision != tab.cdp.contextRevision {
+            let revision = tab.cdp.contextRevision
+            guard let tree = try await tab.cdp.call("Page.getFrameTree")["frameTree"] as? [String: Any] else { throw WorkerCDP.error("Chrome returned no page frame") }
+            tab.frames = frameList(tree); tab.frameRevision = revision
+        }
+        tab.incomplete = tab.frames.count > 64
         guard let top = tab.frames.first else { throw WorkerCDP.error("The worker page has no frame") }
         var result = try await call(tab, frame: top, function: "snapshot")
         let url = result["url"] as? String ?? ""
@@ -575,15 +606,33 @@ final class ChromeWorker {
         tab.page = url; tab.documentID = documentID; tab.snapshotID = UUID().uuidString
         tab.frameTokens.removeAll()
         tab.elements.removeAll()
+        // Four in-flight frame reads overlap CDP round trips without flooding Chrome with large snapshots.
+        var parts: [String: FrameSnapshot] = [:]
+        await withTaskGroup(of: FrameSnapshot.self) { group in
+            var frames = tab.frames.prefix(64).dropFirst().makeIterator()
+            for _ in 0..<4 { if let frame = frames.next() { group.addTask { await self.frameSnapshot(frame, tab: tab) } } }
+            for await part in group {
+                parts[part.frame] = part
+                if let frame = frames.next() { group.addTask { await self.frameSnapshot(frame, tab: tab) } }
+            }
+        }
         var elements: [[String: Any]] = []
-        for frame in tab.frames {
+        for frame in tab.frames.prefix(64) {
             do {
-                let part = frame == top ? result : try await call(tab, frame: frame, function: "snapshot")
+                let part: [String: Any]
+                let origin: CGPoint
+                if frame == top { part = result; origin = .zero }
+                else {
+                    guard let read = parts[frame], let data = read.data,
+                          let decoded = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                        tab.incomplete = true; continue
+                    }
+                    part = decoded; origin = read.origin
+                }
                 guard let document = part["documentID"] as? String, let revision = part["snapshotID"] as? String else {
                     throw WorkerCDP.error("An embedded frame has no freshness token")
                 }
                 tab.frameTokens[frame] = ["documentID": document, "snapshotID": revision]
-                let origin = try await offset(frame, tab: tab)
                 for var element in part["elements"] as? [[String: Any]] ?? [] {
                     guard let local = element["i"] as? Int else { continue }
                     let key = frame + ":" + document + ":" + (element["key"] as? String ?? "\(element["role"] ?? ""):\(element["text"] ?? ""):\(local)")
@@ -614,6 +663,21 @@ final class ChromeWorker {
             return try await call(tab, frame: element.frame, function: name, args: [element.local] + extra)
         }
         switch command {
+        case "values":
+            let indices = Array((args["indices"] as? [Int] ?? []).prefix(200))
+            let groups = Dictionary(grouping: indices.compactMap { index in tab.elements[index].map { (index, $0) } }, by: { $0.1.frame })
+            var result: [String: Any] = [:]
+            try await withThrowingTaskGroup(of: [String: String].self) { group in
+                for (frame, items) in groups {
+                    group.addTask { @MainActor in
+                        let reply = try await self.call(tab, frame: frame, function: "values", args: [items.map { $0.1.local }])
+                        let values = reply["values"] as? [String: Any] ?? [:]
+                        return Dictionary(uniqueKeysWithValues: items.compactMap { item in (values[String(item.1.local)] as? String).map { (String(item.0), $0) } })
+                    }
+                }
+                for try await values in group { result.merge(values) { _, new in new } }
+            }
+            return ["values": result]
         case "click", "focus", "value", "isActive", "prepare", "state", "chosen", "alive", "focusFor": return try await indexed(command)
         case "clickOption":
             guard let frame = args["pointFrame"] as? String, tab.frameTokens[frame] != nil, let token = args["pointToken"] as? String else {

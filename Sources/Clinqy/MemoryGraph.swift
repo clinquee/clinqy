@@ -26,7 +26,8 @@ struct MemoryGraph {
         var weight: [Int: [Int: Double]] = [:]
         for (e, docs) in postings where docs.count >= 2 && docs.count <= hub {
             let w = MemoryGraph.strength(of: e) / log2(1 + Double(docs.count))
-            for a in docs { for b in docs where a != b { weight[a, default: [:]][b, default: 0] += w } }
+            let bounded = docs.suffix(48)
+            for a in bounded { for b in bounded where a != b { weight[a, default: [:]][b, default: 0] += w } }
         }
         self.entities = entities
         self.postings = postings

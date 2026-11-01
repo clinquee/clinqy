@@ -11,6 +11,14 @@ use crate::reply::{self, Action, ActionExt};
 use std::collections::HashMap;
 use tokio::sync::mpsc;
 
+/// Dropping a parent run must also cancel its in-flight model request.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// What the actions of one turn work against; refreshed as they go.
 #[derive(Clone, Default)]
 pub(crate) struct Ctx {
@@ -53,6 +61,7 @@ pub(crate) struct RunState {
     /// Told once to check for itself before claiming the task is done.
     pub warned_of_failure: bool,
     pub request: String,
+    pub workers: Option<crate::delegation::Pool>,
     pub dry: bool,
     pub test: bool,
     pub qa: bool,
@@ -93,7 +102,9 @@ impl ActionResult {
 pub fn is_question(request: &str) -> bool {
     let r = request.trim().to_lowercase();
     r.ends_with('?')
-        || regex::Regex::new(r"^(so |and |ok |okay )?(what|what's|whats|who|who's|where|when|which|how|tell me|do you know|remind me)\b").unwrap().is_match(&r)
+        || regex::Regex::new(r"^(so |and |ok |okay )?(what|what's|whats|who|who's|where|when|which|how|tell me|do you know|remind me)\b")
+            .unwrap()
+            .is_match(&r)
 }
 
 /// A short title with nothing in it ("Your roll number", "Found it").
@@ -134,7 +145,8 @@ pub fn may_meet_forms(text: &str) -> bool {
 
 /// Steps worth starting while the model is still writing (they act on the screen, not outside it).
 pub fn starts_early(a: &Action) -> bool {
-    ["click", "type", "choose", "scroll", "key", "open_url", "open_app", "autofill", "upload", "read", "review"].contains(&a.kind().as_str())
+    ["click", "type", "choose", "scroll", "key", "open_url", "open_app", "autofill", "upload", "read", "review"]
+        .contains(&a.kind().as_str())
 }
 
 pub fn qa_prompt(name: &str, test: &str) -> String {
@@ -180,7 +192,13 @@ impl Agent {
             f.contains("ok to work") && (f.contains("call") || f.contains("screen shar"))
         });
         if !qa && !calls_ok && self.platform.mic_in_use() {
-            let reply = self.ask_user("You seem to be on a call (the mic is in use). Should I go ahead and use the screen?", vec!["Go ahead".into(), "Not now".into()], false).await;
+            let reply = self
+                .ask_user(
+                    "You seem to be on a call (the mic is in use). Should I go ahead and use the screen?",
+                    vec!["Go ahead".into(), "Not now".into()],
+                    false,
+                )
+                .await;
             match reply {
                 Some(r) if r.to_lowercase().starts_with("go") || crate::safety::is_yes(&r) => self.set_phase(Phase::Thinking),
                 _ => return self.finish(false, "Okay, I'll wait until you're off the call"),
@@ -193,6 +211,11 @@ impl Agent {
             Ok(Err(e)) => return self.finish(false, &e.to_string()),
             Err(e) => return self.finish(false, &e.to_string()),
         };
+        rs.workers = Some(crate::delegation::Pool::new(
+            request.clone(),
+            session.provider,
+            crate::config::value("DELEGATE_MODEL").unwrap_or_else(|| "sonnet".into()),
+        ));
         // The next request's session starts warming now.
         self.prewarm();
 
@@ -223,13 +246,25 @@ impl Agent {
             }
             let continuation = self.current.lock().continuation.is_some();
             if turn == 0 && !continuation && !qa {
-                let place = (obs.app.as_ref().map(|a| a.name.clone()), obs.page.as_ref().map(|p| p.url.clone()), obs.page.as_ref().map(|p| p.title.clone()));
+                let place = (
+                    obs.app.as_ref().map(|a| a.name.clone()),
+                    obs.page.as_ref().map(|p| p.url.clone()),
+                    obs.page.as_ref().map(|p| p.title.clone()),
+                );
                 self.current.lock().start_place = place.clone();
                 let ctx = self.context.lock().clone();
                 let cache = crate::workflow::replay_cache();
-                if !test && !dry && ctx.selected_text.is_none() && ctx.selected_files.is_empty() && crate::config::on("WORKFLOW_FIRST", true) {
+                if !test
+                    && !dry
+                    && ctx.selected_text.is_none()
+                    && ctx.selected_files.is_empty()
+                    && crate::config::on("WORKFLOW_FIRST", true)
+                {
                     if let Some(w) = cache.replayable(&request, place.0.as_deref(), place.1.as_deref(), place.2.as_deref()) {
-                        self.log(&format!("replay-first: this exact request worked here before — replaying {} steps, no model", w.steps.len()));
+                        self.log(&format!(
+                            "replay-first: this exact request worked here before — replaying {} steps, no model",
+                            w.steps.len()
+                        ));
                         self.push_step("Done exactly this before — replaying it, no model needed", StepState::Info);
                         session.close();
                         Box::pin(self.replay_or_heal(w, HashMap::new(), None, opts)).await;
@@ -289,12 +324,17 @@ impl Agent {
                         self.log(&format!("  memory: {} fact(s) for this page", found.len()));
                     }
                 }
-                let fields: Vec<String> = page.elements.iter().filter(|e| e.editable).map(|e| format!("w{} {}", e.index, e.extra)).collect();
+                let fields: Vec<String> =
+                    page.elements.iter().filter(|e| e.editable).map(|e| format!("w{} {}", e.index, e.extra)).collect();
                 self.log(&format!(
                     "  page: {} · {} elements{}",
                     page.title.chars().take(50).collect::<String>(),
                     page.elements.len(),
-                    if fields.is_empty() { String::new() } else { format!(" · fields: {}", fields.join(" | ").chars().take(300).collect::<String>()) }
+                    if fields.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" · fields: {}", fields.join(" | ").chars().take(300).collect::<String>())
+                    }
                 ));
             }
             let known = obs.page.as_ref().map(|p| p.elements.len()).unwrap_or(obs.elements.len());
@@ -307,7 +347,10 @@ impl Agent {
                 wants_look = true;
                 let r = super::circle_bounds(c);
                 let inside: Vec<&str> = obs.elements.iter().filter(|e| e.rect.intersects(&r)).map(|e| e.id.as_str()).take(30).collect();
-                message += &format!("\nInside the circled area: {}", if inside.is_empty() { "no listed elements (use the screenshot).".to_string() } else { inside.join(", ") });
+                message += &format!(
+                    "\nInside the circled area: {}",
+                    if inside.is_empty() { "no listed elements (use the screenshot).".to_string() } else { inside.join(", ") }
+                );
             }
             let mut image: Option<String> = None;
             if wants_look {
@@ -334,6 +377,11 @@ impl Agent {
             // Anything the user added mid-task comes first: it can change the plan.
             let added: Vec<String> = std::mem::take(&mut *self.added.lock());
             if !added.is_empty() {
+                rs.workers = Some(crate::delegation::Pool::new(
+                    request.clone(),
+                    session.provider,
+                    crate::config::value("DELEGATE_MODEL").unwrap_or_else(|| "sonnet".into()),
+                ));
                 message = format!(
                     "The user added while you were working (take it into account; it may change the plan):\n{}\n\n{message}",
                     added.iter().map(|a| format!("- {a}")).collect::<Vec<_>>().join("\n")
@@ -342,7 +390,8 @@ impl Agent {
             let turn_text = format!(
                 "{message}\n\n{screen}{}{}",
                 match (&image, &circled) {
-                    (Some(_), Some(_)) => "\n(Screenshot attached: red boxes are tagged with the same e<N> ids. The yellow loop is what the user circled.)",
+                    (Some(_), Some(_)) =>
+                        "\n(Screenshot attached: red boxes are tagged with the same e<N> ids. The yellow loop is what the user circled.)",
                     (Some(_), None) => "\n(Screenshot attached: red boxes are tagged with the same e<N> ids.)",
                     _ => "",
                 },
@@ -368,13 +417,22 @@ impl Agent {
             let s = session.clone();
             let send_text = turn_text.clone();
             let shot = image.clone();
-            let mut replying = tokio::spawn(async move { s.send(&send_text, shot, if early_on { Some(ptx) } else { None }).await });
+            let me = self.clone();
+            let measured_generation = self.generation.load(Ordering::Relaxed);
+            let mut replying = AbortOnDrop(tokio::spawn(async move {
+                let start = Instant::now();
+                let result = s.send(&send_text, shot, if early_on { Some(ptx) } else { None }).await;
+                if me.generation.load(Ordering::Relaxed) == measured_generation {
+                    me.current.lock().model_seconds += start.elapsed().as_secs_f64();
+                }
+                result
+            }));
             let mut early: Option<(Action, ActionResult, Option<Target>)> = None;
             let reply_result;
             loop {
                 tokio::select! {
                     biased;
-                    r = &mut replying => { reply_result = Some(r); break; }
+                    r = &mut replying.0 => { reply_result = Some(r); break; }
                     p = prx.recv() => {
                         let Some(text) = p else { continue };
                         let Some(first) = reply::first_action_in_partial(&text) else { continue };
@@ -388,7 +446,7 @@ impl Agent {
                         }
                         // Only the first action starts early; the rest waits for the whole reply.
                         while prx.try_recv().is_ok() {}
-                        let r = (&mut replying).await;
+                        let r = (&mut replying.0).await;
                         reply_result = Some(r);
                         break;
                     }
@@ -414,7 +472,10 @@ impl Agent {
             let Some(json) = reply::parse(&reply) else {
                 message = format!(
                     "Your last reply wasn't a JSON object. Reply with JSON only.{}",
-                    early.as_ref().map(|e| format!("\n(Its first step already ran: {} → {})", reply::brief(&e.0), e.1.summary)).unwrap_or_default()
+                    early
+                        .as_ref()
+                        .map(|e| format!("\n(Its first step already ran: {} → {})", reply::brief(&e.0), e.1.summary))
+                        .unwrap_or_default()
                 );
                 continue;
             };
@@ -433,12 +494,14 @@ impl Agent {
             }
 
             // A loop is the same actions three times with nothing changing.
-            let signature: String = actions.iter().map(|a| reply::canonical(a)).collect();
+            let signature: String = actions.iter().map(reply::canonical).collect();
             let same = !actions.is_empty() && signature == last_signature;
             same_runs = if same { same_runs + 1 } else { 0 };
             repeats = if same && (unchanged || failures > 0) { repeats + 1 } else { 0 };
             last_signature = signature.clone();
-            if !actions.is_empty() && ((escalated.contains(&signature) && repeats >= 1) || ((repeats >= 2 || same_runs >= 12) && escalated.len() >= 2)) {
+            if !actions.is_empty()
+                && ((escalated.contains(&signature) && repeats >= 1) || ((repeats >= 2 || same_runs >= 12) && escalated.len() >= 2))
+            {
                 return self.finish(false, "I kept trying the same thing, so I stopped");
             }
             if repeats >= 2 || same_runs >= 12 {
@@ -463,7 +526,10 @@ impl Agent {
             }
             let mut results: Vec<String> = vec![];
             let mut cut_short = false;
-            let early_is_first = early.as_ref().map(|e| actions.first().map(|a| reply::canonical(a) == reply::canonical(&e.0)).unwrap_or(false)).unwrap_or(false);
+            let early_is_first = early
+                .as_ref()
+                .map(|e| actions.first().map(|a| reply::canonical(a) == reply::canonical(&e.0)).unwrap_or(false))
+                .unwrap_or(false);
             if let Some(e) = &early {
                 if !early_is_first {
                     results.push(format!("(already done while you were writing: {} → {})", reply::brief(&e.0), e.1.summary));
@@ -484,7 +550,11 @@ impl Agent {
                 let mut action = action.clone();
                 let kind = action.kind();
                 // click/type/open_* already wait for the screen to settle; a long wait stacked on top is dead time.
-                if kind == "wait" && i > 0 && ["click", "type", "open_url", "open_app", "key"].contains(&actions[i - 1].kind().as_str()) && action.num("ms").unwrap_or(600.0) > 1000.0 {
+                if kind == "wait"
+                    && i > 0
+                    && ["click", "type", "open_url", "open_app", "key"].contains(&actions[i - 1].kind().as_str())
+                    && action.num("ms").unwrap_or(600.0) > 1000.0
+                {
                     action.insert("ms".into(), serde_json::json!(1000));
                 }
                 // The ids the model gave point into the page list it was shown; use the same element's id now.
@@ -499,7 +569,10 @@ impl Agent {
                                 }
                             }
                             None => {
-                                let was = n.and_then(|n| seen.element(n)).map(|e| format!(" ({} {:?})", e.role, e.text.chars().take(40).collect::<String>())).unwrap_or_default();
+                                let was = n
+                                    .and_then(|n| seen.element(n))
+                                    .map(|e| format!(" ({} {:?})", e.role, e.text.chars().take(40).collect::<String>()))
+                                    .unwrap_or_default();
                                 results.push(format!(
                                     "{}. (not done: the page changed after the steps above, and {}{was} isn't there anymore; the rest of this batch was skipped — the fresh page is below)",
                                     i + 1,
@@ -526,7 +599,8 @@ impl Agent {
                 if result.ok && !dry {
                     self.record_trace(&action, rs.last_target.clone());
                 }
-                if result.ok && ["click", "type", "key", "choose", "upload", "scroll", "shell", "fill", "autofill"].contains(&kind.as_str()) {
+                if result.ok && ["click", "type", "key", "choose", "upload", "scroll", "shell", "fill", "autofill"].contains(&kind.as_str())
+                {
                     self.current.lock().opened_last = false;
                 }
                 if result.look {
@@ -542,7 +616,7 @@ impl Agent {
                 // The user's answer can change the plan ("it's saved, just click the field"): what was planned
                 // after the question waits for the next turn.
                 if kind == "ask" && i + 1 < actions.len() && result.summary.starts_with("the user answered") {
-                    results.push(format!("(the rest of this batch waits: plan it again with the answer above)"));
+                    results.push("(the rest of this batch waits: plan it again with the answer above)".to_string());
                     cut_short = true;
                     break;
                 }
@@ -551,7 +625,10 @@ impl Agent {
                     if let Some(current) = &ctx.app {
                         if let Some(other) = self.platform.handoff(current) {
                             self.log(&format!("    {} came to the front", other.name));
-                            results.push(format!("({} came to the front, so the rest of this batch was skipped — its screen is below)", other.name));
+                            results.push(format!(
+                                "({} came to the front, so the rest of this batch was skipped — its screen is below)",
+                                other.name
+                            ));
                             ctx.app = Some(other);
                             cut_short = true;
                             break;
@@ -559,7 +636,11 @@ impl Agent {
                     }
                 }
                 // Forms re-render as they're filled: before the next step by w-id, list the page again.
-                if ["type", "choose", "click", "upload", "autofill"].contains(&kind.as_str()) && ctx.page.is_some() && !dry && actions[i + 1..].iter().any(|a| is_web_ref(a.get("id"))) {
+                if ["type", "choose", "click", "upload", "autofill"].contains(&kind.as_str())
+                    && ctx.page.is_some()
+                    && !dry
+                    && actions[i + 1..].iter().any(|a| is_web_ref(a.get("id")))
+                {
                     self.relist(&mut ctx).await;
                 }
             }
@@ -569,7 +650,11 @@ impl Agent {
                 message = format!(
                     "Results:\n{}\n{}",
                     results.join("\n"),
-                    if cut_short { "(You were about to finish, but not all of your last steps ran.)" } else { "(You were about to finish, but the user added something.)" }
+                    if cut_short {
+                        "(You were about to finish, but not all of your last steps ran.)"
+                    } else {
+                        "(You were about to finish, but the user added something.)"
+                    }
                 );
                 continue;
             }
@@ -594,7 +679,12 @@ impl Agent {
                 );
                 continue;
             }
-            if is_done && failures == 0 && rs.pushed_on < 3 && (says_unfinished(&say) || says_unfinished(&reply.chars().rev().take(1500).collect::<String>().chars().rev().collect::<String>())) {
+            if is_done
+                && failures == 0
+                && rs.pushed_on < 3
+                && (says_unfinished(&say)
+                    || says_unfinished(&reply.chars().rev().take(1500).collect::<String>().chars().rev().collect::<String>()))
+            {
                 rs.pushed_on += 1;
                 self.log(&format!("  not done yet: “{}” — carrying on", say.chars().take(80).collect::<String>()));
                 message = format!(
@@ -620,10 +710,23 @@ impl Agent {
                 Ending::Finish | Ending::NotYet => {}
             }
             if is_done && failures == 0 {
+                if let Some(workers) = rs.workers.as_ref().filter(|w| w.pending()) {
+                    self.set_phase(Phase::Thinking);
+                    message = self.collect_workers(workers, &[], true, 300).await;
+                    self.push_step(&("Worker results:\n".to_owned() + &message), StepState::Info);
+                    continue;
+                }
                 self.finish(true, if say.is_empty() { "Done" } else { &say });
                 if !dry && !test {
                     let trace = self.current.lock().trace.clone();
-                    let output = self.steps().iter().map(|s| s.text.clone()).chain(trace.iter().filter_map(|t| t.text.clone())).chain([say.clone()]).collect::<Vec<_>>().join("\n");
+                    let output = self
+                        .steps()
+                        .iter()
+                        .map(|s| s.text.clone())
+                        .chain(trace.iter().filter_map(|t| t.text.clone()))
+                        .chain([say.clone()])
+                        .collect::<Vec<_>>()
+                        .join("\n");
                     memory::note_used(&memory::used(&rs.seen.facts, &output, &rs.seen.apps, &rs.seen.hosts));
                     self.learn(&session, &rs).await;
                 }
@@ -669,12 +772,17 @@ impl Agent {
         {
             let s = self.snaps.lock();
             if !s.0.is_empty() {
-                let waiting: Vec<String> = s.0.iter().filter(|x| !x.pasted).map(|x| format!("{:?}", x.caption.chars().take(60).collect::<String>())).collect();
+                let waiting: Vec<String> =
+                    s.0.iter().filter(|x| !x.pasted).map(|x| format!("{:?}", x.caption.chars().take(60).collect::<String>())).collect();
                 text += &format!(
                     "\nWrite-up screenshots so far in this task: {} ({} already pasted in the doc{}){}. Last captioned: {:?}.",
                     s.0.len(),
                     s.0.len() - waiting.len(),
-                    if waiting.is_empty() { String::new() } else { format!("; not pasted yet: {} — paste_snaps puts them in", waiting.join(", ")) },
+                    if waiting.is_empty() {
+                        String::new()
+                    } else {
+                        format!("; not pasted yet: {} — paste_snaps puts them in", waiting.join(", "))
+                    },
                     s.1.as_ref().map(|f| format!("; saved in {}", f.display())).unwrap_or_default(),
                     s.0.last().map(|x| x.caption.chars().take(80).collect::<String>()).unwrap_or_default()
                 );
@@ -702,7 +810,8 @@ impl Agent {
         }
         if ctx.selected_text.is_none() && ctx.selected_files.is_empty() {
             if let Some(c) = &ctx.copied {
-                let points = crate::workflow::refers_to_context(request) || regex::Regex::new(r"(?i)\b(clipboard|copied|paste|pasted)\b").unwrap().is_match(request);
+                let points = crate::workflow::refers_to_context(request)
+                    || regex::Regex::new(r"(?i)\b(clipboard|copied|paste|pasted)\b").unwrap().is_match(request);
                 if points {
                     let when = describe_age(c.age_secs);
                     if let Some(t) = &c.text {
@@ -725,7 +834,9 @@ impl Agent {
         }
         if let Some(earlier) = &ctx.continuation {
             if let Some(task) = earlier.task.as_ref().filter(|t| **t != earlier.request) {
-                text += &format!("\n\nThe task this is all part of (the user's own instructions, still in force until everything is done):\n{task}");
+                text += &format!(
+                    "\n\nThe task this is all part of (the user's own instructions, still in force until everything is done):\n{task}"
+                );
             }
             let steps: Vec<String> = earlier.steps.iter().rev().take(12).rev().cloned().collect();
             text += &format!(
@@ -734,7 +845,11 @@ impl Agent {
                 earlier.request,
                 steps.join("; "),
                 earlier.answer,
-                earlier.result.as_ref().map(|r| format!("\nEarlier output: {}", r.plain().chars().take(1500).collect::<String>())).unwrap_or_default()
+                earlier
+                    .result
+                    .as_ref()
+                    .map(|r| format!("\nEarlier output: {}", r.plain().chars().take(1500).collect::<String>()))
+                    .unwrap_or_default()
             );
             if let Some(doc) = &earlier.read_text {
                 text += &format!("\nThe document the earlier task read (use this; don't open it again unless it's cut off):\n{doc}");
@@ -748,7 +863,14 @@ impl Agent {
             text += &format!("\nSkills the user taught you (follow the matching one's steps when a request fits; ask for any missing parameters):\n{skills}");
         }
         // Only the memory that matters for this request (plus core facts); the rest is one recall away.
-        let about = [request.to_string(), ctx.target.as_ref().map(|a| a.name.clone()).unwrap_or_default(), ctx.selected_text.clone().unwrap_or_default(), ctx.continuation.as_ref().map(|c| c.request.clone()).unwrap_or_default()].join(" ");
+        let about = [
+            request.to_string(),
+            ctx.target.as_ref().map(|a| a.name.clone()).unwrap_or_default(),
+            ctx.selected_text.clone().unwrap_or_default(),
+            ctx.continuation.as_ref().map(|c| c.request.clone()).unwrap_or_default(),
+        ]
+        .join(" ");
+        text += &crate::task_memory::context(&about);
         let (facts, omitted) = memory::relevant(&about, ctx.target.as_ref().map(|a| a.name.as_str()), None, 40);
         rs.seen.facts.extend(facts.iter().cloned());
         let (profile, other): (Vec<&String>, Vec<&String>) = facts.iter().partition(|f| memory::is_profile(f));
@@ -757,10 +879,15 @@ impl Agent {
             profile.iter().map(|f| format!("- {f}")).collect::<Vec<_>>().join("\n")
         );
         if !other.is_empty() {
-            text += &format!("\nOther things you remember about the user:\n{}", other.iter().map(|f| format!("- {f}")).collect::<Vec<_>>().join("\n"));
+            text += &format!(
+                "\nOther things you remember about the user:\n{}",
+                other.iter().map(|f| format!("- {f}")).collect::<Vec<_>>().join("\n")
+            );
         }
         if omitted > 0 {
-            text += &format!("\n({omitted} more remembered facts not shown — use recall if you need something about the user that isn't here.)");
+            text += &format!(
+                "\n({omitted} more remembered facts not shown — use recall if you need something about the user that isn't here.)"
+            );
         }
         if may_meet_forms(&about) {
             let jp = crate::profile::prompt_block();
@@ -772,9 +899,30 @@ impl Agent {
     }
 
     /// After a task: keep anything lasting it revealed, as edits to the closest facts.
+    pub(crate) async fn collect_workers(&self, workers: &crate::delegation::Pool, ids: &[String], wait: bool, timeout: u64) -> String {
+        let collecting = workers.collect(ids, wait, timeout);
+        tokio::pin!(collecting);
+        loop {
+            tokio::select! {
+                result = &mut collecting => return result,
+                _ = tokio::time::sleep(Duration::from_millis(250)) => {
+                    self.progress();
+                    if !self.added.lock().is_empty() {
+                        return workers.collect(ids,false,1).await + "\nUser guidance arrived; discard outstanding assignments and replan.";
+                    }
+                }
+            }
+        }
+    }
+
     async fn learn(self: &Arc<Self>, session: &Arc<Session>, rs: &RunState) {
         learn_from_forms(self, rs);
-        let about = [rs.request.clone()].into_iter().chain(self.steps().iter().rev().take(25).map(|s| s.text.clone())).chain([self.ui.lock().answer.clone()]).collect::<Vec<_>>().join("\n");
+        let about = [rs.request.clone()]
+            .into_iter()
+            .chain(self.steps().iter().rev().take(25).map(|s| s.text.clone()))
+            .chain([self.ui.lock().answer.clone()])
+            .collect::<Vec<_>>()
+            .join("\n");
         let (near, _) = memory::relevant(&about, None, None, 30);
         let places: Vec<String> = rs.seen.hosts.iter().chain(rs.seen.apps.iter()).cloned().collect();
         let prompt = format!(
@@ -785,7 +933,9 @@ impl Agent {
         let Ok(reply) = session.send(&prompt, None, None).await else { return };
         let Some(json) = reply::parse(&reply) else { return };
         let ops = json.get("ops").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-        let line = |v: Option<&serde_json::Value>| v.and_then(|v| v.as_str()).map(str::trim).filter(|t| !t.is_empty() && t.len() < 240).map(String::from);
+        let line = |v: Option<&serde_json::Value>| {
+            v.and_then(|v| v.as_str()).map(str::trim).filter(|t| !t.is_empty() && t.len() < 240).map(String::from)
+        };
         let fact = |v: Option<&serde_json::Value>| {
             let n = v.and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))? as usize;
             (n >= 1 && n <= near.len()).then(|| near[n - 1].clone())
@@ -837,7 +987,8 @@ fn track_form(rs: &mut RunState, page: &Page, host: &str) {
         return;
     }
     for el in fields {
-        let q = el.question.clone().or(el.placeholder.clone()).or_else(|| (!el.text.is_empty()).then(|| el.text.clone())).unwrap_or_default();
+        let q =
+            el.question.clone().or(el.placeholder.clone()).or_else(|| (!el.text.is_empty()).then(|| el.text.clone())).unwrap_or_default();
         let q = q.trim().to_string();
         if q.len() < 3 || q.len() > 200 {
             continue;
@@ -869,15 +1020,27 @@ fn learn_from_forms(agent: &Agent, rs: &RunState) {
             break;
         }
         let v = last;
-        if v.is_empty() || v == first || v.len() > 160 || v.starts_with("••") || rs.agent_entered.contains(&squash_value(v)) || not_answer.is_match(question) || choose.is_match(v) {
+        if v.is_empty()
+            || v == first
+            || v.len() > 160
+            || v.starts_with("••")
+            || rs.agent_entered.contains(&squash_value(v))
+            || not_answer.is_match(question)
+            || choose.is_match(v)
+        {
             continue;
         }
-        if crate::profile::answer(question, &profile).as_deref() == Some(v.as_str()) || (v.len() >= 4 && known.contains(&v.to_lowercase())) {
+        if crate::profile::answer(question, &profile).as_deref() == Some(v.as_str()) || (v.len() >= 4 && known.contains(&v.to_lowercase()))
+        {
             continue;
         }
         crate::profile::remember(question, v);
         kept += 1;
-        agent.log(&format!("🧠 learned from the form: “{}” → {}", question.chars().take(70).collect::<String>(), v.chars().take(60).collect::<String>()));
+        agent.log(&format!(
+            "🧠 learned from the form: “{}” → {}",
+            question.chars().take(70).collect::<String>(),
+            v.chars().take(60).collect::<String>()
+        ));
     }
 }
 

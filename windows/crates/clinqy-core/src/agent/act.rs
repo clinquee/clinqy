@@ -13,9 +13,33 @@ use crate::safety;
 pub(crate) fn acts(role: &str) -> bool {
     let r = role.to_lowercase();
     ![
-        "radio", "radiobutton", "checkbox", "switch", "option", "menuitemradio", "menuitemcheckbox", "tab", "tabitem", "textbox", "textfield",
-        "textarea", "searchfield", "combobox", "listbox", "row", "cell", "heading", "statictext", "text", "group", "radiogroup", "slider",
-        "treeitem", "edit", "listitem", "dataitem",
+        "radio",
+        "radiobutton",
+        "checkbox",
+        "switch",
+        "option",
+        "menuitemradio",
+        "menuitemcheckbox",
+        "tab",
+        "tabitem",
+        "textbox",
+        "textfield",
+        "textarea",
+        "searchfield",
+        "combobox",
+        "listbox",
+        "row",
+        "cell",
+        "heading",
+        "statictext",
+        "text",
+        "group",
+        "radiogroup",
+        "slider",
+        "treeitem",
+        "edit",
+        "listitem",
+        "dataitem",
     ]
     .contains(&r.as_str())
 }
@@ -116,7 +140,10 @@ impl Agent {
         if self.confirm_risky(label, rs).await {
             None
         } else {
-            Some(format!("the user said not to click {:?}; stop and tell them where things stand", label.chars().take(40).collect::<String>()))
+            Some(format!(
+                "the user said not to click {:?}; stop and tell them where things stand",
+                label.chars().take(40).collect::<String>()
+            ))
         }
     }
 
@@ -200,7 +227,12 @@ impl Agent {
             .iter()
             .find(|e| e.role == wanted.role && e.label == wanted.label)
             .or_else(|| ctx.elements.iter().find(|e| e.label == wanted.label))
-            .or_else(|| ctx.elements.iter().filter(|e| e.role == wanted.role && near(e) < 40.0).min_by(|a, b| near(a).partial_cmp(&near(b)).unwrap()))
+            .or_else(|| {
+                ctx.elements
+                    .iter()
+                    .filter(|e| e.role == wanted.role && near(e) < 40.0)
+                    .min_by(|a, b| near(a).partial_cmp(&near(b)).unwrap())
+            })
             .cloned()
     }
 
@@ -271,6 +303,33 @@ impl Agent {
         let web = super::run::web_index(action.get("id")).is_some();
         let has_id = action.contains_key("id");
         match kind.as_str() {
+            "delegate" => {
+                self.current.lock().requires_fresh_work = true;
+                let line = self.begin("Delegate independent work");
+                let Some(pool) = rs.workers.as_mut() else {
+                    return ActionResult::fail("Workers unavailable");
+                };
+                let jobs = action.get("jobs").cloned().unwrap_or(serde_json::Value::Null);
+                match serde_json::from_value(jobs).map_err(anyhow::Error::from).and_then(|jobs| pool.submit(jobs)) {
+                    Ok(status) => self.end(line, ActionResult::ok(status)),
+                    Err(error) => self.end(line, ActionResult::fail(error.to_string())),
+                }
+            }
+            "collect" => {
+                let line = self.begin("Collect worker results");
+                let Some(pool) = rs.workers.as_ref() else {
+                    return ActionResult::fail("Workers unavailable");
+                };
+                let ids: Vec<String> = action
+                    .get("ids")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                    .unwrap_or_default();
+                let wait = action.get("wait").and_then(|v| v.as_bool()).unwrap_or(false);
+                let timeout = action.get("timeout").and_then(|v| v.as_u64()).unwrap_or(90);
+                self.set_phase(Phase::Thinking);
+                self.end(line, ActionResult::ok(self.collect_workers(pool, &ids, wait, timeout).await))
+            }
             "open_app" => self.open_app(action, ctx).await,
             "open_url" => self.open_url(action, ctx, rs).await,
             "click" if web => self.web_click(action, ctx, rs).await,
@@ -324,7 +383,9 @@ impl Agent {
             "shell" | "powershell" | "applescript" => {
                 let Some(cmd) = action.str("cmd").or_else(|| action.str("script")) else { return ActionResult::fail("shell needs cmd") };
                 if kind == "applescript" && !looks_like_powershell(cmd) {
-                    return ActionResult::fail("this is Windows: there's no AppleScript. Use shell with a PowerShell command (COM objects script Office apps)");
+                    return ActionResult::fail(
+                        "this is Windows: there's no AppleScript. Use shell with a PowerShell command (COM objects script Office apps)",
+                    );
                 }
                 let line = self.begin("Look something up");
                 let (status, out) = self.platform.shell(cmd, 20).await;
@@ -333,17 +394,27 @@ impl Agent {
                     line,
                     ActionResult {
                         ok: status == 0,
-                        summary: format!("exit {status}{}{hint}", if out.is_empty() { String::new() } else { format!(": {}", out.chars().take(2000).collect::<String>()) }),
+                        summary: format!(
+                            "exit {status}{}{hint}",
+                            if out.is_empty() { String::new() } else { format!(": {}", out.chars().take(2000).collect::<String>()) }
+                        ),
                         look: false,
                     },
                 )
             }
-            "dictionary" => ActionResult::fail("Windows apps have no AppleScript dictionary; script Office apps through PowerShell COM with shell, or work on screen"),
+            "dictionary" => ActionResult::fail(
+                "Windows apps have no AppleScript dictionary; script Office apps through PowerShell COM with shell, or work on screen",
+            ),
             "point" | "mark" => {
                 let (rect, name) = if has_id {
                     match self.resolve(action.get("id"), ctx, rs).await {
                         Some(el) => (Some(el.rect), el.short_label()),
-                        None => return ActionResult::fail(format!("element {} isn't on screen anymore", action.get("id").map(|v| v.to_string()).unwrap_or_default())),
+                        None => {
+                            return ActionResult::fail(format!(
+                                "element {} isn't on screen anymore",
+                                action.get("id").map(|v| v.to_string()).unwrap_or_default()
+                            ))
+                        }
                     }
                 } else if let (Some(x), Some(y)) = (action.num("x"), action.num("y")) {
                     let scale = self.platform.shot_scale();
@@ -367,7 +438,12 @@ impl Agent {
                         self.set_step(line, StepState::Info, None);
                         Box::pin(self.ask(action, ctx, rs)).await
                     }
-                    Some(true) => self.end(line, ActionResult::ok("the user checked every answer on the form and approved submitting: submit now, without asking again")),
+                    Some(true) => self.end(
+                        line,
+                        ActionResult::ok(
+                            "the user checked every answer on the form and approved submitting: submit now, without asking again",
+                        ),
+                    ),
                     Some(false) => {
                         let why = self.edited_review();
                         self.end(line, ActionResult::fail(why))
@@ -400,16 +476,31 @@ impl Agent {
                     .iter()
                     .map(|h| {
                         let was = crate::memory::earlier(h, &changes);
-                        format!("- {h}{}", if was.is_empty() { String::new() } else { format!(" (earlier: {})", was.iter().map(|w| format!("“{w}”")).collect::<Vec<_>>().join("; ")) })
+                        format!(
+                            "- {h}{}",
+                            if was.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" (earlier: {})", was.iter().map(|w| format!("“{w}”")).collect::<Vec<_>>().join("; "))
+                            }
+                        )
                     })
                     .collect();
                 let live: HashSet<String> = crate::memory::facts().into_iter().collect();
-                let gone: Vec<_> = crate::memory::search_history(query).into_iter().filter(|c| c.new.is_none() && !live.contains(&c.old)).collect();
+                let gone: Vec<_> =
+                    crate::memory::search_history(query).into_iter().filter(|c| c.new.is_none() && !live.contains(&c.old)).collect();
                 if !gone.is_empty() {
                     lines.push("No longer true (forgotten):".into());
                     lines.extend(gone.iter().map(|c| format!("- {} ({}, {})", c.old, c.why, c.at.get(..10).unwrap_or(""))));
                 }
-                self.end(line, ActionResult::ok(if lines.is_empty() { "nothing remembered about that".to_string() } else { format!("remembered:\n{}", lines.join("\n")) }))
+                self.end(
+                    line,
+                    ActionResult::ok(if lines.is_empty() {
+                        "nothing remembered about that".to_string()
+                    } else {
+                        format!("remembered:\n{}", lines.join("\n"))
+                    }),
+                )
             }
             "remember" => {
                 let Some(fact) = action.str("fact") else { return ActionResult::fail("remember needs fact") };
@@ -418,7 +509,9 @@ impl Agent {
                 ActionResult::ok("saved")
             }
             "remember_answer" => {
-                let (Some(q), Some(a)) = (action.str("question"), action.str("answer")) else { return ActionResult::fail("remember_answer needs question and answer") };
+                let (Some(q), Some(a)) = (action.str("question"), action.str("answer")) else {
+                    return ActionResult::fail("remember_answer needs question and answer");
+                };
                 if !rs.test || rs.save_in_tests {
                     crate::profile::remember(q, a);
                 }
@@ -435,7 +528,9 @@ impl Agent {
             "paste_snaps" => self.paste_snaps(ctx).await,
             "tab" => self.tab(action, ctx).await,
             "menu" => {
-                let (Some(path), Some(app)) = (action.str("path"), ctx.app.clone()) else { return ActionResult::fail("menu needs path (\"File > Export…\") and an app in front") };
+                let (Some(path), Some(app)) = (action.str("path"), ctx.app.clone()) else {
+                    return ActionResult::fail("menu needs path (\"File > Export…\") and an app in front");
+                };
                 let line = self.begin(&format!("Menu: {}", path.chars().take(40).collect::<String>()));
                 if let Some(why) = self.stale_app(ctx) {
                     return self.end(line, ActionResult::fail(why));
@@ -500,7 +595,11 @@ impl Agent {
             if let Some((q2, a)) = profile_answer(action) {
                 rs.profile_offered.insert(q2.clone());
                 self.log(&format!("  profile answers “{}”", q2.chars().take(60).collect::<String>()));
-                return ActionResult { ok: false, summary: format!("NOT ASKED — the job-application profile already answers this: {q2} → {a}. Use it."), look: false };
+                return ActionResult {
+                    ok: false,
+                    summary: format!("NOT ASKED — the job-application profile already answers this: {q2} → {a}. Use it."),
+                    look: false,
+                };
             }
         }
         // Memory first (once per question).
@@ -527,7 +626,9 @@ impl Agent {
             }
         }
         if rs.qa {
-            return ActionResult::fail("this is an unattended test — nobody can answer; assert the missing information as a failed check and finish");
+            return ActionResult::fail(
+                "this is an unattended test — nobody can answer; assert the missing information as a failed check and finish",
+            );
         }
         if q.is_empty() {
             return ActionResult::fail("ask needs a question");
@@ -552,7 +653,16 @@ impl Agent {
         }
         // An answer to an application form's question is kept for the next application (never a code).
         let code = regex::Regex::new(r"(?i)\b(otp|code|password|passcode|pin|cvv)\b").unwrap();
-        if !sensitive && (!rs.test || rs.save_in_tests) && !rs.qa && ctx.page.is_some() && super::run::may_meet_forms(&rs.request) && !is_confirmation(&q) && !code.is_match(&q) && reply.len() < 300 && !safety::is_yes(&reply) {
+        if !sensitive
+            && (!rs.test || rs.save_in_tests)
+            && !rs.qa
+            && ctx.page.is_some()
+            && super::run::may_meet_forms(&rs.request)
+            && !is_confirmation(&q)
+            && !code.is_match(&q)
+            && reply.len() < 300
+            && !safety::is_yes(&reply)
+        {
             crate::profile::remember(&q, &reply);
         }
         self.set_phase(Phase::Acting);
@@ -566,7 +676,10 @@ impl Agent {
     async fn click_element(&self, action: &Action, ctx: &mut Ctx, rs: &mut RunState) -> ActionResult {
         let Some(app) = ctx.app.clone() else { return ActionResult::fail("no app") };
         let Some(el) = self.resolve(action.get("id"), ctx, rs).await else {
-            return ActionResult::fail(format!("element {} isn't on screen anymore", action.get("id").map(|v| v.to_string()).unwrap_or_default()));
+            return ActionResult::fail(format!(
+                "element {} isn't on screen anymore",
+                action.get("id").map(|v| v.to_string()).unwrap_or_default()
+            ));
         };
         let line = self.begin(&format!("Click {}", el.short_label()));
         if let Some(why) = self.stale_app(ctx) {
@@ -625,8 +738,15 @@ impl Agent {
         }
         let nth = action.num("nth").unwrap_or(1.0).max(1.0) as usize;
         if spots.len() < nth {
-            let near: Vec<String> = boxes.iter().filter(|b| observation::similar(&b.text, want)).take(5).map(|b| format!("{:?}", b.text)).collect();
-            return self.end(line, ActionResult::fail(format!("no text {want:?} on the window{}", if near.is_empty() { String::new() } else { format!("; similar: {}", near.join(", ")) })));
+            let near: Vec<String> =
+                boxes.iter().filter(|b| observation::similar(&b.text, want)).take(5).map(|b| format!("{:?}", b.text)).collect();
+            return self.end(
+                line,
+                ActionResult::fail(format!(
+                    "no text {want:?} on the window{}",
+                    if near.is_empty() { String::new() } else { format!("; similar: {}", near.join(", ")) }
+                )),
+            );
         }
         let spot = spots[nth - 1];
         let fp = self.platform.fingerprint(&app).await;
@@ -637,12 +757,21 @@ impl Agent {
         ctx.fingerprint = self.platform.fingerprint(&app).await;
         self.buddy.clear_highlight();
         self.log(&crate::clicks::line("text", &app.name, "real", changed, 1));
-        let more = if spots.len() > nth { format!(" ({} places show it; this was #{nth} from the top — add \"nth\" for another)", spots.len()) } else { String::new() };
-        self.end(line, ActionResult::ok(format!("clicked the text {:?}{more}{}", spot.text, if changed { "" } else { " (no visible change)" })))
+        let more = if spots.len() > nth {
+            format!(" ({} places show it; this was #{nth} from the top — add \"nth\" for another)", spots.len())
+        } else {
+            String::new()
+        };
+        self.end(
+            line,
+            ActionResult::ok(format!("clicked the text {:?}{more}{}", spot.text, if changed { "" } else { " (no visible change)" })),
+        )
     }
 
     async fn click_point(&self, action: &Action, ctx: &mut Ctx) -> ActionResult {
-        let (Some(x), Some(y)) = (action.num("x"), action.num("y")) else { return ActionResult::fail("click needs an id, or x/y on the last screenshot") };
+        let (Some(x), Some(y)) = (action.num("x"), action.num("y")) else {
+            return ActionResult::fail("click needs an id, or x/y on the last screenshot");
+        };
         let Some(p) = self.platform.screen_point(x, y) else { return ActionResult::fail("click by x/y needs a screenshot first (look)") };
         let line = self.begin("Click");
         if let Some(why) = self.stale_app(ctx) {
@@ -701,7 +830,10 @@ impl Agent {
                 tokio::time::sleep(Duration::from_millis(250)).await;
                 if !reads(h).map(|v| observation::similar(&v, text)).unwrap_or(false) {
                     let shows = reads(h).unwrap_or_default().trim().chars().take(60).collect::<String>();
-                    return self.end(line, ActionResult::fail(format!("the text didn't go into {target} (it shows {shows:?}); look again before retrying")));
+                    return self.end(
+                        line,
+                        ActionResult::fail(format!("the text didn't go into {target} (it shows {shows:?}); look again before retrying")),
+                    );
                 }
             }
         }
@@ -719,7 +851,14 @@ impl Agent {
         }
         ctx.fingerprint = self.platform.fingerprint(&app).await;
         self.buddy.clear_highlight();
-        self.end(line, ActionResult::ok(format!("typed {:?} into {target}{}{sent_note}", text.chars().take(60).collect::<String>(), if submit { " and pressed Enter" } else { "" })))
+        self.end(
+            line,
+            ActionResult::ok(format!(
+                "typed {:?} into {target}{}{sent_note}",
+                text.chars().take(60).collect::<String>(),
+                if submit { " and pressed Enter" } else { "" }
+            )),
+        )
     }
 
     /// Best source first: the web page, a PDF in the browser, a file the window has open, then OCR of the screen.
@@ -741,7 +880,11 @@ impl Agent {
         if let Some(page) = &ctx.page {
             let url = page.url.to_lowercase();
             if !url.ends_with(".pdf") && (url.starts_with("http") || url.starts_with("file")) {
-                text = crate::bridge::bridge().perform("read", page, serde_json::json!({}), 8.0).await.ok().and_then(|r| r["text"].as_str().map(String::from));
+                text = crate::bridge::bridge()
+                    .perform("read", page, serde_json::json!({}), 8.0)
+                    .await
+                    .ok()
+                    .and_then(|r| r["text"].as_str().map(String::from));
                 source = "the web page".into();
             }
             if short(&text) && url.contains(".pdf") {
@@ -772,7 +915,9 @@ impl Agent {
                 }
             }
         }
-        let Some(text) = text.filter(|t| !t.trim().is_empty()) else { return self.end(line, ActionResult::fail("couldn't read any text here; try look")) };
+        let Some(text) = text.filter(|t| !t.trim().is_empty()) else {
+            return self.end(line, ActionResult::fail("couldn't read any text here; try look"));
+        };
         if !source.starts_with("the screen") {
             self.current.lock().read_text = Some(format!("{source}:\n{text}"));
         }
@@ -780,7 +925,7 @@ impl Agent {
     }
 
     async fn wait(&self, action: &Action, ctx: &mut Ctx) -> ActionResult {
-        let ms = action.num("ms").unwrap_or(600.0).min(5000.0).max(0.0) as u64;
+        let ms = action.num("ms").unwrap_or(600.0).clamp(0.0, 5000.0) as u64;
         let Some(app) = ctx.app.clone().filter(|_| ms >= 1500) else {
             tokio::time::sleep(Duration::from_millis(ms)).await;
             if let Some(app) = ctx.app.clone() {
@@ -812,7 +957,9 @@ impl Agent {
     /// window's text, with OCR as the last word.
     async fn wait_for(&self, text: &str, gone: bool, secs: f64, ctx: &mut Ctx) -> ActionResult {
         let want = text.trim().to_lowercase();
-        let Some(app) = ctx.app.clone().filter(|_| !want.is_empty()) else { return ActionResult::fail("wait needs for:\"<text>\" and an app in front") };
+        let Some(app) = ctx.app.clone().filter(|_| !want.is_empty()) else {
+            return ActionResult::fail("wait needs for:\"<text>\" and an app in front");
+        };
         let line = self.begin(&if gone {
             format!("Wait for “{}” to go", text.chars().take(30).collect::<String>())
         } else {
@@ -831,11 +978,21 @@ impl Agent {
         };
         let bridge = crate::bridge::bridge();
         if let Some(page) = &ctx.page {
-            if let Ok(r) = bridge.perform("waitText", page, serde_json::json!({"text": text, "gone": gone, "ms": (secs * 1000.0) as u64}), secs + 3.0).await {
+            if let Ok(r) = bridge
+                .perform("waitText", page, serde_json::json!({"text": text, "gone": gone, "ms": (secs * 1000.0) as u64}), secs + 3.0)
+                .await
+            {
                 if r["met"] == true {
                     beat.abort();
                     self.refresh(ctx).await;
-                    return self.end(line, ActionResult::ok(format!("{text:?} {} (after {:.1} s)", if gone { "is gone" } else { "shows" }, started.elapsed().as_secs_f64())));
+                    return self.end(
+                        line,
+                        ActionResult::ok(format!(
+                            "{text:?} {} (after {:.1} s)",
+                            if gone { "is gone" } else { "shows" },
+                            started.elapsed().as_secs_f64()
+                        )),
+                    );
                 }
             }
         }
@@ -877,7 +1034,10 @@ impl Agent {
                     let all = format!("{}\n{}", r["title"].as_str().unwrap_or(""), r["text"].as_str().unwrap_or(""));
                     let close = closest(text, &all);
                     if let Some(hit) = close.iter().find(|l| words_in_order(text, l)) {
-                        return self.end(line, ActionResult::ok(format!("“{}” shows (what {text:?} meant)", hit.chars().take(80).collect::<String>())));
+                        return self.end(
+                            line,
+                            ActionResult::ok(format!("“{}” shows (what {text:?} meant)", hit.chars().take(80).collect::<String>())),
+                        );
                     }
                     if !close.is_empty() {
                         near = format!("; closest on the page: {}", close.iter().map(|c| format!("“{c}”")).collect::<Vec<_>>().join(", "));
@@ -885,7 +1045,14 @@ impl Agent {
                 }
             }
         }
-        self.end(line, ActionResult::fail(format!("after {} s {text:?} {}{near}; look at what's there instead", secs as i64, if gone { "still shows" } else { "hasn't appeared" })))
+        self.end(
+            line,
+            ActionResult::fail(format!(
+                "after {} s {text:?} {}{near}; look at what's there instead",
+                secs as i64,
+                if gone { "still shows" } else { "hasn't appeared" }
+            )),
+        )
     }
 
     async fn shows(&self, want: &str, app: &AppRef, page: Option<&crate::page::Page>, ocr: bool) -> bool {
@@ -897,7 +1064,12 @@ impl Agent {
             }
         }
         let scan = self.platform.scan(app, 300).await;
-        if scan.window.to_lowercase().contains(want) || scan.focused.to_lowercase().contains(want) || scan.elements.iter().any(|e| e.label.to_lowercase().contains(want) || e.value.as_deref().map(|v| v.to_lowercase().contains(want)).unwrap_or(false)) {
+        if scan.window.to_lowercase().contains(want)
+            || scan.focused.to_lowercase().contains(want)
+            || scan.elements.iter().any(|e| {
+                e.label.to_lowercase().contains(want) || e.value.as_deref().map(|v| v.to_lowercase().contains(want)).unwrap_or(false)
+            })
+        {
             return true;
         }
         if ocr {
@@ -910,7 +1082,9 @@ impl Agent {
 
     async fn tab(&self, action: &Action, ctx: &mut Ctx) -> ActionResult {
         let op = action.str("op").unwrap_or("list").to_lowercase();
-        let id = action.get("id").and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.chars().filter(|c| c.is_ascii_digit()).collect::<String>().parse().ok())));
+        let id = action.get("id").and_then(|v| {
+            v.as_i64().or_else(|| v.as_str().and_then(|s| s.chars().filter(|c| c.is_ascii_digit()).collect::<String>().parse().ok()))
+        });
         let bridge = crate::bridge::bridge();
         if !bridge.is_connected() {
             return ActionResult::fail("the browser extension isn't connected");
@@ -957,7 +1131,11 @@ impl Agent {
                         page.title,
                         page.url,
                         page.list(),
-                        if page.text.is_empty() { String::new() } else { format!("\nText on screen: {}", page.text.chars().take(4000).collect::<String>()) }
+                        if page.text.is_empty() {
+                            String::new()
+                        } else {
+                            format!("\nText on screen: {}", page.text.chars().take(4000).collect::<String>())
+                        }
                     )),
                 )
             }
@@ -973,7 +1151,9 @@ impl Agent {
         let line = self.begin(&format!("Screenshot: {}", caption.chars().take(40).collect::<String>()));
         self.platform.bring_to_front(&app).await;
         tokio::time::sleep(Duration::from_millis(600)).await;
-        let Some(shot) = self.platform.screenshot(&app).await else { return self.end(line, ActionResult::fail("couldn't capture the window")) };
+        let Some(shot) = self.platform.screenshot(&app).await else {
+            return self.end(line, ActionResult::fail("couldn't capture the window"));
+        };
         let file = self.save_snap(&shot.png, &caption);
         let waiting = {
             let mut s = self.snaps.lock();
@@ -1006,8 +1186,18 @@ impl Agent {
             }
         }
         let folder = s.1.clone()?;
-        let count = std::fs::read_dir(&folder).map(|d| d.flatten().filter(|e| e.path().extension().map(|x| x == "png").unwrap_or(false)).count()).unwrap_or(0);
-        let name: String = regex::Regex::new(r#"[/\\\n\r\t"*?<>|:]+"#).unwrap().replace_all(caption, " ").split_whitespace().collect::<Vec<_>>().join(" ").chars().take(80).collect();
+        let count = std::fs::read_dir(&folder)
+            .map(|d| d.flatten().filter(|e| e.path().extension().map(|x| x == "png").unwrap_or(false)).count())
+            .unwrap_or(0);
+        let name: String = regex::Regex::new(r#"[/\\\n\r\t"*?<>|:]+"#)
+            .unwrap()
+            .replace_all(caption, " ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(80)
+            .collect();
         let path = folder.join(format!("{:02} {name}.png", count + 1));
         std::fs::write(&path, png).ok().map(|_| path)
     }
@@ -1020,7 +1210,11 @@ impl Agent {
         };
         if todo.is_empty() {
             let n = self.snaps.lock().0.len();
-            return ActionResult::fail(if n == 0 { "no screenshots taken yet; use snap first".to_string() } else { format!("all {n} screenshots are already pasted; snap new steps first") });
+            return ActionResult::fail(if n == 0 {
+                "no screenshots taken yet; use snap first".to_string()
+            } else {
+                format!("all {n} screenshots are already pasted; snap new steps first")
+            });
         }
         let line = self.begin(&format!("Paste {} screenshots", todo.len()));
         self.platform.bring_to_front(&app).await;
@@ -1061,7 +1255,23 @@ impl Agent {
 
     /// Dry run: mark the target and say what would happen. None = the action only looks, so it really runs.
     async fn rehearse(&self, kind: &str, action: &Action, ctx: &mut Ctx, rs: &mut RunState) -> Option<ActionResult> {
-        const LOOK_ONLY: &[&str] = &["open_app", "open_url", "scroll", "look", "read", "wait", "recall", "ask", "show", "point", "mark", "review", "assert", "extract", "dictionary"];
+        const LOOK_ONLY: &[&str] = &[
+            "open_app",
+            "open_url",
+            "scroll",
+            "look",
+            "read",
+            "wait",
+            "recall",
+            "ask",
+            "show",
+            "point",
+            "mark",
+            "review",
+            "assert",
+            "extract",
+            "dictionary",
+        ];
         let op = action.str("op").unwrap_or("").to_lowercase();
         let read_ops: &[(&str, &[&str])] = &[
             ("event", &["list", "find", "search", "free", "busy"]),
@@ -1087,9 +1297,15 @@ impl Agent {
             "upload" => format!("upload {}", action.str("file").and_then(|f| f.rsplit(['/', '\\']).next()).unwrap_or("a file")),
             "key" => format!("press {}", action.str("keys").unwrap_or("?")),
             "email" => format!("email {}", action.list("to").join(", ")),
-            "event" | "calendar" => format!("add “{}” to the calendar at {}", action.str("title").unwrap_or(""), action.str("start").unwrap_or("?")),
+            "event" | "calendar" => {
+                format!("add “{}” to the calendar at {}", action.str("title").unwrap_or(""), action.str("start").unwrap_or("?"))
+            }
             "reminder" => format!("{} reminder “{}”", if op.is_empty() { "add" } else { &op }, action.str("title").unwrap_or("")),
-            "table" => format!("write {} rows to {}", action.get("rows").and_then(|r| r.as_array()).map(|a| a.len()).unwrap_or(0), action.str("to").unwrap_or("csv")),
+            "table" => format!(
+                "write {} rows to {}",
+                action.get("rows").and_then(|r| r.as_array()).map(|a| a.len()).unwrap_or(0),
+                action.str("to").unwrap_or("csv")
+            ),
             "shell" | "applescript" => "run a command".to_string(),
             _ => format!("{kind}{}", if op.is_empty() { String::new() } else { format!(" {op}") }),
         };
@@ -1129,12 +1345,23 @@ impl Agent {
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
         self.current.lock().linger = 3.5;
-        Some(self.end(line, ActionResult::ok(format!("DRY RUN — not done: would {what}{target}. The screen didn't change; plan the next step as if it had worked."))))
+        Some(self.end(
+            line,
+            ActionResult::ok(format!(
+                "DRY RUN — not done: would {what}{target}. The screen didn't change; plan the next step as if it had worked."
+            )),
+        ))
     }
 
     /// Replays a workflow with no model; if a step breaks, the model finishes the job and the workflow is updated.
     /// Returns true if the model had to step in.
-    pub(crate) async fn replay_or_heal(self: &Arc<Self>, workflow: crate::workflow::Workflow, params: std::collections::HashMap<String, String>, qa_test: Option<String>, opts: &RunOptions) -> bool {
+    pub(crate) async fn replay_or_heal(
+        self: &Arc<Self>,
+        workflow: crate::workflow::Workflow,
+        params: std::collections::HashMap<String, String>,
+        qa_test: Option<String>,
+        opts: &RunOptions,
+    ) -> bool {
         if self.platform.screen_locked() {
             self.finish(false, "The PC is locked — unlock it and run again");
             return false;
@@ -1156,11 +1383,18 @@ impl Agent {
                     }
                     tokio::time::sleep(Duration::from_millis(600)).await;
                 }
-                self.push_step(&format!("Check “{}”", want.chars().take(50).collect::<String>()), if pass { StepState::Ok } else { StepState::Failed });
+                self.push_step(
+                    &format!("Check “{}”", want.chars().take(50).collect::<String>()),
+                    if pass { StepState::Ok } else { StepState::Failed },
+                );
                 self.log(&format!("  {} expect {want}", if pass { "✓" } else { "✗" }));
                 self.buddy.signal(pass);
                 if qa_test.is_some() {
-                    self.checks.lock().push(Check { text: want, pass, note: if pass { String::new() } else { "not visible on screen".into() } });
+                    self.checks.lock().push(Check {
+                        text: want,
+                        pass,
+                        note: if pass { String::new() } else { "not visible on screen".into() },
+                    });
                     self.current.lock().trace.push(step.clone());
                     continue;
                 }
@@ -1183,10 +1417,19 @@ impl Agent {
                     }
                 }
                 if id.is_none() {
-                    return Box::pin(self.heal(&workflow, i, &format!("couldn't find {} “{}”", t.role, t.label), &params, qa_test, opts)).await;
+                    return Box::pin(self.heal(&workflow, i, &format!("couldn't find {} “{}”", t.role, t.label), &params, qa_test, opts))
+                        .await;
                 }
             }
-            let mut ctx = Ctx { app: obs.app.clone(), elements: obs.elements.clone(), fingerprint: obs.fingerprint, page: obs.page.clone(), web_area: obs.web_area, typed: vec![], seen: obs.page.clone() };
+            let mut ctx = Ctx {
+                app: obs.app.clone(),
+                elements: obs.elements.clone(),
+                fingerprint: obs.fingerprint,
+                page: obs.page.clone(),
+                web_area: obs.web_area,
+                typed: vec![],
+                seen: obs.page.clone(),
+            };
             rs.last_target = None;
             let r = self.perform(&step.to_action(&params, id), &mut ctx, &mut rs).await;
             if !r.ok {
@@ -1204,10 +1447,22 @@ impl Agent {
         false
     }
 
-    async fn heal(self: &Arc<Self>, workflow: &crate::workflow::Workflow, index: usize, reason: &str, params: &std::collections::HashMap<String, String>, qa_test: Option<String>, opts: &RunOptions) -> bool {
+    async fn heal(
+        self: &Arc<Self>,
+        workflow: &crate::workflow::Workflow,
+        index: usize,
+        reason: &str,
+        params: &std::collections::HashMap<String, String>,
+        qa_test: Option<String>,
+        opts: &RunOptions,
+    ) -> bool {
         self.log(&format!("  heal from step {}: {reason}", index + 1));
-        self.push_step(&format!("Step {} changed ({}) — adapting", index + 1, reason.chars().take(60).collect::<String>()), StepState::Info);
-        let remaining: Vec<String> = workflow.steps[index..].iter().enumerate().map(|(i, s)| format!("{}. {}", i + 1, s.summary())).collect();
+        self.push_step(
+            &format!("Step {} changed ({}) — adapting", index + 1, reason.chars().take(60).collect::<String>()),
+            StepState::Info,
+        );
+        let remaining: Vec<String> =
+            workflow.steps[index..].iter().enumerate().map(|(i, s)| format!("{}. {}", i + 1, s.summary())).collect();
         let mut request = format!(
             "You're continuing the saved workflow “{}”. Steps before this point already ran. It got stuck at: {} — {reason}. Finish it from there, adapting to what's on screen now. Remaining steps:\n{}",
             workflow.name,
@@ -1256,7 +1511,11 @@ impl Agent {
                 }
             }
         }
-        self.platform.ocr(app).await.map(|b| b.iter().map(|x| x.text.to_lowercase()).collect::<Vec<_>>().join(" ").contains(&want)).unwrap_or(false)
+        self.platform
+            .ocr(app)
+            .await
+            .map(|b| b.iter().map(|x| x.text.to_lowercase()).collect::<Vec<_>>().join(" ").contains(&want))
+            .unwrap_or(false)
     }
 }
 
@@ -1312,13 +1571,14 @@ fn shell_hint(out: &str) -> String {
 
 /// Up to three lines of `text` sharing the most words with `want`.
 pub(crate) fn closest(want: &str, text: &str) -> Vec<String> {
-    let words = |s: &str| s.to_lowercase().split(|c: char| !c.is_alphanumeric()).filter(|w| w.len() >= 3).map(String::from).collect::<HashSet<_>>();
+    let words =
+        |s: &str| s.to_lowercase().split(|c: char| !c.is_alphanumeric()).filter(|w| w.len() >= 3).map(String::from).collect::<HashSet<_>>();
     let target = words(want);
     if target.is_empty() {
         return vec![];
     }
     let mut scored: Vec<(String, f64)> = text
-        .split(|c| c == '\n' || c == '·' || c == '|')
+        .split(['\n', '·', '|'])
         .map(str::trim)
         .filter(|l| l.len() >= 3 && l.len() <= 160)
         .filter_map(|l| {
@@ -1333,7 +1593,8 @@ pub(crate) fn closest(want: &str, text: &str) -> Vec<String> {
 
 /// Every word of `want` appears in `line` in order, at most 3 other words between each pair.
 pub(crate) fn words_in_order(want: &str, line: &str) -> bool {
-    let w = |t: &str| t.to_lowercase().split(|c: char| !c.is_alphanumeric()).filter(|s| !s.is_empty()).map(String::from).collect::<Vec<_>>();
+    let w =
+        |t: &str| t.to_lowercase().split(|c: char| !c.is_alphanumeric()).filter(|s| !s.is_empty()).map(String::from).collect::<Vec<_>>();
     let (need, have) = (w(want), w(line));
     if need.len() < 2 || have.len() > need.len() + 8 {
         return false;

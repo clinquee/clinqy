@@ -89,6 +89,8 @@ enum Secrets { static func mask(_ text: String) -> String { text.replacingOccurr
             check(denied(action), "blocks shared desktop action: \(action)")
         }
         check(BackgroundPolicy.route(["do":"files","op":"list"], hasWorkerPage: false) == .api, "Finder work routes to filesystem")
+        check(BackgroundPolicy.route(["do":"delegate"], hasWorkerPage: false) == .api, "delegation doesn't require foreground access")
+        check(BackgroundPolicy.route(["do":"collect"], hasWorkerPage: false) == .api, "worker collection doesn't require foreground access")
         check(BackgroundPolicy.route(["do":"type","id":"w2"], hasWorkerPage: true) == .browser, "owned web field allowed")
         check(BackgroundPolicy.route(["do":"key","keys":"cmd+a"], hasWorkerPage: true) == .browser, "owned select-all allowed")
         print("PASS: \(checks) task recovery and background policy checks")
