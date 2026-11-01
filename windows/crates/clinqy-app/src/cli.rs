@@ -1,5 +1,5 @@
 //! The `clinqy` command: drive the Clinqy app from a terminal or any coding agent (Claude Code, Codex, Cursor,
-//! Antigravity…). The same commands as on the Mac.
+//! Antigravity, OpenCode…). The same commands as on the Mac.
 
 use crate::ipc;
 use serde_json::{json, Value};
@@ -37,7 +37,7 @@ pub const HELP: &str = "clinqy — drive Clinqy from a terminal or any coding ag
         Use that one (saved in the settings file), then check it really answers. `clinqy model test` checks again.
         `clinqy model auto` (the default): use what's installed, in this order: Claude Code, Codex, agy, Ollama.
   clinqy models [name]                     The models that provider offers on this PC (default: the one in use).
-  clinqy connect <all|claude|agy|cursor|codex|gemini|windsurf> ...
+  clinqy connect <all|claude|agy|cursor|codex|gemini|windsurf|opencode> ...
         Add Clinqy as an MCP server to those coding agents (keeps their other servers). all: every one on this PC.
   clinqy setup [--model <name>] [--connect <names|all|none>] [--no-extension]
         Everything at once: the model (auto unless named), coding agents (all unless named), the browser extension,

@@ -14,6 +14,8 @@ final class DashboardModel: ObservableObject {
     @Published var talkKey = Config.value("TALK_HOTKEY") ?? ""
     @Published var tokenLimit = Config.value("MONTHLY_TOKEN_LIMIT") ?? ""
     @Published var requestLimit = Config.value("MONTHLY_REQUEST_LIMIT") ?? ""
+    @Published var fastProvider = Config.value("FAST_PROVIDER") ?? "auto"
+    @Published var delegateProvider = Config.value("DELEGATE_PROVIDER") ?? "auto"
     @Published var status = ""
     @Published private(set) var configuredProviders: Set<Provider>?
     @Published var summary = UsageStore.summary(range: .month)
@@ -44,12 +46,14 @@ final class DashboardModel: ObservableObject {
     }
 
     var currentProvider: Provider { Provider(rawValue: selectedProvider) ?? Provider.current }
-    var usesModelTiers: Bool { ![.codexCLI, .ollama, .compatible].contains(currentProvider) }
+    var usesModelTiers: Bool { ![.codexCLI, .opencodeCLI, .cursorCLI, .ollama, .compatible].contains(currentProvider) }
     var modelManaged: Bool {
         let environment = ProcessInfo.processInfo.environment
         switch currentProvider {
         case .ollama, .compatible: return environment["LOCAL_MODEL"] != nil
         case .codexCLI: return environment["CODEX_MODEL"] != nil
+        case .opencodeCLI: return environment["OPENCODE_MODEL"] != nil
+        case .cursorCLI: return environment["CURSOR_MODEL"] != nil
         case .agyCLI:
             return environment["AGY_MODEL"] != nil ||
                 (Config.value("AGY_MODEL") == nil && environment["CLAUDE_MODEL"] != nil)
@@ -60,7 +64,8 @@ final class DashboardModel: ObservableObject {
     }
     var canSaveModel: Bool {
         if usesModelTiers && modelChoice != "custom" { return true }
-        return !modelIdentifier.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || currentProvider == .codexCLI
+        return !modelIdentifier.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
+            [.codexCLI, .opencodeCLI, .cursorCLI].contains(currentProvider)
     }
     var modelName: String {
         let model = currentProvider.model(Brain.defaultModel(for: currentProvider))
@@ -69,6 +74,10 @@ final class DashboardModel: ObservableObject {
     var displayedTalkKey: String {
         if ["off", "none", "disabled"].contains(talkKey.lowercased()) { return "Off" }
         return talkKey.isEmpty ? "Same as summon · hold to talk" : talkKey
+    }
+    var routingManaged: Bool {
+        ProcessInfo.processInfo.environment["FAST_PROVIDER"] != nil ||
+            ProcessInfo.processInfo.environment["DELEGATE_PROVIDER"] != nil
     }
     var tokenLimitValue: Int { Int(tokenLimit) ?? 0 }
     var requestLimitValue: Int { Int(requestLimit) ?? 0 }
@@ -90,6 +99,8 @@ final class DashboardModel: ObservableObject {
             if requestLimit == savedSettings["MONTHLY_REQUEST_LIMIT"] { requestLimit = latest["MONTHLY_REQUEST_LIMIT"] ?? "" }
             savedSettings = latest
             let provider = currentProvider
+            fastProvider = Config.value("FAST_PROVIDER") ?? "auto"
+            delegateProvider = Config.value("DELEGATE_PROVIDER") ?? "auto"
             if provider != modelProvider || modelDraft == savedModelState { loadAppModel(for: provider) }
             refreshProviderStatus()
         }
@@ -138,9 +149,10 @@ final class DashboardModel: ObservableObject {
         if provider == .ollama || provider == .compatible {
             modelChoice = "custom"
             modelIdentifier = Config.value("LOCAL_MODEL") ?? "qwen3-vl"
-        } else if provider == .codexCLI {
+        } else if [.codexCLI, .opencodeCLI, .cursorCLI].contains(provider) {
             modelChoice = "custom"
-            modelIdentifier = Config.value("CODEX_MODEL") ?? ""
+            let key = provider == .codexCLI ? "CODEX_MODEL" : provider == .opencodeCLI ? "OPENCODE_MODEL" : "CURSOR_MODEL"
+            modelIdentifier = Config.value(key) ?? ""
         } else {
             let configured = Brain.defaultModel(for: provider)
             if ["haiku", "sonnet", "opus"].contains(configured.lowercased()) {
@@ -170,19 +182,40 @@ final class DashboardModel: ObservableObject {
         switch currentProvider {
         case .ollama, .compatible: key = "LOCAL_MODEL"
         case .codexCLI: key = "CODEX_MODEL"
+        case .opencodeCLI: key = "OPENCODE_MODEL"
+        case .cursorCLI: key = "CURSOR_MODEL"
         case .agyCLI: key = "AGY_MODEL"
         default: key = "CLAUDE_MODEL"
         }
         do {
             try Config.write([key: value.isEmpty ? nil : value])
             savedModelState = modelDraft
-            status = currentProvider == .codexCLI && value.isEmpty
-                ? "Using Codex's configured default model."
+            status = [.codexCLI, .opencodeCLI, .cursorCLI].contains(currentProvider) && value.isEmpty
+                ? "Using the provider's configured default model."
                 : "App model saved."
             providerChanged()
         } catch {
             status = "Couldn't save model: \(error.localizedDescription)"
         }
+    }
+
+    func saveRouting() {
+        guard !routingManaged else { status = "Provider routing is managed by environment variables."; return }
+        for raw in [fastProvider, delegateProvider] where raw != "auto" {
+            guard let provider = Provider(rawValue: raw), provider.isConfigured else {
+                let name = Provider(rawValue: raw)?.displayName ?? raw
+                status = "Set up \(name) before assigning it to a routing role."
+                return
+            }
+        }
+        do {
+            try Config.write([
+                "FAST_PROVIDER": fastProvider == "auto" ? nil : fastProvider,
+                "DELEGATE_PROVIDER": delegateProvider == "auto" ? nil : delegateProvider,
+            ])
+            status = "Provider routing saved. Fast helper and delegate sessions will use their selected providers."
+            providerChanged()
+        } catch { status = "Couldn't save routing: \(error.localizedDescription)" }
     }
 
     func saveLimits() {
@@ -557,6 +590,29 @@ struct DashboardContentView: View {
                         Spacer()
                         Button("Save model") { model.saveAppModel() }.brand(primary: true)
                             .disabled(model.modelManaged || !model.canSaveModel)
+                    }
+                }
+                Divider().overlay(Brand.line)
+                VStack(alignment: .leading, spacing: 9) {
+                    Text("Orchestrator routing").font(.system(size: 13, weight: .semibold))
+                    Picker("Fast helper", selection: $model.fastProvider) {
+                        Text("Auto · same as lead").tag("auto")
+                        ForEach(model.providers, id: \.rawValue) { Text($0.displayName).tag($0.rawValue) }
+                    }.disabled(model.routingManaged)
+                    Picker("Delegated work", selection: $model.delegateProvider) {
+                        Text("Auto · same as lead").tag("auto")
+                        ForEach(model.providers, id: \.rawValue) { Text($0.displayName).tag($0.rawValue) }
+                    }.disabled(model.routingManaged)
+                    HStack {
+                        Text("Routes routine steps and delegated tasks through separate accounts.")
+                            .font(.system(size: 11)).foregroundStyle(muted)
+                        Spacer()
+                        Button("Save routing") { model.saveRouting() }.brand()
+                            .disabled(model.routingManaged)
+                    }
+                    if model.routingManaged {
+                        Text("Set FAST_PROVIDER or DELEGATE_PROVIDER in the environment to manage these routes.")
+                            .font(.system(size: 11)).foregroundStyle(muted)
                     }
                 }
             }

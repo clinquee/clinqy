@@ -102,7 +102,7 @@ final class OnboardingWindow: NSWindow, NSWindowDelegate {
 
 /// The ways to drive Clinqy that setup offers, in the order shown.
 enum ModelChoice: String, CaseIterable, Identifiable {
-    case claude, agy, codex, anthropic, openai, gemini, openrouter, ollama, compatible
+    case claude, agy, codex, opencode, cursor, anthropic, openai, gemini, openrouter, ollama, compatible
     var id: String { rawValue }
 
     var provider: Provider {
@@ -110,6 +110,8 @@ enum ModelChoice: String, CaseIterable, Identifiable {
         case .claude: return .claudeCLI
         case .agy: return .agyCLI
         case .codex: return .codexCLI
+        case .opencode: return .opencodeCLI
+        case .cursor: return .cursorCLI
         case .anthropic: return .anthropic
         case .openai: return .openai
         case .gemini: return .gemini
@@ -122,7 +124,7 @@ enum ModelChoice: String, CaseIterable, Identifiable {
     enum Group: String { case cli = "Use a CLI you're logged into", api = "Use an API key", local = "Use a local model" }
     var group: Group {
         switch self {
-        case .claude, .agy, .codex: return .cli
+        case .claude, .agy, .codex, .opencode, .cursor: return .cli
         case .anthropic, .openai, .gemini, .openrouter: return .api
         case .ollama, .compatible: return .local
         }
@@ -133,6 +135,8 @@ enum ModelChoice: String, CaseIterable, Identifiable {
         case .claude: return "Claude Code"
         case .agy: return "Antigravity CLI (agy)"
         case .codex: return "Codex CLI"
+        case .opencode: return "OpenCode"
+        case .cursor: return "Cursor Agent"
         case .anthropic: return "Anthropic"
         case .openai: return "OpenAI"
         case .gemini: return "Google Gemini"
@@ -147,6 +151,8 @@ enum ModelChoice: String, CaseIterable, Identifiable {
         case .claude: return "Your Claude login. No key needed."
         case .agy: return "Your Google login. No key needed."
         case .codex: return "Your ChatGPT login. No key needed."
+        case .opencode: return "Your OpenCode provider login, including supported ChatGPT plans."
+        case .cursor: return "Your Cursor login. Read-only Ask mode; Clinqy handles actions."
         case .anthropic: return "Claude models with your API key."
         case .openai: return "GPT models with your API key."
         case .gemini: return "Gemini models with your API key."
@@ -194,6 +200,8 @@ enum ModelChoice: String, CaseIterable, Identifiable {
         case .claude: return ("curl -fsSL https://claude.ai/install.sh | bash", "https://claude.com/claude-code", "claude")
         case .agy: return (nil, "https://antigravity.google/docs/cli/overview", "agy")
         case .codex: return ("npm install -g @openai/codex", "https://github.com/openai/codex", "codex login")
+        case .opencode: return ("curl -fsSL https://opencode.ai/v2/install | bash", "https://opencode.ai/docs/cli/", "opencode auth login")
+        case .cursor: return ("curl https://cursor.com/install -fsS | bash", "https://cursor.com/docs/cli/installation", "agent login")
         default: return nil
         }
     }
@@ -525,6 +533,7 @@ final class OnboardingModel: ObservableObject {
         Agent(id: "cursor", name: "Cursor", detail: "~/.cursor/mcp.json"),
         Agent(id: "codex", name: "Codex", detail: "~/.codex/config.toml"),
         Agent(id: "gemini", name: "Gemini CLI", detail: "~/.gemini/settings.json"),
+        Agent(id: "opencode", name: "OpenCode", detail: "opencode mcp add --global"),
     ]
 
     func connect(_ id: String) {

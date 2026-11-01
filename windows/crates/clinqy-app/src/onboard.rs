@@ -8,10 +8,12 @@ use std::time::{Duration, Instant};
 
 /// The choices, by the short names people type: (name, provider, what it is), in the order Clinqy picks them
 /// when nothing is set.
-pub const MODELS: [(&str, Provider, &str); 9] = [
+pub const MODELS: [(&str, Provider, &str); 11] = [
     ("claude", Provider::ClaudeCli, "Claude Code CLI, your Claude login"),
     ("codex", Provider::CodexCli, "Codex CLI, your ChatGPT login"),
     ("agy", Provider::AgyCli, "Antigravity CLI, your Google login"),
+    ("opencode", Provider::OpenCodeCli, "OpenCode, your connected provider logins"),
+    ("cursor", Provider::CursorCli, "Cursor Agent, your Cursor login"),
     ("ollama", Provider::Ollama, "a local model with Ollama"),
     ("anthropic", Provider::Anthropic, "Anthropic API key"),
     ("openai", Provider::OpenAi, "OpenAI API key"),
@@ -43,9 +45,28 @@ pub fn readiness(p: Provider) -> Result<String, String> {
             None => Err("The Antigravity CLI (agy) isn't installed. Install it from https://antigravity.google/docs/cli/overview, then run `agy` once in a new terminal to log in.".into()),
         },
         Provider::CodexCli => match p.cli() {
-            Some(c) => Ok(c.program.display().to_string()),
+            Some(c) if p.is_configured() => Ok(c.program.display().to_string()),
+            Some(_) => Err("Codex CLI isn't signed in with ChatGPT. Run `codex login` once in a terminal.".into()),
             None => Err("The Codex CLI isn't installed. Install it with `npm i -g @openai/codex`, then run `codex login`.".into()),
         },
+        Provider::OpenCodeCli => {
+            if p.cli().is_none() {
+                Err("OpenCode isn't installed. Download the Windows CLI from https://opencode.ai/download, then run `opencode auth login`.".into())
+            } else if !p.is_configured() {
+                Err("OpenCode isn't connected. Run `opencode auth login` once in a terminal.".into())
+            } else {
+                Ok(p.label())
+            }
+        }
+        Provider::CursorCli => {
+            if p.cli().is_none() {
+                Err("Cursor Agent isn't installed. In PowerShell run `irm 'https://cursor.com/install?win32=true' | iex`, then `agent login`.".into())
+            } else if !p.is_configured() {
+                Err("Cursor Agent isn't logged in. Run `agent login` once in a terminal.".into())
+            } else {
+                Ok(p.label())
+            }
+        }
         Provider::Ollama => {
             if clinqy_core::provider::reachable(&p.base_url()) {
                 Ok(format!("{} · model {}", p.base_url(), p.model("sonnet")))
@@ -128,7 +149,7 @@ pub fn provider_info(p: Provider) -> serde_json::Value {
     let installed = !p.is_cli() || p.cli().is_some();
     let configured = p.is_configured();
     let kind = match p {
-        Provider::ClaudeCli | Provider::CodexCli | Provider::AgyCli => "cli",
+        Provider::ClaudeCli | Provider::CodexCli | Provider::AgyCli | Provider::OpenCodeCli | Provider::CursorCli => "cli",
         Provider::Ollama | Provider::Compatible => "local",
         _ => "api",
     };
@@ -143,6 +164,8 @@ pub fn provider_info(p: Provider) -> serde_json::Value {
         Provider::ClaudeCli => ("winget install Anthropic.ClaudeCode", "claude", "https://claude.com/claude-code"),
         Provider::CodexCli => ("npm i -g @openai/codex", "codex login", "https://github.com/openai/codex"),
         Provider::AgyCli => ("", "agy", "https://antigravity.google/docs/cli/overview"),
+        Provider::OpenCodeCli => ("", "opencode auth login", "https://opencode.ai/download"),
+        Provider::CursorCli => ("irm 'https://cursor.com/install?win32=true' | iex", "agent login", "https://cursor.com/docs/cli/installation"),
         Provider::Ollama => ("winget install Ollama.Ollama", "", "https://ollama.com/download"),
         _ => ("", "", ""),
     };
@@ -180,13 +203,14 @@ pub fn key_var(p: Provider) -> Option<&'static str> {
 }
 
 /// The coding agents the Clinqy window can connect: (id, name, where it goes).
-pub const AGENT_ROWS: [(&str, &str, &str); 6] = [
+pub const AGENT_ROWS: [(&str, &str, &str); 7] = [
     ("claude", "Claude Code", "claude mcp add"),
     ("codex", "Codex", "~/.codex/config.toml"),
     ("agy", "Antigravity CLI", "agy mcp add"),
     ("cursor", "Cursor", "~/.cursor/mcp.json"),
     ("gemini", "Gemini CLI", "~/.gemini/settings.json"),
     ("windsurf", "Windsurf", "~/.codeium/windsurf/mcp_config.json"),
+    ("opencode", "OpenCode", "opencode mcp add --global"),
 ];
 
 /// The browser Clinqy adds its extension to, and the request that does it. None when the extension folder is missing.
@@ -222,7 +246,7 @@ pub fn clinqy_exe() -> PathBuf {
 }
 
 /// The coding agents `clinqy connect` knows.
-pub const AGENTS: [&str; 6] = ["claude", "agy", "cursor", "codex", "gemini", "windsurf"];
+pub const AGENTS: [&str; 7] = ["claude", "agy", "cursor", "codex", "gemini", "windsurf", "opencode"];
 
 /// The coding agents on this PC: those whose CLI or settings folder is here.
 pub fn installed_agents() -> Vec<&'static str> {
@@ -236,6 +260,7 @@ pub fn installed_agents() -> Vec<&'static str> {
             "cursor" => home.join(".cursor").is_dir(),
             "gemini" => home.join(".gemini").is_dir(),
             "windsurf" => home.join(".codeium").join("windsurf").is_dir(),
+            "opencode" => opencode_cli().is_some(),
             _ => false,
         })
         .collect()
@@ -259,6 +284,11 @@ pub fn connect(agent: &str) -> Result<String, String> {
             run(&cli, &["mcp", "add", "clinqy", &exe_s, "mcp"])?;
             Ok("agy: added the clinqy MCP server".into())
         }
+        "opencode" => {
+            let cli = opencode_cli().ok_or("OpenCode CLI isn't installed or isn't on PATH (set OPENCODE_PATH in the Clinqy settings file)")?;
+            run(&cli, &opencode_args(&exe_s))?;
+            Ok("OpenCode: added the clinqy MCP server globally (all projects)".into())
+        }
         "cursor" => json_server(&home.join(".cursor").join("mcp.json"), &exe_s).map(|p| format!("Cursor: added clinqy to {}", p.display())),
         "gemini" | "gemini-cli" => json_server(&home.join(".gemini").join("settings.json"), &exe_s).map(|p| format!("Gemini CLI: added clinqy to {}", p.display())),
         "windsurf" => json_server(&home.join(".codeium").join("windsurf").join("mcp_config.json"), &exe_s).map(|p| format!("Windsurf: added clinqy to {}", p.display())),
@@ -281,6 +311,20 @@ pub fn connect(agent: &str) -> Result<String, String> {
         }
         other => Err(format!("I don't know the agent {other:?}; use one of: {}", AGENTS.join(", "))),
     }
+}
+
+/// Finds OpenCode's native executable or the current official npm CLI shim.
+fn opencode_cli() -> Option<clinqy_core::provider::CliCommand> {
+    let home = clinqy_core::paths::home();
+    let spots = [
+        home.join(".opencode").join("bin").join("opencode.exe"),
+        home.join(".bun").join("bin").join("opencode.exe"),
+    ];
+    clinqy_core::provider::find_cli("OPENCODE_PATH", "opencode", &spots, "@opencode/cli/bin/opencode.cjs")
+}
+
+fn opencode_args(exe: &str) -> [&str; 7] {
+    ["mcp", "add", "clinqy", "--global", "--", exe, "mcp"]
 }
 
 /// `{"mcpServers": {"clinqy": {...}}}` in a JSON config, keeping everything else.
@@ -312,5 +356,20 @@ fn run(cli: &clinqy_core::provider::CliCommand, args: &[&str]) -> Result<(), Str
         let err = String::from_utf8_lossy(&out.stderr);
         let msg = if err.trim().is_empty() { String::from_utf8_lossy(&out.stdout).into_owned() } else { err.into_owned() };
         Err(first_line(&msg))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn opencode_connection_is_global_and_keeps_executable_path_as_one_argument() {
+        assert_eq!(AGENTS.last(), Some(&"opencode"));
+        assert!(AGENT_ROWS.iter().any(|(id, _, _)| *id == "opencode"));
+        assert_eq!(
+            opencode_args(r"C:\Program Files\Clinqy\clinqy.exe"),
+            ["mcp", "add", "clinqy", "--global", "--", r"C:\Program Files\Clinqy\clinqy.exe", "mcp"]
+        );
     }
 }

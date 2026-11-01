@@ -211,10 +211,15 @@ impl Agent {
             Ok(Err(e)) => return self.finish(false, &e.to_string()),
             Err(e) => return self.finish(false, &e.to_string()),
         };
+        let worker_provider = crate::config::value("DELEGATE_PROVIDER")
+            .and_then(|raw| Provider::parse(&raw))
+            .filter(|provider| provider.is_configured())
+            .unwrap_or(session.provider);
+        let worker_model = crate::config::value("DELEGATE_MODEL").unwrap_or_else(|| worker_provider.default_model());
         rs.workers = Some(crate::delegation::Pool::new(
             request.clone(),
-            session.provider,
-            crate::config::value("DELEGATE_MODEL").unwrap_or_else(|| "sonnet".into()),
+            worker_provider,
+            worker_model.clone(),
         ));
         // The next request's session starts warming now.
         self.prewarm();
@@ -379,8 +384,8 @@ impl Agent {
             if !added.is_empty() {
                 rs.workers = Some(crate::delegation::Pool::new(
                     request.clone(),
-                    session.provider,
-                    crate::config::value("DELEGATE_MODEL").unwrap_or_else(|| "sonnet".into()),
+                    worker_provider,
+                    worker_model.clone(),
                 ));
                 message = format!(
                     "The user added while you were working (take it into account; it may change the plan):\n{}\n\n{message}",

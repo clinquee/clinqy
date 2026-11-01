@@ -34,7 +34,7 @@ Terminals that were already open don't know about it yet.
 ## 2. Paste the setup prompt
 
 Copy the prompt from the [main README](../README.md#setup-on-windows) or the [website](https://clinqy.vercel.app/#setup)
-into the AI you use: Claude Code, Codex, agy, Cursor, Gemini CLI, Windsurf, or a plain chat. There's nothing to fill in.
+into the AI you use: Claude Code, Codex, agy, Cursor, Gemini CLI, Windsurf, OpenCode, or a plain chat. There's nothing to fill in.
 
 The top two lines are the only settings, and the defaults suit most people:
 
@@ -45,7 +45,7 @@ Connect to: all
 
 - **Model** is the AI Clinqy thinks with. `auto` picks the first one you have, in this order: Claude Code, Codex, agy,
   Ollama. To choose one, use `claude`, `codex`, `agy`, `ollama`, `anthropic`, `openai`, `gemini` or `openrouter`.
-- **Connect to** is which coding agents get Clinqy's tools. Use `all`, `none`, or names with commas.
+- **Connect to** is which coding agents get Clinqy's tools. Use `all`, `none`, or comma-separated names from `claude`, `codex`, `agy`, `cursor`, `gemini`, `windsurf` and `opencode`.
 
 Your AI then does the following. If it's a chat with no terminal, it gives you one command at a time to paste instead.
 
@@ -152,7 +152,9 @@ automation on your everyday one. You have two options, both in the Clinqy window
 - Or click **Sign in…**, sign in to the site in the window that opens, then click **Finish sign-in**. You only do this
   once per site. To keep those sign-ins somewhere else, change **Profile folder** on the same page.
 
-**A coding agent can't see Clinqy.** Restart it. To check it's connected, use `claude mcp list` or `agy mcp list`.
+**A coding agent can't see Clinqy.** Restart it. To check it's connected, use `claude mcp list`, `agy mcp list` or `opencode mcp list`.
+
+**OpenCode isn't detected.** Add the OpenCode CLI to `PATH`, or set `OPENCODE_PATH` in `clinqy settings`, then run `clinqy connect opencode`.
 
 **Still stuck?** The log is at `%LOCALAPPDATA%\Clinqy\Logs\agent.log`.
 

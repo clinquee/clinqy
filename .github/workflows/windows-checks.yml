@@ -1,0 +1,17 @@
+name: Windows checks
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  checks:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Test provider and agent core
+        run: cargo test --manifest-path windows/Cargo.toml -p clinqy-core --lib --locked
+      - name: Check all Windows crates
+        run: cargo check --manifest-path windows/Cargo.toml --workspace --locked

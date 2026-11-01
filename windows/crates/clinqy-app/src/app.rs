@@ -4,6 +4,7 @@
 use crate::ui::{Bar, Dashboard, Island, LiveView, ResultPanel};
 use clinqy_core::agent::{Context, Copied, Event as AgentEvent, RunOptions};
 use clinqy_core::platform::{Mood, Platform};
+use clinqy_core::provider::Provider;
 use clinqy_core::{bridge, history, workflow, Agent};
 use clinqy_windows::hotkey::{self, HotEvent, TaskKey};
 use clinqy_windows::{Overlay, WindowsPlatform};
@@ -159,8 +160,7 @@ pub fn run() -> anyhow::Result<()> {
     let now = crate::onboard::short_name(clinqy_core::provider::Provider::current());
     let mut models: Vec<CheckMenuItem> = vec![CheckMenuItem::with_id("model:auto", "Automatic (what you have)", true, auto, None)];
     models.extend(
-        crate::onboard::MODELS[..4]
-            .iter()
+        crate::onboard::MODELS.iter().filter(|m| m.1.is_cli())
             .map(|(name, _, what)| CheckMenuItem::with_id(format!("model:{name}"), *what, true, !auto && now == *name, None)),
     );
     let model_menu = Submenu::with_id("model", "Model", true);
@@ -317,6 +317,7 @@ pub fn run() -> anyhow::Result<()> {
         follow_up: false,
         dashboard_range: "month".into(),
         dashboard_status: String::new(),
+        run_provider: Provider::current(),
     };
     let proxy_for_loop = proxy.clone();
     event_loop.run(move |event, _target, control_flow| {
@@ -425,6 +426,8 @@ struct UiState {
     follow_up: bool,
     dashboard_range: String,
     dashboard_status: String,
+    /// One-run model choice from the command bar; the saved dashboard provider remains the default.
+    run_provider: Provider,
 }
 
 impl UiState {
@@ -442,6 +445,8 @@ impl UiState {
         let wfs: Vec<Value> = workflow::workflows().all().iter().map(|w| json!({"id": w.id, "name": w.name, "steps": w.steps.len(), "runs": w.runs, "schedule": w.schedule, "params": w.params})).collect();
         let skills: Vec<Value> = clinqy_core::skills::all().iter().map(|s| json!({"id": s.id, "name": s.name, "summary": s.summary, "parameters": s.parameters, "steps": s.steps})).collect();
         let provider = clinqy_core::provider::Provider::current();
+        let providers: Vec<Value> = Provider::ALL.iter().filter(|p| p.is_configured())
+            .map(|p| json!({"id": p.id(), "name": p.display_name()})).collect();
         let ctx = self.agent().context.lock().clone();
         let name = |p: &std::path::Path| p.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_else(|| p.display().to_string());
         let copied = ctx.copied.as_ref().map(|c| {
@@ -464,6 +469,7 @@ impl UiState {
             "listening": self.shared.voice.is_listening(), "transcript": if transcript == "Transcribing…" { String::new() } else { transcript },
             "backgroundMode": clinqy_core::background::always(),
             "hotkey": self.hotkey_label, "talkKey": self.talk_label, "model": format!("{} · {}", provider.id(), provider.default_model()),
+            "providers": providers, "runProvider": self.run_provider.id(),
         })
     }
 
@@ -553,11 +559,16 @@ impl UiState {
     }
 
     fn show_bar(&mut self) {
+        if !self.agent().is_running() && self.agent().question().is_none() {
+            self.run_provider = Provider::current();
+        }
         self.bar.show(&self.extras());
     }
 
     fn submit(&mut self, text: &str, voice: bool) {
         self.voice_run = voice;
+        let provider = self.run_provider;
+        self.run_provider = Provider::current();
         self.bar.hide();
         self.bar.clear();
         let target = self.agent().context.lock().target.clone();
@@ -569,7 +580,7 @@ impl UiState {
             if let Some(t) = target {
                 platform.bring_to_front(&t).await;
             }
-            agent.submit(&text, RunOptions::default());
+            agent.submit(&text, RunOptions { provider: Some(provider), ..Default::default() });
         });
     }
 
@@ -764,6 +775,8 @@ impl UiState {
             "model": crate::onboard::model_label(current),
             "auto": crate::onboard::is_auto(),
             "providerManaged": Provider::managed_by_environment(),
+            "delegateProvider": clinqy_core::config::value("DELEGATE_PROVIDER").unwrap_or_else(|| "auto".into()),
+            "routingManaged": std::env::var_os("DELEGATE_PROVIDER").is_some(),
             "providers": crate::onboard::MODELS.iter().map(|m| crate::onboard::provider_info(m.1)).collect::<Vec<_>>(),
             "baseUrl": clinqy_core::config::value("OPENAI_BASE_URL").unwrap_or_default(),
             "tokenLimit": clinqy_core::config::value("MONTHLY_TOKEN_LIMIT").unwrap_or_default(),
@@ -920,6 +933,31 @@ impl UiState {
                             self.set_status(if model.is_empty() { format!("{} will use its default model.", p.display_name()) } else { format!("{} will use {model}.", p.display_name()) });
                         }
                         Err(error) => self.set_status(format!("Couldn't save the model: {error}")),
+                    }
+                }
+            }
+            "saveRouting" => {
+                if std::env::var_os("DELEGATE_PROVIDER").is_some() {
+                    self.set_status("Provider routing is set by environment variables.");
+                } else {
+                    let raw = string("delegateProvider");
+                    let invalid = if raw.is_empty() || raw == "auto" { None } else {
+                        match Provider::parse(&raw) {
+                            Some(p) if p.is_configured() => None,
+                            Some(p) => Some(format!("Set up {} before assigning it to delegated work.", p.display_name())),
+                            None => Some(format!("Unknown provider {raw:?}.")),
+                        }
+                    };
+                    if let Some(error) = invalid {
+                        self.set_status(error);
+                    } else {
+                        let saved = clinqy_core::config::set("DELEGATE_PROVIDER", if raw == "auto" { "" } else { &raw });
+                        match saved {
+                            Ok(()) => {
+                                self.set_status("Delegate provider saved. New delegated tasks will use that provider.");
+                            }
+                            Err(error) => self.set_status(format!("Couldn't save provider routing: {error}")),
+                        }
                     }
                 }
             }
@@ -1431,6 +1469,14 @@ impl UiState {
                 self.bar.hide();
             }
             "submit" => self.submit(&s("text"), false),
+            "provider" => {
+                if let Some(provider) = Provider::parse(&s("provider")) {
+                    if provider.is_configured() {
+                        self.run_provider = provider;
+                        self.refresh_bar();
+                    }
+                }
+            }
             "add" => {
                 agent.add_context(&s("text"));
                 self.bar.hide();

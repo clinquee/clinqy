@@ -13,6 +13,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Build the Mac app sources
         run: swift build -c release
+      - name: OpenCode MCP registration
+        run: bash tests/opencode-connect.sh "$PWD/.build/release/Clinqy"
+      - name: OpenCode and Cursor ACP sessions (mock agents)
+        run: bash tests/acp-session.sh
       - name: Native and Telegram regressions (mocked services)
         run: |
           bash tests/task-power.sh

@@ -371,6 +371,28 @@ struct CommandView: View {
                         .buttonStyle(.plain).font(.system(size: 11)).foregroundStyle(DS.secondary)
                 }.padding(.horizontal, 18).padding(.top, 12)
             }
+            if agent.newTaskMode {
+                HStack(spacing: 8) {
+                    Text("AI for this run").font(.system(size: 11, weight: .medium)).foregroundStyle(DS.secondary)
+                    if agent.newTaskProviderChoices.isEmpty {
+                        Text(agent.loadingNewTaskProviderChoices ? "Checking providers…" : "No configured provider")
+                            .font(.system(size: 11)).foregroundStyle(DS.tertiary)
+                    } else {
+                        Picker("AI for this run", selection: $agent.newTaskProvider) {
+                            ForEach(agent.newTaskProviderChoices, id: \.rawValue) { provider in
+                                Text(provider.displayName).tag(provider)
+                            }
+                        }
+                        .labelsHidden()
+                        .pickerStyle(.menu)
+                        .controlSize(.small)
+                    }
+                    Spacer()
+                    Text("dashboard default stays unchanged").font(.system(size: 10)).foregroundStyle(DS.tertiary)
+                }
+                .padding(.horizontal, 18)
+                .padding(.top, 8)
+            }
             VStack(spacing: 0) {
                 if let r = review.pending, !agent.newTaskMode {
                     ReviewCard(review: r, onSubmit: { review.decide(true) },

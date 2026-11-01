@@ -177,8 +177,12 @@ function providerDetail() {
 }
 function ai() {
   const managed = S.providerManaged ? `<p class="note">The provider is set by an environment variable or launch option, so it can't be changed here.</p>` : "";
-  return `<div class="card"><div class="row"><div class="grow"><h2>AI provider</h2><p>Choose which service answers for Clinqy. With Automatic, it uses the first one you have: Claude Code, then Codex, then agy, then Ollama.</p></div></div>
-    <div class="row"><span class="grow">Automatic</span><button class="switch ${S.auto ? "on" : ""}" data-do="auto" ${S.providerManaged ? "disabled" : ""}></button></div>${managed}</div>${providerDetail()}<div class="card">${providerRows()}</div>`;
+  const routeOptions = `<option value="auto" ${S.delegateProvider === "auto" ? "selected" : ""}>Auto · same as main</option>${(S.providers || []).map((p) => `<option value="${esc(p.id)}" ${S.delegateProvider === p.id ? "selected" : ""}>${esc(p.name)}</option>`).join("")}`;
+  return `<div class="card"><div class="row"><div class="grow"><h2>AI provider</h2><p>Choose which service answers for Clinqy. Automatic uses the first configured provider in PROVIDER_ORDER.</p></div></div>
+    <div class="row"><span class="grow">Automatic</span><button class="switch ${S.auto ? "on" : ""}" data-do="auto" ${S.providerManaged ? "disabled" : ""}></button></div>${managed}</div>${providerDetail()}<div class="card">${providerRows()}</div>
+    <div class="card"><h2>Orchestrator routing</h2><p>Run delegated research, analysis, or review with a separate provider account. The main provider stays responsible for the task and all computer actions.</p>
+      <div class="row"><span class="grow">Delegated work</span><select id="delegateProvider" ${S.routingManaged ? "disabled" : ""}>${routeOptions}</select><button class="btn" data-do="saveRouting" ${S.routingManaged ? "disabled" : ""}>Save route</button></div>
+      ${S.routingManaged ? `<p class="note">Set DELEGATE_PROVIDER in the environment to manage this route.</p>` : ""}</div>`;
 }
 function background() {
   const b = S.background || {};
@@ -295,6 +299,7 @@ function act(what) {
     case "apikey": { const v = $("apikey").value.trim(); if (v) { post("apiKey", { provider: wanted, key: v }); $("apikey").value = ""; models[wanted] = undefined; } break; }
     case "baseurl": post("baseUrl", { url: $("baseurl").value.trim() }); models[wanted] = undefined; break;
     case "saveModel": { const sel = $("model").value; const id = sel === "__custom" ? ($("customModel")?.value || "").trim() : sel; if (sel === "__custom" && !id) return; post("saveModel", { provider: wanted, model: id }); if (models[wanted]) models[wanted].saved = id; if (sel === "__custom") { models[wanted].choices.push({ id, label: id }); custom = ""; } break; }
+    case "saveRouting": post("saveRouting", { delegateProvider: $("delegateProvider").value }); break;
     case "backgroundBrowser": post("backgroundBrowser", { on: !S.background.ownBrowser }); break;
     case "workerProfile": post("workerProfile", { folder: $("workerprofile").value.trim() }); break;
     case "limits": post("limits", { tokens: $("tokens").value.trim(), requests: $("requests").value.trim() }); break;
