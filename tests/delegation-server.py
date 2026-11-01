@@ -1,5 +1,6 @@
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from socketserver import TCPServer
 import sys
 
 
@@ -33,6 +34,15 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
-server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+class FixtureServer(ThreadingHTTPServer):
+    def server_bind(self):
+        # HTTPServer normally reverse-resolves its address here. This loopback-only
+        # fixture needs no DNS, which can be slow or unavailable on hosted runners.
+        TCPServer.server_bind(self)
+        self.server_name = "localhost"
+        self.server_port = self.server_address[1]
+
+
+server = FixtureServer(("127.0.0.1", 0), Handler)
 Path(sys.argv[1]).write_text(str(server.server_port))
 server.serve_forever()
