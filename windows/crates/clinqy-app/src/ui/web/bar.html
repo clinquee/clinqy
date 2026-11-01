@@ -31,6 +31,7 @@
   .rrow .v.empty { color: var(--failure); }
   .small { font-size: 11px; color: var(--tertiary); }
   .bar { display: flex; align-items: center; gap: 14px; height: 64px; padding: 0 18px; }
+  .provider-picker { max-width: 132px; min-width: 88px; padding: 6px 8px; border: 1px solid var(--hairline); border-radius: 8px; background: rgba(255,255,255,0.06); color: var(--secondary); font: 11px var(--font); }
   #orb { width: 26px; height: 26px; flex: none; }
   .field { flex: 1; min-width: 0; position: relative; }
   #input { width: 100%; background: transparent; border: 0; outline: 0; color: var(--text); font: 20px var(--font); padding: 0; user-select: text; caret-color: var(--text); }
@@ -94,6 +95,7 @@
   <div id="top"></div>
   <div class="bar">
     <canvas id="orb"></canvas>
+    <select id="provider" class="provider-picker" title="AI for this run"></select>
     <div class="field">
       <input id="input" autocomplete="off" spellcheck="false">
       <div id="heard" class="hide"></div>
@@ -114,7 +116,7 @@ document.addEventListener("mousedown", (e) => {
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 const O = orb($("#orb"));
 let S = { snap: {}, history: [], workflows: [], skills: [], listening: false, transcript: "", status: "", hotkey: "Ctrl+Alt", talkKey: "Ctrl+H",
-          context: {}, tab: "home", fixDismissed: null, recording: false, learning: false };
+          context: {}, tab: "home", fixDismissed: null, recording: false, learning: false, providers: [], runProvider: "" };
 
 const suggestions = [
   ["bubble.left.fill", "Say good morning to mom on WhatsApp"],
@@ -183,6 +185,10 @@ function render() {
 
   // The bar: orb, field (or what's being heard), buttons.
   const input = $("#input"), heard = $("#heard");
+  const provider = $("#provider");
+  provider.innerHTML = (S.providers || []).map((p) => `<option value="${esc(p.id)}">${esc(p.name)}</option>`).join("");
+  provider.value = S.runProvider || "";
+  provider.classList.toggle("hide", !!s.running || !!s.question || !!s.review || !(S.providers || []).length);
   input.classList.toggle("hide", !!S.listening);
   heard.classList.toggle("hide", !S.listening);
   heard.classList.toggle("empty", !S.transcript);
@@ -283,6 +289,11 @@ function submitInput() {
   else send({ type: "submit", text });
   $("#input").value = "";
 }
+
+$("#provider").addEventListener("change", (event) => {
+  S.runProvider = event.target.value;
+  send({ type: "provider", provider: S.runProvider });
+});
 $("#input").addEventListener("keydown", (e) => {
   if (e.key === "Escape") { send({ type: "hide" }); return; }
   if (e.key === "Enter") { e.preventDefault(); submitInput(); }

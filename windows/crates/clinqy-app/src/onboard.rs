@@ -8,10 +8,12 @@ use std::time::{Duration, Instant};
 
 /// The choices, by the short names people type: (name, provider, what it is), in the order Clinqy picks them
 /// when nothing is set.
-pub const MODELS: [(&str, Provider, &str); 9] = [
+pub const MODELS: [(&str, Provider, &str); 11] = [
     ("claude", Provider::ClaudeCli, "Claude Code CLI, your Claude login"),
     ("codex", Provider::CodexCli, "Codex CLI, your ChatGPT login"),
     ("agy", Provider::AgyCli, "Antigravity CLI, your Google login"),
+    ("opencode", Provider::OpenCodeCli, "OpenCode, your connected provider logins"),
+    ("cursor", Provider::CursorCli, "Cursor Agent, your Cursor login"),
     ("ollama", Provider::Ollama, "a local model with Ollama"),
     ("anthropic", Provider::Anthropic, "Anthropic API key"),
     ("openai", Provider::OpenAi, "OpenAI API key"),
@@ -43,9 +45,28 @@ pub fn readiness(p: Provider) -> Result<String, String> {
             None => Err("The Antigravity CLI (agy) isn't installed. Install it from https://antigravity.google/docs/cli/overview, then run `agy` once in a new terminal to log in.".into()),
         },
         Provider::CodexCli => match p.cli() {
-            Some(c) => Ok(c.program.display().to_string()),
+            Some(c) if p.is_configured() => Ok(c.program.display().to_string()),
+            Some(_) => Err("Codex CLI isn't signed in with ChatGPT. Run `codex login` once in a terminal.".into()),
             None => Err("The Codex CLI isn't installed. Install it with `npm i -g @openai/codex`, then run `codex login`.".into()),
         },
+        Provider::OpenCodeCli => {
+            if p.cli().is_none() {
+                Err("OpenCode isn't installed. Download the Windows CLI from https://opencode.ai/download, then run `opencode auth login`.".into())
+            } else if !p.is_configured() {
+                Err("OpenCode isn't connected. Run `opencode auth login` once in a terminal.".into())
+            } else {
+                Ok(p.label())
+            }
+        }
+        Provider::CursorCli => {
+            if p.cli().is_none() {
+                Err("Cursor Agent isn't installed. In PowerShell run `irm 'https://cursor.com/install?win32=true' | iex`, then `agent login`.".into())
+            } else if !p.is_configured() {
+                Err("Cursor Agent isn't logged in. Run `agent login` once in a terminal.".into())
+            } else {
+                Ok(p.label())
+            }
+        }
         Provider::Ollama => {
             if clinqy_core::provider::reachable(&p.base_url()) {
                 Ok(format!("{} · model {}", p.base_url(), p.model("sonnet")))
@@ -128,7 +149,7 @@ pub fn provider_info(p: Provider) -> serde_json::Value {
     let installed = !p.is_cli() || p.cli().is_some();
     let configured = p.is_configured();
     let kind = match p {
-        Provider::ClaudeCli | Provider::CodexCli | Provider::AgyCli => "cli",
+        Provider::ClaudeCli | Provider::CodexCli | Provider::AgyCli | Provider::OpenCodeCli | Provider::CursorCli => "cli",
         Provider::Ollama | Provider::Compatible => "local",
         _ => "api",
     };
@@ -143,6 +164,8 @@ pub fn provider_info(p: Provider) -> serde_json::Value {
         Provider::ClaudeCli => ("winget install Anthropic.ClaudeCode", "claude", "https://claude.com/claude-code"),
         Provider::CodexCli => ("npm i -g @openai/codex", "codex login", "https://github.com/openai/codex"),
         Provider::AgyCli => ("", "agy", "https://antigravity.google/docs/cli/overview"),
+        Provider::OpenCodeCli => ("", "opencode auth login", "https://opencode.ai/download"),
+        Provider::CursorCli => ("irm 'https://cursor.com/install?win32=true' | iex", "agent login", "https://cursor.com/docs/cli/installation"),
         Provider::Ollama => ("winget install Ollama.Ollama", "", "https://ollama.com/download"),
         _ => ("", "", ""),
     };

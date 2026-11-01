@@ -27,6 +27,8 @@ final class FastLane {
     }
 
     private let model: String?
+    private let requestedModel: String?
+    private let provider: Provider
     private let intro: String
     private var session: AgySession?
     /// The lead's routine plan; set = the next turns go to the helper.
@@ -57,22 +59,21 @@ final class FastLane {
     /// Who answered the last turn, for the log: "fast · ", "lead ← fast (why) · ", or "".
     private(set) var tag = ""
 
-    /// The lead's provider: the helper runs on it too (a per-task provider override must not be silently dropped).
-    private let provider: Provider
-
-    /// `provider` is the lead session's. Names are compared as the provider resolves them, so a helper that would
-    /// land on the very same model as the lead (Codex picks its own default for both) is not a helper at all.
-    init(intro: String, leadModel: String, provider: Provider = Provider.current) {
+    init(intro: String, leadProvider: Provider, leadModel: String) {
         self.intro = intro
-        self.provider = provider
+        let route = Provider.routed("FAST_PROVIDER", fallback: leadProvider)
         let fast = Self.model
-        if let fast, fast == leadModel || provider.model(fast) == provider.model(leadModel) { model = nil } else { model = fast }
+        provider = route
+        requestedModel = fast
+        let resolved = fast.map { route.model($0) }
+        model = route == leadProvider && resolved == leadModel ? nil : resolved
     }
 
     /// The helper's identity, for the log: nil when the helper is off.
     var helperRoute: String? {
         guard let model else { return nil }
-        return "fast helper: provider=\(provider.rawValue) requested=\(model) model=\(provider.model(model).isEmpty ? "(cli default)" : provider.model(model)) role=helper"
+        let requested = requestedModel ?? model
+        return "fast helper: provider=\(provider.rawValue) requested=\(requested) model=\(model.isEmpty ? "(cli default)" : model) role=helper"
     }
 
     /// Appended to the lead's first message: how to hand routine steps off (empty when off).

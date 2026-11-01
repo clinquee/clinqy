@@ -25,6 +25,10 @@ final class Agent: ObservableObject {
     @Published var narration = ""
     @Published var steps: [Step] = []
     @Published var input = ""
+    /// Provider selected in the new-task bar. This is a one-run override; it doesn't change the dashboard default.
+    @Published var newTaskProvider = Provider.current
+    @Published private(set) var newTaskProviderChoices: [Provider] = []
+    @Published private(set) var loadingNewTaskProviderChoices = false
     @Published var answer = ""
     /// Set while the run is paused waiting for the user's answer.
     @Published var question: Question?
@@ -131,14 +135,30 @@ final class Agent: ObservableObject {
     @Published var newTaskMode = false {
         didSet {
             guard newTaskMode != oldValue else { return }
-            if newTaskMode { currentTaskDraft = input; input = newTaskDraft }
+            if newTaskMode {
+                currentTaskDraft = input
+                input = newTaskDraft
+                loadingNewTaskProviderChoices = true
+                Task { [weak self] in
+                    let choices = await Task.detached(priority: .utility) {
+                        Provider.allCases.filter(\.isConfigured)
+                    }.value
+                    guard let self, self.newTaskMode else { return }
+                    self.newTaskProviderChoices = choices
+                    self.loadingNewTaskProviderChoices = false
+                    if !choices.contains(self.newTaskProvider) {
+                        self.newTaskProvider = choices.first ?? Provider.current
+                    }
+                }
+            }
             else { newTaskDraft = input; input = currentTaskDraft }
         }
     }
-    var enqueueNewRequest: ((String) -> Bool)?
+    var enqueueNewRequest: ((String, Provider) -> Bool)?
     @discardableResult func submitNewRequest(_ raw: String) -> Bool {
         let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty, enqueueNewRequest?(text) == true else { return false }
+        guard !text.isEmpty, enqueueNewRequest?(text, newTaskProvider) == true else { return false }
+        newTaskProvider = Provider.current
         input = ""; newTaskMode = false
         return true
     }
@@ -723,12 +743,13 @@ final class Agent: ObservableObject {
 
         let sourceCache = SourceCache()
         defer { Task { await sourceCache.cancelAll() } }
-        let workerModel = Config.value("DELEGATE_MODEL") ?? FastLane.model ?? session.sessionModel
+        let workerProvider = Provider.routed("DELEGATE_PROVIDER", fallback: session.sessionProvider)
+        let workerModel = Config.value("DELEGATE_MODEL") ?? FastLane.model ?? Brain.defaultModel(for: workerProvider)
         let workersEnabled = !["off", "0", "false", "no"].contains((Config.value("DELEGATION") ?? "on").lowercased())
         let pool = DelegationPool(concurrency: Int(Config.value("DELEGATE_CONCURRENCY") ?? "3") ?? 3,
                                   timeout: min(300, max(10, Double(Config.value("DELEGATE_TIMEOUT") ?? "90") ?? 90))) { job, dependencies in
             try await DelegationWorker.run(job, dependencies: dependencies, parent: request,
-                                           provider: session.sessionProvider, model: workerModel,
+                                           provider: workerProvider, model: workerModel,
                                            effort: Config.value("DELEGATE_EFFORT") ?? "low", sources: sourceCache)
         }
         delegation = workersEnabled ? pool : nil
@@ -741,7 +762,7 @@ final class Agent: ObservableObject {
         message += workersEnabled
             ? "\nParallel delegation available: up to \(pool.concurrency) independent worker sessions, model \(workerModel). Split substantial independent research/analysis/drafting/review work with delegate, then continue your own work. Use collect(wait:true) when only worker results remain. Small tasks should stay direct."
             : "\nParallel delegation is disabled; carry out this task directly."
-        let fast = FastLane(intro: message, leadModel: modelOverride ?? Brain.model, provider: session.sessionProvider)
+        let fast = FastLane(intro: message, leadProvider: session.sessionProvider, leadModel: session.sessionModel)
         if let helper = fast.helperRoute { log("  \(helper)") }
         defer { fast.close() }
         message += fast.leadNote
@@ -2156,7 +2177,7 @@ final class Agent: ObservableObject {
             let host = Clicks.host(page.url)
             let method: String
             // Choose one route before delivery. An unchanged screen or timeout never authorizes another click.
-            if Background.active, let viewport, hittable {
+            if Background.active, viewport != nil, hittable {
                 method = "cdp"
             } else if !Background.active, hittable, !Clicks.prefersScript(host),
                       Hand.hitMismatch(at: point, pid: context.app?.processIdentifier ?? 0, window: context.nativeWindow?.element) == nil {

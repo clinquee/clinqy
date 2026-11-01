@@ -19,6 +19,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         var app: NSRunningApplication?
         var files: [URL] = []
         var selection: String?
+        var provider: Provider? = nil
     }
     private var newRequestTarget = RequestTarget()
     private var queuedNativeTargets: [UUID: RequestTarget] = [:]
@@ -59,7 +60,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         buddy = Buddy()
         agent = Agent(buddy: buddy)
-        agent.enqueueNewRequest = { [weak self] text in self?.enqueueNewRequest(text) ?? false }
+        agent.enqueueNewRequest = { [weak self] text, provider in self?.enqueueNewRequest(text, provider: provider) ?? false }
         agent.dispatchBrowserTask = { [weak self] request, test, model, provider, taskID in
             guard let self else { return false }
             // Telegram dispatches its own requests to the pool and binds questions to their originating task.
@@ -485,25 +486,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         agent.newTaskMode = true
     }
 
-    private func enqueueNewRequest(_ raw: String) -> Bool {
+    private func enqueueNewRequest(_ raw: String, provider: Provider) -> Bool {
         var request = raw
         let explicit = Background.choice(&request)
         let background = explicit != false && (explicit == true || BrowserTaskRouting.isBrowserTask(request))
         if background {
-            return BrowserJobs.shared.submit(raw, files: newRequestTarget.files,
+            return BrowserJobs.shared.submit(raw, provider: provider, files: newRequestTarget.files,
                 browser: BrowserTaskRouting.browser(in: request) ?? newRequestTarget.app.flatMap { Launcher.isBrowser($0) ? $0.cleanName : nil }
                     ?? BrowserJobs.shared.running.compactMap(\.browser).first) != nil
         }
         if agent.isRunning {
             guard let id = TaskStore.shared.enqueue(request, files: newRequestTarget.files, source: .mac, background: false) else { return false }
-            queuedNativeTargets[id] = newRequestTarget
+            var target = newRequestTarget
+            target.provider = provider
+            queuedNativeTargets[id] = target
             return true
         }
         agent.targetApp = newRequestTarget.app
         agent.selectedFiles = newRequestTarget.files
         agent.selectedText = newRequestTarget.selection
         agent.continuation = nil
-        agent.submit(raw, background: false)
+        agent.submit(raw, provider: provider, background: false)
         return true
     }
 
@@ -514,7 +517,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             guard let target = queuedNativeTargets.removeValue(forKey: item.id) else { continue }
             agent.targetApp = target.app; agent.selectedFiles = target.files; agent.selectedText = target.selection
             agent.copied = nil; agent.annotation = nil; agent.continuation = nil
-            agent.submit(item.request, background: false, taskID: item.id)
+            agent.submit(item.request, provider: target.provider, background: false, taskID: item.id)
             return
         }
     }

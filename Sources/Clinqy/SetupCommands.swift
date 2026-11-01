@@ -158,6 +158,8 @@ enum SetupCommands {
         ("claude", .claude, "Claude Code (your Claude login)"),
         ("codex", .codex, "Codex CLI (your ChatGPT login)"),
         ("agy", .agy, "Antigravity CLI (your Google login)"),
+        ("opencode", .opencode, "OpenCode (your connected provider login)"),
+        ("cursor", .cursor, "Cursor Agent (your Cursor login)"),
         ("ollama", .ollama, "a local model with Ollama"),
         ("anthropic", .anthropic, "Anthropic API key"),
         ("openai", .openai, "OpenAI API key"),
@@ -176,8 +178,17 @@ enum SetupCommands {
         case .claudeCLI:
             guard AgySession.claudePath != nil else { return "Claude Code isn't installed: curl -fsSL https://claude.ai/install.sh | bash" }
             return Provider.isClaudeLoggedIn ? nil : "Claude Code isn't logged in: run `claude` once in a terminal and log in"
-        case .agyCLI, .codexCLI:
-            return p.cliPath == nil ? "\(name(p)) isn't installed (or set \(name(p).uppercased())_PATH in the settings file)" : nil
+        case .agyCLI:
+            return p.cliPath == nil ? "\(name(p)) isn't installed (or set its executable path in the settings file)" : nil
+        case .codexCLI:
+            guard p.cliPath != nil else { return "Codex CLI isn't installed (or set CODEX_PATH in the settings file)" }
+            return p.isConfigured ? nil : "Codex CLI isn't signed in with ChatGPT: run `codex login` once"
+        case .opencodeCLI:
+            guard p.cliPath != nil else { return "OpenCode isn't installed: https://opencode.ai/docs/cli/" }
+            return p.isConfigured ? nil : "OpenCode isn't connected: run `opencode auth login` once"
+        case .cursorCLI:
+            guard p.cliPath != nil else { return "Cursor Agent isn't installed: https://cursor.com/docs/cli" }
+            return p.isConfigured ? nil : "Cursor Agent isn't logged in: run `agent login` once"
         case .ollama:
             let has = ["/opt/homebrew/bin/ollama", "/usr/local/bin/ollama", "/Applications/Ollama.app"].contains { FileManager.default.fileExists(atPath: $0) }
             return has ? nil : "Ollama isn't installed: https://ollama.com/download, then ollama pull qwen3-vl"
@@ -208,7 +219,7 @@ enum SetupCommands {
         case "auto":
             do { try Config.write(["PROVIDER": nil, "USE_AGY": nil]) } catch { return failed("couldn't save the settings file: \(error.localizedDescription)") }
             provider = Provider.current
-            print("Clinqy picks what this Mac has (Claude Code, then Codex, then agy, then an API key): \(name(provider)).")
+            print("Clinqy picks the first configured provider in PROVIDER_ORDER: \(name(provider)).")
         case let n?:
             guard let c = choices.first(where: { $0.name == n })?.choice ?? ModelChoice(rawValue: n)
                     ?? Provider(rawValue: n).map(ModelChoice.from) else {
@@ -219,6 +230,9 @@ enum SetupCommands {
             switch c {
             case .claude: if let id { s["CLAUDE_MODEL"] = id }
             case .agy: if let id { s["AGY_MODEL"] = id }
+            case .codex: if let id { s["CODEX_MODEL"] = id }
+            case .opencode: if let id { s["OPENCODE_MODEL"] = id }
+            case .cursor: if let id { s["CURSOR_MODEL"] = id }
             case .ollama:
                 s["LOCAL_MODEL"] = id ?? Config.value("LOCAL_MODEL") ?? "qwen3-vl"
                 s["OPENAI_BASE_URL"] = Config.value("OPENAI_BASE_URL") ?? "http://localhost:11434/v1"
