@@ -3,6 +3,7 @@
 //! history, workflows, the browser-extension bridge, background jobs — lives here.
 
 pub mod agent;
+pub mod acp;
 pub mod applications;
 pub mod background;
 pub mod bridge;

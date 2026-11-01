@@ -1,17 +1,27 @@
 import Foundation
+import SQLite3
 
-/// Which model service answers: a coding CLI you're already logged into (Claude Code, the default; Antigravity CLI / agy;
-/// Codex) or a provider's HTTP API with your own key. Set PROVIDER in ~/.config/clinqy/env (`Clinqy model <name>`); with
-/// none set, the first of Claude Code (logged in), Codex, agy, Claude Code, then an API key that this Mac has.
-enum Provider: String, CaseIterable {
+/// Which model service answers. Set PROVIDER in ~/.config/clinqy/env (`Clinqy model <name>`); with none set,
+/// PROVIDER_ORDER is checked from left to right and the first configured provider is used.
+enum Provider: String, CaseIterable, Sendable {
     case claudeCLI = "claude-cli", agyCLI = "agy-cli", codexCLI = "codex-cli"
+    case opencodeCLI = "opencode-cli", cursorCLI = "cursor-cli"
     case anthropic, openai, gemini, openrouter, ollama, compatible = "openai-compatible"
+
+    private final class ProbeResult: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = false
+        func set(_ value: Bool) { lock.withLock { self.value = value } }
+        func get() -> Bool { lock.withLock { value } }
+    }
 
     var displayName: String {
         switch self {
         case .claudeCLI: return "Claude Code"
         case .agyCLI: return "Antigravity CLI"
         case .codexCLI: return "Codex CLI"
+        case .opencodeCLI: return "OpenCode"
+        case .cursorCLI: return "Cursor Agent"
         case .anthropic: return "Anthropic API"
         case .openai: return "OpenAI API"
         case .gemini: return "Google Gemini"
@@ -24,16 +34,21 @@ enum Provider: String, CaseIterable {
     var isConfigured: Bool {
         switch self {
         case .claudeCLI: return AgySession.claudePath != nil && Self.isClaudeLoggedIn
-        case .agyCLI, .codexCLI: return cliPath != nil
+        case .agyCLI: return cliPath != nil
+        case .codexCLI: return cliPath != nil && Self.codexLoginCache.isLoggedIn(path: cliPath)
+        case .opencodeCLI:
+            return cliPath != nil && (Config.value("OPENCODE_API_KEY")?.isEmpty == false || Self.openCodeAuthExists)
+        case .cursorCLI: return cliPath != nil && Self.cursorAuthExists
         case .anthropic, .openai, .gemini, .openrouter: return key != nil
-        case .ollama, .compatible: return true
+        case .ollama: return Self.localServerReachable
+        case .compatible: return Config.value("OPENAI_BASE_URL") != nil
         }
     }
 
     static var isManagedByEnvironment: Bool {
         let env = ProcessInfo.processInfo.environment
         return env["PROVIDER"] != nil || env["USE_AGY"] != nil ||
-            CommandLine.arguments.contains(where: { ["--agy", "--agy-cli", "--claude", "--claude-cli"].contains($0) })
+            CommandLine.arguments.contains(where: { ["--agy", "--agy-cli", "--claude", "--claude-cli", "--codex", "--codex-cli", "--opencode", "--opencode-cli", "--cursor", "--cursor-cli"].contains($0) })
     }
 
     /// Flag switch: set via --agy command line flag, USE_AGY=1/true, or PROVIDER=agy-cli.
@@ -98,27 +113,196 @@ enum Provider: String, CaseIterable {
     /// UI and startup never wait on a Keychain subprocess. A short-lived cached availability check refreshes off-main.
     static var isClaudeLoggedIn: Bool { loginCache.read() }
 
+    /// Codex exposes a non-interactive login-status command. Cache the result because provider choices are refreshed
+    /// several times while the dashboard and task bar are open.
+    private final class CodexLoginCache {
+        private let lock = NSLock()
+        private var lastPath: String?
+        private var value = false
+        private var checked = Date.distantPast
+
+        func isLoggedIn(path: String?) -> Bool {
+            guard let path else { return false }
+            return lock.withLock {
+                guard path != lastPath || Date().timeIntervalSince(checked) > 30 else { return value }
+                let process = Process(), output = Pipe()
+                process.executableURL = URL(fileURLWithPath: path)
+                process.arguments = ["login", "status"]
+                process.standardOutput = output
+                process.standardError = output
+                do {
+                    try process.run()
+                    let deadline = DispatchWorkItem { if process.isRunning { process.terminate() } }
+                    DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 3, execute: deadline)
+                    defer { deadline.cancel() }
+                    let status = output.fileHandleForReading.readDataToEndOfFile()
+                    process.waitUntilExit()
+                    let text = String(data: status, encoding: .utf8)?.lowercased() ?? ""
+                    value = process.terminationStatus == 0 && text.contains("logged in using chatgpt")
+                } catch {
+                    value = false
+                }
+                lastPath = path
+                checked = Date()
+                return value
+            }
+        }
+    }
+    private static let codexLoginCache = CodexLoginCache()
+
     static var current: Provider {
         if CommandLine.arguments.contains("--agy") || CommandLine.arguments.contains("--agy-cli") { return .agyCLI }
         if CommandLine.arguments.contains("--claude") || CommandLine.arguments.contains("--claude-cli") { return .claudeCLI }
+        if CommandLine.arguments.contains("--codex") || CommandLine.arguments.contains("--codex-cli") { return .codexCLI }
+        if CommandLine.arguments.contains("--opencode") || CommandLine.arguments.contains("--opencode-cli") { return .opencodeCLI }
+        if CommandLine.arguments.contains("--cursor") || CommandLine.arguments.contains("--cursor-cli") { return .cursorCLI }
         if useAgy { return .agyCLI }
         if let raw = Config.value("PROVIDER")?.lowercased() {
             switch raw {
             case "agy", "agy-cli", "antigravity", "gemini-cli": return .agyCLI
             case "claude", "claude-code", "cli": return .claudeCLI
             case "codex": return .codexCLI
-            case "gpt", "chatgpt": return .openai
+            case "opencode", "open-code": return .opencodeCLI
+            case "cursor", "cursor-agent": return .cursorCLI
             case "google": return .gemini
             case "compatible", "custom": return .compatible
-            default: if let p = Provider(rawValue: raw) { return p }
+            default: if let p = Provider.parse(raw) { return p }
             }
         }
-        // Nothing chosen ("auto"): what this Mac has, in the same order as on Windows: Claude Code, Codex, agy, then a key.
-        if ClaudeSession.claudePath != nil && isClaudeLoggedIn { return .claudeCLI }
-        if Provider.codexCLI.cliPath != nil { return .codexCLI }
-        if AgySession.agyPath != nil { return .agyCLI }
+        // Nothing chosen ("auto"): use the configured priority order, ignoring unavailable providers.
+        let order = Config.value("PROVIDER_ORDER") ?? "claude-cli,codex-cli,agy-cli,opencode-cli,cursor-cli,anthropic,openai,gemini,openrouter,ollama,openai-compatible"
+        if let selected = order.split(separator: ",").compactMap({ Provider.parse(String($0).trimmingCharacters(in: .whitespaces)) }).first(where: \.isConfigured) {
+            return selected
+        }
         if ClaudeSession.claudePath != nil { return .claudeCLI }
         return [.anthropic, .openai, .gemini, .openrouter].first { $0.key != nil } ?? .claudeCLI
+    }
+
+    static func parse(_ raw: String) -> Provider? {
+        switch raw.lowercased() {
+        case "agy", "antigravity", "gemini-cli": return .agyCLI
+        case "claude", "claude-code", "cli": return .claudeCLI
+        case "codex": return .codexCLI
+        case "gpt", "chatgpt": return .openai
+        case "opencode", "open-code": return .opencodeCLI
+        case "cursor", "cursor-agent": return .cursorCLI
+        case "google": return .gemini
+        case "compatible", "custom": return .compatible
+        default: return Provider(rawValue: raw.lowercased())
+        }
+    }
+
+    private static var openCodeAuthExists: Bool {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let dataHome = Config.value("XDG_DATA_HOME") ?? "\(home)/.local/share"
+        let authFiles = ["\(dataHome)/opencode/auth.json", "\(home)/.opencode/auth.json"]
+        var databases = ["\(dataHome)/opencode/opencode.db"]
+        if let database = Config.value("OPENCODE_DB"), !database.isEmpty {
+            databases.append((database as NSString).expandingTildeInPath)
+        }
+        return authFiles.contains(where: Self.openCodeAuthFileHasCredentials)
+            || databases.contains(where: Self.openCodeDatabaseHasCredentials)
+    }
+
+    /// OpenCode creates its SQLite database for sessions even before anyone logs in. Check credential rows rather
+    /// than treating an empty database as a signed-in provider. Read only: credential values never leave SQLite.
+    private static func openCodeDatabaseHasCredentials(_ path: String) -> Bool {
+        guard FileManager.default.fileExists(atPath: path) else { return false }
+        var database: OpaquePointer?
+        guard sqlite3_open_v2(path, &database, SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX, nil) == SQLITE_OK,
+              let database else {
+            if let database { sqlite3_close(database) }
+            return false
+        }
+        defer { sqlite3_close(database) }
+        sqlite3_busy_timeout(database, 250)
+        // OpenCode shares this table with OAuth-backed MCP services. Only model-provider integrations count here;
+        // MCP integration IDs use the `mcp_` prefix. The separate `auth` table can represent non-model accounts.
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(database,
+                                 "SELECT 1 FROM credential WHERE integration_id IS NOT NULL AND substr(integration_id, 1, 4) != 'mcp_' LIMIT 1",
+                                 -1, &statement, nil) == SQLITE_OK,
+              let statement else { return false }
+        defer { sqlite3_finalize(statement) }
+        return sqlite3_step(statement) == SQLITE_ROW
+    }
+
+    /// OpenCode v1 and migration-era installs keep provider credentials in auth.json.
+    private static func openCodeAuthFileHasCredentials(_ path: String) -> Bool {
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
+        return root.values.contains { value in
+            guard let record = value as? [String: Any], let type = record["type"] as? String else { return false }
+            let fields: [String]
+            switch type.lowercased() {
+            case "api": fields = ["key"]
+            case "oauth": fields = ["access", "refresh"]
+            case "wellknown": fields = ["key", "token"]
+            default: return false
+            }
+            return fields.contains { (record[$0] as? String)?.isEmpty == false }
+        }
+    }
+
+    private static var localServerReachable: Bool {
+        guard let url = URL(string: "\(Provider.ollama.baseURL)/api/tags") else { return false }
+        let finished = DispatchSemaphore(value: 0)
+        let result = ProbeResult()
+        let task = URLSession.shared.dataTask(with: URLRequest(url: url, timeoutInterval: 0.4)) { _, response, _ in
+            result.set((response as? HTTPURLResponse).map { (200..<500).contains($0.statusCode) } ?? false)
+            finished.signal()
+        }
+        task.resume()
+        if finished.wait(timeout: .now() + .milliseconds(450)) == .timedOut { task.cancel() }
+        return result.get()
+    }
+
+    private final class CursorLoginCache {
+        private let lock = NSLock()
+        private var lastPath: String?
+        private var value = false
+        private var checked = Date.distantPast
+
+        func isLoggedIn(path: String?) -> Bool {
+            guard let path else { return false }
+            if ["CURSOR_API_KEY", "CURSOR_AUTH_TOKEN"].contains(where: { Config.value($0)?.isEmpty == false }) { return true }
+            return lock.withLock {
+                guard path != lastPath || Date().timeIntervalSince(checked) > 30 else { return value }
+                let process = Process(), output = Pipe()
+                process.executableURL = URL(fileURLWithPath: path)
+                process.arguments = ["status"]
+                process.standardOutput = output
+                process.standardError = output
+                do {
+                    try process.run()
+                    let deadline = DispatchWorkItem { if process.isRunning { process.terminate() } }
+                    DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 2, execute: deadline)
+                    defer { deadline.cancel() }
+                    let data = output.fileHandleForReading.readDataToEndOfFile()
+                    process.waitUntilExit()
+                    let status = String(data: data, encoding: .utf8)?.lowercased() ?? ""
+                    if status.contains("not authenticated") || status.contains("unauthenticated") ||
+                        status.contains("not signed in") || status.contains("not logged in") {
+                        value = false
+                    } else if process.terminationStatus == 0 &&
+                        (status.contains("authenticated") || status.contains("signed in") || status.contains("logged in")) {
+                        value = true
+                    } else {
+                        // Some CLI builds crash or omit status output. Let ACP validate the local login when used.
+                        value = true
+                    }
+                } catch {
+                    value = true
+                }
+                lastPath = path
+                checked = Date()
+                return value
+            }
+        }
+    }
+    private static let cursorLoginCache = CursorLoginCache()
+    private static var cursorAuthExists: Bool {
+        cursorLoginCache.isLoggedIn(path: Provider.cursorCLI.cliPath)
     }
 
     /// The CLI's executable, for the CLI providers (AGY_PATH / CLAUDE_PATH / CODEX_PATH, else the usual install spots).
@@ -128,20 +312,32 @@ enum Provider: String, CaseIterable {
         case .agyCLI: return AgySession.agyPath
         case .claudeCLI: return AgySession.claudePath
         case .codexCLI: name = "codex"
+        case .opencodeCLI: name = "opencode"
+        case .cursorCLI: name = "cursor-agent"
         default: return nil
         }
-        if let explicit = Config.value(name.uppercased() + "_PATH") { return explicit }
+        let pathKey = self == .cursorCLI ? "CURSOR_AGENT_PATH" : name.uppercased() + "_PATH"
+        if let explicit = Config.value(pathKey) { return explicit }
         let home = FileManager.default.homeDirectoryForCurrentUser.path
-        return ["\(home)/.local/bin/\(name)", "/opt/homebrew/bin/\(name)", "/usr/local/bin/\(name)", "\(home)/.npm-global/bin/\(name)", "\(home)/.bun/bin/\(name)"]
+        var candidates = [name]
+        if self == .cursorCLI { candidates = ["agent", "cursor-agent"] }
+        let fromPath = ProcessInfo.processInfo.environment["PATH"].map { path in
+            path.split(separator: ":").flatMap { dir in candidates.map { "\(dir)/\($0)" } }
+        } ?? []
+        let spots = candidates.flatMap { binary in
+            ["\(home)/.local/bin/\(binary)", "\(home)/.opencode/bin/\(binary)", "/opt/homebrew/bin/\(binary)", "/usr/local/bin/\(binary)", "\(home)/.npm-global/bin/\(binary)", "\(home)/.bun/bin/\(binary)"]
+        }
+        return (fromPath + spots)
             .first { FileManager.default.isExecutableFile(atPath: $0) }
     }
 
-    var isCLI: Bool { self == .agyCLI || self == .claudeCLI || self == .codexCLI }
+    var isACP: Bool { self == .opencodeCLI || self == .cursorCLI }
+    var isCLI: Bool { self == .agyCLI || self == .claudeCLI || self == .codexCLI || isACP }
 
     var key: String? {
         let names: [String]
         switch self {
-        case .agyCLI, .claudeCLI, .codexCLI, .ollama: return nil
+        case .agyCLI, .claudeCLI, .codexCLI, .opencodeCLI, .cursorCLI, .ollama: return nil
         case .anthropic: names = ["ANTHROPIC_API_KEY"]
         case .openai: names = ["OPENAI_API_KEY"]
         case .gemini: names = ["GEMINI_API_KEY", "GOOGLE_API_KEY"]
@@ -162,6 +358,8 @@ enum Provider: String, CaseIterable {
         case .claudeCLI: return alias == "haiku" ? "claude-haiku-5-5" : name
         // The CLIs pick their own default model for your account; only an explicit model id is passed on.
         case .codexCLI: return ""
+        case .opencodeCLI: return Config.value("OPENCODE_MODEL") ?? ""
+        case .cursorCLI: return Config.value("CURSOR_MODEL") ?? ""
         case .anthropic: return ["claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5"][tier]
         case .openrouter: return ["anthropic/claude-haiku-5.5", "anthropic/claude-sonnet-5.5", "anthropic/claude-opus-5.5"][tier]
         case .openai: return ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"][tier]
@@ -175,6 +373,8 @@ enum Provider: String, CaseIterable {
         case .claudeCLI: return "Claude Code CLI: \(AgySession.claudePath ?? "❌ not found")"
         case .agyCLI: return "Antigravity CLI (agy): \(AgySession.agyPath ?? "❌ not found")"
         case .codexCLI: return "Codex CLI: \(cliPath ?? "❌ not found")"
+        case .opencodeCLI: return "OpenCode: \(cliPath ?? "❌ not found")"
+        case .cursorCLI: return "Cursor Agent: \(cliPath ?? "❌ not found")"
         case .ollama: return "Ollama (\(baseURL))"
         case .compatible: return "OpenAI-compatible API (\(baseURL)\(key == nil ? ", no key" : ""))"
         default: return "\(rawValue) API (\(key == nil ? "❌ no key" : "key set"))"
@@ -190,8 +390,13 @@ enum Provider: String, CaseIterable {
         case .compatible: return explicit ?? "http://localhost:1234/v1"
         case .anthropic: return Config.value("ANTHROPIC_BASE_URL") ?? "https://api.anthropic.com"
         case .gemini: return "https://generativelanguage.googleapis.com/v1beta"
-        case .agyCLI, .claudeCLI, .codexCLI: return ""
+        case .agyCLI, .claudeCLI, .codexCLI, .opencodeCLI, .cursorCLI: return ""
         }
+    }
+
+    static func routed(_ key: String, fallback: Provider) -> Provider {
+        guard let raw = Config.value(key), let provider = parse(raw) else { return fallback }
+        return provider.isConfigured ? provider : fallback
     }
 }
 
@@ -391,7 +596,7 @@ final class APIChat: @unchecked Sendable {
             if !plain, provider == .openai, let level = ModelRoute.openAIEffort(model: model, effort: effort) {
                 body["reasoning_effort"] = level
             }
-        case .agyCLI, .claudeCLI, .codexCLI:
+        case .agyCLI, .claudeCLI, .codexCLI, .opencodeCLI, .cursorCLI:
             throw ClaudeSession.BrainError.failed("\(provider.rawValue) isn't an HTTP provider")
         }
         // Streaming transport also forwards cumulative text to the validated early-action parser.

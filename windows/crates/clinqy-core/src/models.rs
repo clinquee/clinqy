@@ -140,6 +140,10 @@ pub async fn list(p: Provider) -> Vec<Choice> {
             all.extend(found);
             all
         }
+        Provider::OpenCodeCli | Provider::CursorCli => {
+            let model = p.default_model();
+            vec![choice(&model, if model.is_empty() { "Provider default" } else { &model })]
+        }
         _ if !found.is_empty() => found,
         Provider::Ollama | Provider::Compatible => vec![],
         _ => tiers(),

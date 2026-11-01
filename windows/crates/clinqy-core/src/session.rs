@@ -4,6 +4,7 @@
 //! waits for process startup.
 
 use crate::config;
+use crate::acp::AcpSession;
 use crate::provider::{CliCommand, Provider};
 use anyhow::{anyhow, bail, Result};
 use parking_lot::Mutex;
@@ -25,6 +26,7 @@ pub struct Session {
 
 enum Kind {
     Cli(Arc<CliSession>),
+    Acp(Arc<AcpSession>),
     Api(Arc<ApiChat>),
 }
 
@@ -32,6 +34,7 @@ impl Session {
     pub fn start(system: &str, model: &str, provider: Provider) -> Result<Session> {
         let kind = match provider {
             Provider::ClaudeCli | Provider::AgyCli => Kind::Cli(CliSession::start(system, model, provider)?),
+            Provider::OpenCodeCli | Provider::CursorCli => Kind::Acp(AcpSession::start(provider, system, model)?),
             _ => Kind::Api(Arc::new(ApiChat::new(provider, system, model)?)),
         };
         Ok(Session { provider, model: provider.model(model), kind })
@@ -40,6 +43,7 @@ impl Session {
     pub fn is_alive(&self) -> bool {
         match &self.kind {
             Kind::Cli(c) => c.is_alive(),
+            Kind::Acp(a) => a.is_alive(),
             Kind::Api(a) => !*a.closed.lock(),
         }
     }
@@ -53,6 +57,11 @@ impl Session {
                 crate::usage::record(self.provider.id(), &self.model, None, None);
                 Ok(reply)
             }
+            Kind::Acp(a) => {
+                let reply = a.send(text, image, partial).await?;
+                crate::usage::record(self.provider.id(), &self.model, None, None);
+                Ok(reply)
+            }
             Kind::Api(a) => a.clone().send(text, image, partial).await,
         }
     }
@@ -60,6 +69,7 @@ impl Session {
     pub fn close(&self) {
         match &self.kind {
             Kind::Cli(c) => c.close(),
+            Kind::Acp(a) => a.close(),
             Kind::Api(a) => *a.closed.lock() = true,
         }
     }
