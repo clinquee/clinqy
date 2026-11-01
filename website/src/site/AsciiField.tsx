@@ -97,6 +97,8 @@ export function AsciiField({ running }: { running: boolean }) {
     let cols = 0
     let rows = 0
     let dpr = 1
+    let colA = new Float32Array(0)
+    const buckets: number[][] = Array.from({ length: RAMP.length }, () => [])
     const resize = () => {
       dpr = Math.min(2, devicePixelRatio || 1)
       canvas.width = innerWidth * dpr
@@ -107,6 +109,7 @@ export function AsciiField({ running }: { running: boolean }) {
       cw = ctx.measureText('M').width
       cols = Math.ceil(innerWidth / cw)
       rows = Math.ceil(innerHeight / LINE)
+      colA = new Float32Array(cols)
     }
     resize()
     addEventListener('resize', resize)
@@ -165,7 +168,7 @@ export function AsciiField({ running }: { running: boolean }) {
     const t0 = performance.now()
 
     function frame(now: number) {
-      raf = requestAnimationFrame(frame)
+      raf = running && !calm && !document.hidden ? requestAnimationFrame(frame) : 0
       if (now - last < 50 || document.hidden) return
       last = now
       const t = (now - t0) / 1000
@@ -175,9 +178,8 @@ export function AsciiField({ running }: { running: boolean }) {
       // the text veil, so it isn't drawn at all. Glyphs are grouped by
       // brightness so the colour changes 8 times a frame, not per glyph.
       const c0 = innerWidth > 900 ? Math.floor(cols * 0.3) : 0
-      const colA = new Float32Array(cols)
       for (let c = c0; c < cols; c++) colA[c] = Math.sin(c * 0.07 + t * 0.5)
-      const buckets: number[][] = Array.from({ length: RAMP.length }, () => [])
+      for (const bucket of buckets) bucket.length = 0
       for (let r = 0; r < rows; r++) {
         const rowA = Math.sin(r * 0.17 - t * 0.35)
         const dy = (r - rows * 0.4) * 2
@@ -289,6 +291,11 @@ export function AsciiField({ running }: { running: boolean }) {
       drawPixelCursor(ctx!, cur.x, cur.y, heading.turn, press)
     }
 
+    const onVisibility = () => {
+      if (document.hidden) { cancelAnimationFrame(raf); raf = 0 }
+      else if (running && !calm && !raf) raf = requestAnimationFrame(frame)
+    }
+    document.addEventListener('visibilitychange', onVisibility)
     if (calm) {
       // One still frame, no motion.
       for (let i = 0; i < 5; i++) spawn(-DECODE - 100)
@@ -300,6 +307,7 @@ export function AsciiField({ running }: { running: boolean }) {
 
     return () => {
       cancelAnimationFrame(raf)
+      document.removeEventListener('visibilitychange', onVisibility)
       removeEventListener('resize', resize)
       removeEventListener('pointermove', onMove)
       removeEventListener('scroll', onScroll)
