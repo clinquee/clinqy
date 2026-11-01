@@ -20,7 +20,7 @@ Download, paste one prompt into your coding agent, done. It needs macOS 14 or la
 
 **1. Download** **[`Clinqy.dmg`](https://clinqy.vercel.app/api/mac-download)**, open it and drag Clinqy into Applications. Clinqy isn't notarized by Apple yet, so the first time you open it macOS blocks it: open **System Settings → Privacy & Security**, scroll down and click **Open Anyway**. (You can skip this step: the prompt installs Clinqy too, and then macOS doesn't block it.)
 
-**2. Paste this into your coding agent** (Claude Code, Codex, agy, Cursor, Gemini CLI or Windsurf). There's nothing to fill in. It uses the AI you already have, in this order: Claude Code, then Codex, then agy, then an API key. It asks for Clinqy's permissions, adds the browser extension (Clinqy loads it into your browser itself), connects the agent you pasted it into, and checks everything. Want a particular AI? Change the first line to `claude cli`, `codex cli`, `agy cli`, `ollama qwen3-vl` or `anthropic api key` (or `openai`, `gemini`, `openrouter`).
+**2. Paste this into your coding agent** (Claude Code, Codex, agy, Cursor, Gemini CLI, Windsurf or OpenCode). There's nothing to fill in. It uses the AI you already have, in this order: Claude Code, then Codex, then agy, then an API key. It asks for Clinqy's permissions, adds the browser extension (Clinqy loads it into your browser itself), connects the agent you pasted it into, and checks everything. Want a particular AI? Change the first line to `claude cli`, `codex cli`, `agy cli`, `ollama qwen3-vl` or `anthropic api key` (or `openai`, `gemini`, `openrouter`).
 
 ````text
 Model: auto
@@ -49,9 +49,9 @@ commands yourself. Only stop when you need my answer or a click that only I can 
 4. Add the browser extension with `$c extension install` (add `chrome`, `arc`, `brave` or `edge` to pick one). Clinqy
    loads it by itself and moves the mouse for a minute, so tell me before you run it. If it fails, walk me through it
    by hand: it prints the folder to pick.
-5. Connect coding agents with `$c connect <names>` (claude, codex, agy, cursor, gemini, windsurf). "this agent" means
+5. Connect coding agents with `$c connect <names>` (claude, codex, agy, cursor, gemini, windsurf, opencode). "this agent" means
    you: Claude Code → claude, Codex → codex, Antigravity → agy, Cursor → cursor, Gemini CLI → gemini, Windsurf →
-   windsurf. Skip this if it says none.
+   windsurf, OpenCode → opencode. Skip this if it says none.
 6. Check it: run `$c doctor`, then `~/.local/bin/clinqy run --dry "open example.com"`, and show me the planned steps.
    Fix anything that isn't ready (the log is ~/Library/Logs/Clinqy/agent.log). Finish with a short summary, and tell
    me: tap ⌃⌥ (Control + Option) to type a request, hold it to say it.
@@ -65,7 +65,7 @@ commands yourself. Only stop when you need my answer or a click that only I can 
 clinqy model              # which AI Clinqy uses; `clinqy model agy` (or claude, codex, ollama…) picks one and checks it answers
 clinqy permissions        # which macOS permissions Clinqy still needs (it asks macOS for them)
 clinqy extension install  # Clinqy loads its own extension into your browser (add chrome, arc, brave or edge to choose)
-clinqy connect claude     # add Clinqy to coding agents over MCP: claude, codex, agy, cursor, gemini, windsurf
+clinqy connect claude     # add Clinqy to coding agents over MCP: claude, codex, agy, cursor, gemini, windsurf, opencode
 clinqy doctor             # what's ready
 ```
 
@@ -127,7 +127,7 @@ Download, paste one prompt into your coding agent, done. It needs Windows 10 (19
 
 **1. Download** **`Clinqy-windows-x64.zip`** from the [latest Windows download](https://clinqy.vercel.app/api/windows-download), unzip it and double-click **`Install Clinqy.bat`**. It installs Clinqy to `%LOCALAPPDATA%\Programs\Clinqy`, adds it to the Start menu, puts the `clinqy` command on your PATH and starts it. Open at login is off until you turn it on in settings (Dashboard → General). The app isn't code-signed yet, so if Windows SmartScreen warns you, click **More info → Run anyway**. If Microsoft Defender quarantines it, open Windows Security → Protection history, choose the Clinqy entry and allow it on your device. (You can skip this step: the prompt installs Clinqy too.)
 
-**2. Paste this into any AI you use** (Claude Code, Codex, agy, Cursor, Gemini CLI, Windsurf, or a chat with no terminal, which walks you through it). There's nothing to fill in. It uses the AI you already have, in this order: Claude Code, then Codex, then agy, then Ollama. It connects your coding agents, has Clinqy add its own browser extension, and checks everything. Want a particular AI? Change the first line to `claude`, `codex`, `agy`, `ollama` or `anthropic` (or `openai`, `gemini`, `openrouter`).
+**2. Paste this into any AI you use** (Claude Code, Codex, agy, Cursor, Gemini CLI, Windsurf, OpenCode, or a chat with no terminal, which walks you through it). There's nothing to fill in. It uses the AI you already have, in this order: Claude Code, then Codex, then agy, then Ollama. It connects your coding agents, has Clinqy add its own browser extension, and checks everything. Want a particular AI? Change the first line to `claude`, `codex`, `agy`, `ollama` or `anthropic` (or `openai`, `gemini`, `openrouter`).
 
 ````text
 Model: auto
@@ -145,7 +145,7 @@ commands here, tell me to open PowerShell, give me one command at a time to past
      & $c setup --model <Model> --connect <Connect to>
    Model is auto, or one of claude, codex, agy, ollama, anthropic, openai, gemini, openrouter. Auto uses what this PC
    has: Claude Code, then Codex, then agy, then Ollama. Connect to is all, none, or names with commas from claude, codex,
-   agy, cursor, gemini, windsurf. "this agent" means you. Setup does everything it can and ends with what's ready and a
+   agy, cursor, gemini, windsurf, opencode. "this agent" means you. Setup does everything it can and ends with what's ready and a
    "Needs you" list.
 3. Work through "Needs you", then run the same setup command again, until it says everything is ready:
    - No AI installed: install Claude Code with `winget install Anthropic.ClaudeCode`.
@@ -319,7 +319,7 @@ clinqy://browser?cmd=page|read|url&id=<id>  what's in the focused browser tab �
 
 ## The `clinqy` command: QA and workflows for any coding agent
 
-`./build.sh` installs `clinqy` to `~/.local/bin`. Any terminal or coding agent (Antigravity CLI, Claude Code, Codex, Cursor…) can call it. It hands the job to the running app, which has the permissions, the browser extension and the cursor.
+`./build.sh` installs `clinqy` to `~/.local/bin`. Any terminal or coding agent (Antigravity CLI, Claude Code, Codex, Cursor, OpenCode…) can call it. It hands the job to the running app, which has the permissions, the browser extension and the cursor.
 
 ```bash
 clinqy qa tests/qa/                      # run every test in a folder
@@ -361,7 +361,7 @@ Install it for Claude Code:
 mkdir -p ~/.claude/skills/clinqy && curl -fsSL https://raw.githubusercontent.com/Amrit-Nigam/clinqy/main/skills/clinqy/SKILL.md -o ~/.claude/skills/clinqy/SKILL.md
 ```
 
-Claude Code then uses it on its own when you say things like "check my browser" or "test this in the browser", or when you type `/clinqy`. Other agents (Cursor, Codex, agy, Gemini CLI) can use Clinqy over MCP instead; see step 5 of the [setup guide](#setup-guide).
+Claude Code then uses it on its own when you say things like "check my browser" or "test this in the browser", or when you type `/clinqy`. Other agents (Cursor, Codex, agy, Gemini CLI, Windsurf and OpenCode) can use Clinqy over MCP instead; see step 5 of the [setup guide](#setup-guide).
 
 **Workflows (routines without a model).** Every successful run records exactly what it did. In **History**, hover a run and click **Save workflow**. Typed text becomes named inputs, defaulting to the original values. Saved workflows appear under **Skills → Workflows**:
 - **Run:** replays it with no model.
@@ -372,7 +372,7 @@ From the terminal: `clinqy workflow <name> "Input=value"`. A step that breaks is
 
 **How runs are going.** `Clinqy stats [days]` gives the success rate (overall and per app), the slowest runs, a per-turn breakdown of model time vs action time (from `agent.log`), and the most common failure reasons and failed steps. `Clinqy stats --last` shows the latest run turn by turn. A **Clicks** section shows how often the first click worked, which fallbacks rescued the rest, and the sites and apps where clicks struggle most. What it learns about each site is kept in `~/Library/Application Support/Clinqy/click-hints.json`.
 
-## MCP server (Claude Code, Antigravity CLI, Codex, Cursor…)
+## MCP server (Claude Code, Antigravity CLI, Codex, Cursor, OpenCode…)
 
 `Clinqy mcp` runs Clinqy as a stdio [MCP](https://modelcontextprotocol.io) server with no extra dependencies. Register it in Claude Code with:
 
@@ -385,6 +385,14 @@ Or in Antigravity CLI (`agy`) with:
 ```bash
 agy mcp add clinqy -- /Applications/Clinqy.app/Contents/MacOS/Clinqy mcp
 ```
+
+OpenCode can connect Clinqy for every project with:
+
+```bash
+opencode mcp add clinqy --global -- /Applications/Clinqy.app/Contents/MacOS/Clinqy mcp
+```
+
+Or run `clinqy connect opencode`. OpenCode is a coding-agent client here; the AI provider Clinqy itself uses is chosen separately with `clinqy model`.
 
 | Tool | Read-only | What it does |
 |---|---|---|
@@ -461,6 +469,7 @@ Optional `KEY=value` lines in `~/.config/clinqy/env` (start from [`env.example`]
 | `OPENAI_BASE_URL` | per provider | Endpoint for `openai`, `ollama` or `openai-compatible` |
 | `LOCAL_MODEL` | `qwen3-vl` | Model for `ollama` / `openai-compatible` |
 | `CLAUDE_PATH` · `AGY_PATH` · `CODEX_PATH` | auto-detected | Path to each CLI |
+| `OPENCODE_PATH` | auto-detected | Path to the OpenCode CLI, for `clinqy connect opencode` |
 | `CLAUDE_MODEL` / `AGY_MODEL` | `sonnet` | Model for the agent (any provider) |
 | `CODEX_MODEL` (macOS) | Codex default | Optional explicit model ID for Codex CLI |
 | `CLAUDE_EFFORT` / `AGY_EFFORT` | `low` | `low` is noticeably faster per step |

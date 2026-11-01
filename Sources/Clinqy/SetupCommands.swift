@@ -2,7 +2,7 @@ import AppKit
 
 /// Adds Clinqy as an MCP server to coding agents, keeping their other servers (the setup window and `Clinqy connect`).
 enum AgentConnect {
-    static let ids = ["claude", "codex", "agy", "cursor", "gemini", "windsurf"]
+    static let ids = ["claude", "codex", "agy", "cursor", "gemini", "windsurf", "opencode"]
 
     static var exe: String {
         // The installed app, not a build folder that may move.
@@ -23,6 +23,12 @@ enum AgentConnect {
             guard let agy = AgySession.agyPath else { throw fail("agy isn't installed") }
             try run(agy, ["mcp", "add", "clinqy", "--", exe, "mcp"], okIfContains: "already exists")
             return "agy: added (agy mcp add clinqy)"
+        case "opencode":
+            guard let opencode = opencodePath else {
+                throw fail("OpenCode CLI isn't installed or isn't on PATH (set OPENCODE_PATH in ~/.config/clinqy/env)")
+            }
+            try run(opencode, ["mcp", "add", "clinqy", "--global", "--", exe, "mcp"], okIfContains: "already exists")
+            return "OpenCode: added the clinqy MCP server globally (opencode mcp add clinqy)"
         case "cursor":
             try addJSONServer(".cursor/mcp.json")
             return "Cursor: added to ~/.cursor/mcp.json"
@@ -59,6 +65,28 @@ enum AgentConnect {
     }
 
     private static func fail(_ s: String) -> NSError { NSError(domain: "Clinqy", code: 1, userInfo: [NSLocalizedDescriptionKey: s]) }
+
+    /// OpenCode may be launched from the Dock with a much shorter PATH than a terminal. Check its installer,
+    /// common package-manager locations and the current PATH; OPENCODE_PATH is available for custom installs.
+    private static var opencodePath: String? {
+        if let configured = Config.value("OPENCODE_PATH") { return configured }
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let path = ProcessInfo.processInfo.environment["PATH"] ?? ""
+        var candidates = path.split(separator: ":").map { "\($0)/opencode" }
+        candidates += [
+            "\(home)/.opencode/bin/opencode",
+            "\(home)/.local/bin/opencode",
+            "\(home)/.bun/bin/opencode",
+            "\(home)/.volta/bin/opencode",
+            "/opt/homebrew/bin/opencode",
+            "/usr/local/bin/opencode",
+        ]
+        let nvmVersions = "\(home)/.nvm/versions/node"
+        if let versions = try? FileManager.default.contentsOfDirectory(atPath: nvmVersions) {
+            candidates += versions.sorted(by: >).map { "\(nvmVersions)/\($0)/bin/opencode" }
+        }
+        return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
+    }
 
     private static func run(_ path: String, _ args: [String], okIfContains: String) throws {
         let p = Process()

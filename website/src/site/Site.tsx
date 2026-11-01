@@ -93,7 +93,7 @@ const CAN = [
   {
     say: 'check how localhost:5173 looks in my browser',
     title: 'Works with your coding agent',
-    body: 'Add Clinqy as an MCP server to Claude Code, Cursor, Codex or agy, and they can see how your page really renders, logged in, in your own browser.',
+    body: 'Add Clinqy as an MCP server to Claude Code, Cursor, Codex, agy or OpenCode, and they can see how your page really renders, logged in, in your own browser.',
   },
 ]
 
@@ -379,7 +379,7 @@ export function Site({ live, onReplay }: { live: boolean; onReplay: () => void }
                   <li>
                     <h3>Paste one prompt into your coding agent</h3>
                     <p>
-                      Claude Code, Codex, agy, Cursor, Gemini CLI or Windsurf. Nothing to fill in: it uses the AI you already have (Claude
+                      Claude Code, Codex, agy, Cursor, Gemini CLI, Windsurf or OpenCode. Nothing to fill in: it uses the AI you already have (Claude
                       Code, then Codex, then agy, then an API key), asks for the permissions, adds the browser extension and connects your
                       agent. It only stops when it needs you.
                     </p>
@@ -434,7 +434,7 @@ export function Site({ live, onReplay }: { live: boolean; onReplay: () => void }
                   <li>
                     <h3>Paste one prompt into any AI you use</h3>
                     <p>
-                      Claude Code, Codex, agy, Cursor, Gemini CLI, Windsurf, or even a chat. Nothing to fill in: it uses the AI you already
+                      Claude Code, Codex, agy, Cursor, Gemini CLI, Windsurf, OpenCode, or even a chat. Nothing to fill in: it uses the AI you already
                       have (Claude Code, then Codex, then agy, then Ollama), connects your coding agents and adds the browser extension. It
                       only stops when it needs you.
                     </p>

@@ -525,6 +525,7 @@ final class OnboardingModel: ObservableObject {
         Agent(id: "cursor", name: "Cursor", detail: "~/.cursor/mcp.json"),
         Agent(id: "codex", name: "Codex", detail: "~/.codex/config.toml"),
         Agent(id: "gemini", name: "Gemini CLI", detail: "~/.gemini/settings.json"),
+        Agent(id: "opencode", name: "OpenCode", detail: "opencode mcp add --global"),
     ]
 
     func connect(_ id: String) {

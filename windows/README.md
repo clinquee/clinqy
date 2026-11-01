@@ -42,7 +42,8 @@ also works alone:
 clinqy model              # the AI Clinqy uses (`clinqy model agy`, `claude`, `codex`, `ollama`…; `auto` is the default)
 clinqy models             # the models it offers on this PC (`clinqy model codex gpt-6.1-terra` picks one)
 clinqy extension install  # Clinqy loads its own extension into Chrome, Edge or Brave
-clinqy connect all        # MCP for coding agents: all, or claude, codex, agy, cursor, gemini, windsurf
+clinqy connect all        # MCP for coding agents: all, or claude, codex, agy, cursor, gemini, windsurf, opencode
+clinqy connect opencode   # add Clinqy to OpenCode for every project
 clinqy doctor
 clinqy update             # install the newest version, keeping your settings and data
 ```

@@ -180,13 +180,14 @@ pub fn key_var(p: Provider) -> Option<&'static str> {
 }
 
 /// The coding agents the Clinqy window can connect: (id, name, where it goes).
-pub const AGENT_ROWS: [(&str, &str, &str); 6] = [
+pub const AGENT_ROWS: [(&str, &str, &str); 7] = [
     ("claude", "Claude Code", "claude mcp add"),
     ("codex", "Codex", "~/.codex/config.toml"),
     ("agy", "Antigravity CLI", "agy mcp add"),
     ("cursor", "Cursor", "~/.cursor/mcp.json"),
     ("gemini", "Gemini CLI", "~/.gemini/settings.json"),
     ("windsurf", "Windsurf", "~/.codeium/windsurf/mcp_config.json"),
+    ("opencode", "OpenCode", "opencode mcp add --global"),
 ];
 
 /// The browser Clinqy adds its extension to, and the request that does it. None when the extension folder is missing.
@@ -222,7 +223,7 @@ pub fn clinqy_exe() -> PathBuf {
 }
 
 /// The coding agents `clinqy connect` knows.
-pub const AGENTS: [&str; 6] = ["claude", "agy", "cursor", "codex", "gemini", "windsurf"];
+pub const AGENTS: [&str; 7] = ["claude", "agy", "cursor", "codex", "gemini", "windsurf", "opencode"];
 
 /// The coding agents on this PC: those whose CLI or settings folder is here.
 pub fn installed_agents() -> Vec<&'static str> {
@@ -236,6 +237,7 @@ pub fn installed_agents() -> Vec<&'static str> {
             "cursor" => home.join(".cursor").is_dir(),
             "gemini" => home.join(".gemini").is_dir(),
             "windsurf" => home.join(".codeium").join("windsurf").is_dir(),
+            "opencode" => opencode_cli().is_some(),
             _ => false,
         })
         .collect()
@@ -259,6 +261,11 @@ pub fn connect(agent: &str) -> Result<String, String> {
             run(&cli, &["mcp", "add", "clinqy", &exe_s, "mcp"])?;
             Ok("agy: added the clinqy MCP server".into())
         }
+        "opencode" => {
+            let cli = opencode_cli().ok_or("OpenCode CLI isn't installed or isn't on PATH (set OPENCODE_PATH in the Clinqy settings file)")?;
+            run(&cli, &opencode_args(&exe_s))?;
+            Ok("OpenCode: added the clinqy MCP server globally (all projects)".into())
+        }
         "cursor" => json_server(&home.join(".cursor").join("mcp.json"), &exe_s).map(|p| format!("Cursor: added clinqy to {}", p.display())),
         "gemini" | "gemini-cli" => json_server(&home.join(".gemini").join("settings.json"), &exe_s).map(|p| format!("Gemini CLI: added clinqy to {}", p.display())),
         "windsurf" => json_server(&home.join(".codeium").join("windsurf").join("mcp_config.json"), &exe_s).map(|p| format!("Windsurf: added clinqy to {}", p.display())),
@@ -281,6 +288,20 @@ pub fn connect(agent: &str) -> Result<String, String> {
         }
         other => Err(format!("I don't know the agent {other:?}; use one of: {}", AGENTS.join(", "))),
     }
+}
+
+/// Finds OpenCode's native executable or the current official npm CLI shim.
+fn opencode_cli() -> Option<clinqy_core::provider::CliCommand> {
+    let home = clinqy_core::paths::home();
+    let spots = [
+        home.join(".opencode").join("bin").join("opencode.exe"),
+        home.join(".bun").join("bin").join("opencode.exe"),
+    ];
+    clinqy_core::provider::find_cli("OPENCODE_PATH", "opencode", &spots, "@opencode/cli/bin/opencode.cjs")
+}
+
+fn opencode_args(exe: &str) -> [&str; 7] {
+    ["mcp", "add", "clinqy", "--global", "--", exe, "mcp"]
 }
 
 /// `{"mcpServers": {"clinqy": {...}}}` in a JSON config, keeping everything else.
@@ -312,5 +333,20 @@ fn run(cli: &clinqy_core::provider::CliCommand, args: &[&str]) -> Result<(), Str
         let err = String::from_utf8_lossy(&out.stderr);
         let msg = if err.trim().is_empty() { String::from_utf8_lossy(&out.stdout).into_owned() } else { err.into_owned() };
         Err(first_line(&msg))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn opencode_connection_is_global_and_keeps_executable_path_as_one_argument() {
+        assert_eq!(AGENTS.last(), Some(&"opencode"));
+        assert!(AGENT_ROWS.iter().any(|(id, _, _)| *id == "opencode"));
+        assert_eq!(
+            opencode_args(r"C:\Program Files\Clinqy\clinqy.exe"),
+            ["mcp", "add", "clinqy", "--global", "--", r"C:\Program Files\Clinqy\clinqy.exe", "mcp"]
+        );
     }
 }
